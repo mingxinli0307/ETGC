@@ -54,6 +54,47 @@ def edge_ncut_loss(Q_union: torch.Tensor, union_ids: np.ndarray, W_E: sp.csr_mat
     return float(K) - (assoc / (vol + 1e-8)).sum()
 
 
+def edge_ncut_loss_global(
+    Q_all: torch.Tensor,
+    W_E: sp.csr_matrix,
+    K: int,
+    row_block_size: int = 65536,
+) -> torch.Tensor:
+    W_E = W_E.tocsr()
+    if W_E.shape[0] != W_E.shape[1]:
+        raise ValueError(f"W_E must be square, got shape={W_E.shape}")
+    if W_E.shape[0] != int(Q_all.size(0)):
+        raise ValueError(f"Q_all rows={Q_all.size(0)} do not match W_E shape={W_E.shape}")
+    if W_E.nnz == 0:
+        return Q_all.sum() * 0.0
+
+    device = Q_all.device
+    dtype = Q_all.dtype
+    m = int(W_E.shape[0])
+    block_size = max(1, int(row_block_size))
+    assoc = Q_all.new_zeros(int(K))
+
+    for start in range(0, m, block_size):
+        end = min(m, start + block_size)
+        sub = W_E[start:end].tocoo()
+        if sub.nnz == 0:
+            continue
+        row_np = sub.row.astype(np.int64, copy=False) + start
+        col_np = sub.col.astype(np.int64, copy=False)
+        val_np = sub.data.astype(np.float32, copy=False)
+        row = torch.from_numpy(row_np).to(device=device)
+        col = torch.from_numpy(col_np).to(device=device)
+        val = torch.from_numpy(val_np).to(device=device, dtype=dtype)
+        q_i = Q_all.index_select(0, row)
+        q_j = Q_all.index_select(0, col)
+        assoc = assoc + (val.unsqueeze(1) * q_i * q_j).sum(dim=0)
+
+    degree_np = np.asarray(W_E.sum(axis=1)).ravel().astype(np.float32)
+    degree = torch.from_numpy(degree_np).to(device=device, dtype=dtype)
+    vol = (degree.unsqueeze(1) * Q_all).sum(dim=0)
+    return float(K) - (assoc / (vol + 1e-8)).sum()
+
+
 def projection_loss(Q_batch: torch.Tensor, src_batch: torch.Tensor, dst_batch: torch.Tensor, num_nodes: int) -> torch.Tensor:
     K = Q_batch.size(1)
     S = torch.zeros((num_nodes, K), dtype=Q_batch.dtype, device=Q_batch.device)

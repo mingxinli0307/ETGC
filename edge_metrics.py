@@ -25,9 +25,15 @@ def clustering_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def evaluate_node_clustering(labels: np.ndarray, pred_y: np.ndarray) -> dict:
     aligned_pred = align_predicted_labels(labels, pred_y)
+    macro_f1 = (
+        float(f1_score(labels, aligned_pred, average="macro", zero_division=0))
+        if labels.size
+        else 0.0
+    )
     return {
         "ACC": float(np.mean(aligned_pred == labels)) if labels.size else 0.0,
         "NMI": float(normalized_mutual_info_score(labels, pred_y)),
         "ARI": float(adjusted_rand_score(labels, pred_y)),
-        "F1": float(f1_score(labels, aligned_pred, average="weighted")),
+        "Macro_F1": macro_f1,
+        "F1": macro_f1,
     }

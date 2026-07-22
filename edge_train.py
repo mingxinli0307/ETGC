@@ -7,7 +7,13 @@ from torch.optim import Adam
 from tqdm import tqdm
 
 from edge_data import load_edge_event_data
-from edge_losses import balance_loss, edge_ncut_loss, edge_ppr_proximity_loss, projection_loss
+from edge_losses import (
+    balance_loss,
+    edge_ncut_loss,
+    edge_ncut_loss_global,
+    edge_ppr_proximity_loss,
+    projection_loss,
+)
 from edge_metrics import evaluate_node_clustering
 from edge_model import EdgeHiNoSModel, load_pretrained_node_features
 from edge_proximity import compute_edge_ppr_cached
@@ -20,6 +26,9 @@ class EdgeHiNoSTrainer:
         self.args = args
         self.device = choose_device(args.device)
         self.rng = np.random.RandomState(int(args.seed))
+        self.ncut_scope = str(getattr(args, "ncut_scope", "batch")).lower()
+        if self.ncut_scope not in {"batch", "global"}:
+            raise ValueError(f"Unsupported ncut_scope: {self.ncut_scope}")
 
         self.data = load_edge_event_data(args.data_root, args.dataset)
         self.K = int(self.data.K)
@@ -42,6 +51,7 @@ class EdgeHiNoSTrainer:
             edge_ppr_topk=args.edge_ppr_topk,
             beta=args.beta,
             seed=args.seed,
+            quiet=bool(int(getattr(args, "quiet", 0))),
         )
         self.Pi_E.sort_indices()
         self.W_E.sort_indices()
@@ -90,19 +100,29 @@ class EdgeHiNoSTrainer:
             self.time_feat_t.index_select(0, ids_t),
         )
 
+    def _forward_all_q_with_grad(self, chunk_size: int) -> torch.Tensor:
+        chunks = []
+        ids = np.arange(self.data.num_events, dtype=np.int64)
+        chunk_size = max(1, int(chunk_size))
+        for start in range(0, self.data.num_events, chunk_size):
+            _, q = self._forward_ids(ids[start : start + chunk_size])
+            chunks.append(q)
+        return torch.cat(chunks, dim=0)
+
     def train(self) -> Tuple[int, dict]:
         best_epoch = -1
         best_metrics = None
         best_key = None
         m = self.data.num_events
         batch_size = int(self.args.batch_size)
+        quiet = bool(int(getattr(self.args, "quiet", 0)))
         for epoch in range(1, int(self.args.epoch) + 1):
             self.model.train()
             order = self.rng.permutation(m)
             total_loss = 0.0
             steps = 0
             iterator = range(0, m, batch_size)
-            for start in tqdm(iterator, desc=f"Edge-HiNoS epoch {epoch}", leave=False):
+            for start in tqdm(iterator, desc=f"Edge-HiNoS epoch {epoch}", leave=False, disable=quiet):
                 batch_ids = order[start : start + batch_size]
                 union_ids = self._batch_union_ids(batch_ids)
                 local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
@@ -114,7 +134,6 @@ class EdgeHiNoSTrainer:
                 l_prox = edge_ppr_proximity_loss(
                     r_union, local_index, batch_ids, self.Pi_E, m, self.rng, self.device
                 )
-                l_ncut = edge_ncut_loss(q_union, union_ids, self.W_E, self.K)
                 l_proj = projection_loss(
                     q_batch,
                     self.src_t.index_select(0, batch_t),
@@ -124,27 +143,45 @@ class EdgeHiNoSTrainer:
                 l_bal = balance_loss(q_union, self.K)
                 loss = (
                     float(self.args.lambda_prox) * l_prox
-                    + float(self.args.lambda_edge_ncut) * l_ncut
                     + float(self.args.lambda_proj) * l_proj
                     + float(self.args.lambda_bal) * l_bal
                 )
+                if self.ncut_scope == "batch":
+                    l_ncut = edge_ncut_loss(q_union, union_ids, self.W_E, self.K)
+                    loss = loss + float(self.args.lambda_edge_ncut) * l_ncut
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 total_loss += float(loss.detach().cpu())
                 steps += 1
 
+            global_ncut = float("nan")
+            if self.ncut_scope == "global":
+                self.model.train()
+                self.optimizer.zero_grad()
+                q_all = self._forward_all_q_with_grad(int(self.args.global_q_chunk_size))
+                l_ncut_global = edge_ncut_loss_global(
+                    q_all,
+                    self.W_E,
+                    self.K,
+                    row_block_size=int(self.args.global_ncut_row_block_size),
+                )
+                (float(self.args.lambda_edge_ncut) * l_ncut_global).backward()
+                self.optimizer.step()
+                global_ncut = float(l_ncut_global.detach().cpu())
+
             if epoch % int(self.args.eval_every) == 0 or epoch == int(self.args.epoch):
                 metrics, _ = self.evaluate()
-                key = (float(metrics.get("ACC", 0.0)), float(metrics.get("F1", 0.0)))
+                key = (float(metrics.get("ACC", 0.0)), float(metrics.get("Macro_F1", 0.0)))
                 if best_key is None or key > best_key:
                     best_key = key
                     best_epoch = epoch
                     best_metrics = metrics
                 print(
-                    f"epoch={epoch} loss={total_loss / max(1, steps):.4f} "
+                    f"epoch={epoch} batch_loss={total_loss / max(1, steps):.4f} "
+                    f"global_ncut={global_ncut:.4f} "
                     f"ACC={metrics['ACC']:.4f} NMI={metrics['NMI']:.4f} "
-                    f"ARI={metrics['ARI']:.4f} F1={metrics['F1']:.4f}"
+                    f"ARI={metrics['ARI']:.4f} Macro_F1={metrics['Macro_F1']:.4f}"
                 )
         if int(self.args.save_embeddings):
             self.save_outputs()

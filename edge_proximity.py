@@ -2,8 +2,7 @@ import json
 import multiprocessing as mp
 import os
 import time
-from collections import defaultdict
-from typing import Dict, Tuple
+from typing import Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -157,9 +156,45 @@ def build_temporal_edge_event_transition(src, dst, times, num_nodes: int, edge_n
         return sp.csr_matrix((0, 0), dtype=np.float32)
 
     incident, positions = _build_temporal_incidence(src, dst, times, int(num_nodes))
-    weights: Dict[Tuple[int, int], float] = defaultdict(float)
     limit = int(edge_neighbor_k)
     beta = float(beta)
+    chunk_entries = max(1, int(os.environ.get("EDGE_TRANSITION_CHUNK_ENTRIES", "2000000")))
+    combine_chunks = max(1, int(os.environ.get("EDGE_TRANSITION_COMBINE_CHUNKS", "8")))
+    row_parts, col_parts, data_parts = [], [], []
+    buffered_entries = 0
+    partials = []
+
+    def flush_parts() -> None:
+        nonlocal row_parts, col_parts, data_parts, buffered_entries, partials
+        if buffered_entries <= 0:
+            return
+        rows_np = np.concatenate(row_parts)
+        cols_np = np.concatenate(col_parts)
+        data_np = np.concatenate(data_parts)
+        part = sp.csr_matrix((data_np, (rows_np, cols_np)), shape=(m, m), dtype=np.float32)
+        part.sum_duplicates()
+        partials.append(part)
+        row_parts, col_parts, data_parts = [], [], []
+        buffered_entries = 0
+        if len(partials) >= combine_chunks:
+            merged = partials[0]
+            for extra in partials[1:]:
+                merged = (merged + extra).tocsr()
+            merged.sum_duplicates()
+            partials = [merged]
+
+    def append_entries(row_id: int, cols, values) -> None:
+        nonlocal buffered_entries
+        cols_np = np.asarray(cols, dtype=np.int64)
+        values_np = np.asarray(values, dtype=np.float32)
+        if cols_np.size == 0:
+            return
+        row_parts.append(np.full(cols_np.shape, int(row_id), dtype=np.int64))
+        col_parts.append(cols_np)
+        data_parts.append(values_np)
+        buffered_entries += int(cols_np.size)
+        if buffered_entries >= chunk_entries:
+            flush_parts()
 
     for i in range(m):
         t0 = float(times[i])
@@ -180,23 +215,25 @@ def build_temporal_edge_event_transition(src, dst, times, num_nodes: int, edge_n
                     jpos += 1
 
             if not candidates:
-                weights[(int(i), int(i))] += 0.5
+                append_entries(int(i), [int(i)], [0.5])
                 continue
 
             raw_weights = np.asarray(raw_weights, dtype=np.float64)
             total = float(raw_weights.sum())
             if total <= 0.0 or not np.isfinite(total):
                 prob = 1.0 / float(len(candidates))
-                for j in candidates:
-                    weights[(int(i), int(j))] += 0.5 * prob
+                append_entries(int(i), candidates, np.full(len(candidates), 0.5 * prob, dtype=np.float32))
             else:
-                probs = raw_weights / total
-                for j, prob in zip(candidates, probs):
-                    weights[(int(i), int(j))] += 0.5 * float(prob)
+                append_entries(int(i), candidates, (0.5 * raw_weights / total).astype(np.float32))
 
-    rows, cols, data = zip(*((i, j, w) for (i, j), w in weights.items()))
-    P = sp.csr_matrix((data, (rows, cols)), shape=(m, m), dtype=np.float32)
-    P.sum_duplicates()
+    flush_parts()
+    if partials:
+        P = partials[0]
+        for extra in partials[1:]:
+            P = (P + extra).tocsr()
+        P.sum_duplicates()
+    else:
+        P = sp.csr_matrix((m, m), dtype=np.float32)
     rowsum = np.asarray(P.sum(axis=1)).ravel()
     bad = np.where((rowsum <= 0.0) | ~np.isfinite(rowsum))[0]
     if bad.size:
@@ -350,6 +387,7 @@ def compute_state_expanded_temporal_forest_edge_ppr(
     edge_neighbor_k: int,
     beta: float,
     seed: int,
+    quiet: bool = False,
 ) -> sp.csr_matrix:
     """SF-ETRL-inspired temporal state-expanded generalization.
 
@@ -386,11 +424,12 @@ def compute_state_expanded_temporal_forest_edge_ppr(
             for start in range(0, sample_num, chunk_size)
         ]
         progress_start = time.time()
-        print(
-            f"[temporal_state_forest] start parallel sampling samples={sample_num} "
-            f"edge_events={m} total_states={total_states} workers={workers} chunk_samples={chunk_size}",
-            flush=True,
-        )
+        if not quiet:
+            print(
+                f"[temporal_state_forest] start parallel sampling samples={sample_num} "
+                f"edge_events={m} total_states={total_states} workers={workers} chunk_samples={chunk_size}",
+                flush=True,
+            )
         Pi = None
         pending = []
         samples_done = 0
@@ -418,15 +457,16 @@ def compute_state_expanded_temporal_forest_edge_ppr(
                     pending.clear()
                 samples_done += int(sample_count)
                 hits_done += int(hit_count)
-                elapsed = time.time() - progress_start
-                avg = elapsed / max(1, samples_done)
-                eta = avg * (sample_num - samples_done)
-                print(
-                    f"[temporal_state_forest] samples={samples_done}/{sample_num} "
-                    f"elapsed={elapsed:.1f}s avg_per_sample={avg:.2f}s eta={eta:.1f}s "
-                    f"hits={hits_done} nnz={Pi.nnz if Pi is not None else 0}",
-                    flush=True,
-                )
+                if not quiet:
+                    elapsed = time.time() - progress_start
+                    avg = elapsed / max(1, samples_done)
+                    eta = avg * (sample_num - samples_done)
+                    print(
+                        f"[temporal_state_forest] samples={samples_done}/{sample_num} "
+                        f"elapsed={elapsed:.1f}s avg_per_sample={avg:.2f}s eta={eta:.1f}s "
+                        f"hits={hits_done} nnz={Pi.nnz if Pi is not None else 0}",
+                        flush=True,
+                    )
         if pending:
             batch = pending[0]
             for extra in pending[1:]:
@@ -452,11 +492,12 @@ def compute_state_expanded_temporal_forest_edge_ppr(
 
     progress_interval = max(1, sample_num // 20)
     progress_start = time.time()
-    print(
-        f"[temporal_state_forest] start sampling samples={sample_num} "
-        f"edge_events={m} total_states={total_states}",
-        flush=True,
-    )
+    if not quiet:
+        print(
+            f"[temporal_state_forest] start sampling samples={sample_num} "
+            f"edge_events={m} total_states={total_states}",
+            flush=True,
+        )
 
     for sample_idx in range(sample_num):
         in_forest.fill(False)
@@ -505,7 +546,10 @@ def compute_state_expanded_temporal_forest_edge_ppr(
                 cols.append(r)
                 data.append(hit_weight)
 
-        if (sample_idx + 1) == 1 or (sample_idx + 1) % progress_interval == 0 or (sample_idx + 1) == sample_num:
+        if (
+            not quiet
+            and ((sample_idx + 1) == 1 or (sample_idx + 1) % progress_interval == 0 or (sample_idx + 1) == sample_num)
+        ):
             elapsed = time.time() - progress_start
             done = sample_idx + 1
             avg = elapsed / done
@@ -705,12 +749,12 @@ def compute_forest_edge_ppr(
 
 def build_edge_ncut_affinity(Pi_E: sp.csr_matrix, edge_ppr_topk: int) -> sp.csr_matrix:
     W = 0.5 * (Pi_E.tocsr() + Pi_E.T.tocsr())
-    W = W.tocsr()
-    W.sum_duplicates()
+    W = W.tolil()
     W.setdiag(0.0)
-    W.eliminate_zeros()
+    W = W.tocsr()
     W = sparse_row_topk(W, edge_ppr_topk)
     W.sum_duplicates()
+    W.eliminate_zeros()
     return W.tocsr()
 
 
@@ -729,6 +773,7 @@ def compute_edge_ppr_cached(
     edge_ppr_topk: int,
     beta: float,
     seed: int,
+    quiet: bool = False,
 ) -> Tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix, dict]:
     method = str(method)
     forest_impl = {
@@ -774,10 +819,14 @@ def compute_edge_ppr_cached(
             P_E = build_sf_etrl_expanded_graph(src, dst, num_nodes)
             sp.save_npz(p_path, P_E)
 
-    if os.path.exists(pi_path) and os.path.exists(w_path):
+    cache_hit = os.path.exists(pi_path) and os.path.exists(w_path)
+    if cache_hit:
         Pi_E = sp.load_npz(pi_path).tocsr()
         W_E = sp.load_npz(w_path).tocsr()
     else:
+        prox_start = time.time()
+        if quiet and method in ["temporal_state_forest", "forest"]:
+            print(f"[proximity] start method={method} samples={int(forest_samples)}", flush=True)
         if method in ["temporal_state_forest", "forest"]:
             Pi_E = compute_state_expanded_temporal_forest_edge_ppr(
                 src=src,
@@ -790,6 +839,7 @@ def compute_edge_ppr_cached(
                 edge_neighbor_k=edge_neighbor_k,
                 beta=beta,
                 seed=seed,
+                quiet=quiet,
             )
         elif method == "legacy_temporal_forest":
             Pi_E = compute_sf_etrl_temporal_forest_edge_ppr(
@@ -807,6 +857,9 @@ def compute_edge_ppr_cached(
         elif method == "truncated":
             Pi_E = compute_truncated_edge_ppr(P_E, alpha, T, edge_ppr_topk)
         W_E = build_edge_ncut_affinity(Pi_E, edge_ppr_topk)
+        if quiet and method in ["temporal_state_forest", "forest"]:
+            elapsed = time.time() - prox_start
+            print(f"[proximity] done seconds={elapsed:.2f} Pi_nnz={Pi_E.nnz} W_nnz={W_E.nnz}", flush=True)
         sp.save_npz(pi_path, Pi_E)
         sp.save_npz(w_path, W_E)
         with open(meta_path, "w", encoding="utf-8") as writer:
@@ -814,6 +867,7 @@ def compute_edge_ppr_cached(
 
     stats = {
         "config_hash": cfg_hash,
+        "cache_hit": bool(cache_hit),
         "P_shape": P_E.shape,
         "P_nnz": int(P_E.nnz),
         "P_avg_outdegree": float(P_E.nnz / max(1, P_E.shape[0])),
