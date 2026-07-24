@@ -876,5 +876,6 @@ def compute_edge_ppr_cached(
         "Pi_avg_row_nnz": float(Pi_E.nnz / max(1, Pi_E.shape[0])),
         "W_shape": W_E.shape,
         "W_nnz": int(W_E.nnz),
+        "W_avg_row_nnz": float(W_E.nnz / max(1, W_E.shape[0])),
     }
     return P_E, Pi_E, W_E, stats

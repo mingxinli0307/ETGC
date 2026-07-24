@@ -1,7 +1,161 @@
+import warnings
+
 import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn.functional as F
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="Sparse invariant checks are implicitly disabled.*",
+    category=UserWarning,
+)
+if hasattr(torch.sparse, "check_sparse_tensor_invariants"):
+    torch.sparse.check_sparse_tensor_invariants.disable()
+
+
+def scipy_csr_to_torch_sparse_coo(
+    mat: sp.spmatrix,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    mat = mat.tocoo()
+    indices = torch.stack(
+        [
+            torch.from_numpy(mat.row.astype(np.int64, copy=False)),
+            torch.from_numpy(mat.col.astype(np.int64, copy=False)),
+        ],
+        dim=0,
+    ).to(device=device)
+    values = torch.from_numpy(mat.data.astype(np.float32, copy=False)).to(device=device, dtype=dtype)
+    return torch.sparse_coo_tensor(indices, values, size=mat.shape, device=device, dtype=dtype).coalesce()
+
+
+def _as_degree_tensor(degree, Q_all: torch.Tensor) -> torch.Tensor:
+    if isinstance(degree, torch.Tensor):
+        return degree.to(device=Q_all.device, dtype=Q_all.dtype)
+    degree_np = np.asarray(degree, dtype=np.float32).reshape(-1)
+    return torch.from_numpy(degree_np).to(device=Q_all.device, dtype=Q_all.dtype)
+
+
+def _check_scalar_finite(name: str, value: torch.Tensor, stats: dict) -> None:
+    if not torch.isfinite(value).all():
+        details = ", ".join(f"{k}={v}" for k, v in stats.items())
+        raise FloatingPointError(f"{name} is not finite in trace mincut loss: {details}")
+
+
+def _sparse_block_wq_numerator(W_E: sp.csr_matrix, Q_all: torch.Tensor, row_block_size: int) -> torch.Tensor:
+    W_E = W_E.tocsr()
+    m = int(W_E.shape[0])
+    block_size = max(1, int(row_block_size))
+    numerator = Q_all.new_zeros(())
+    for start in range(0, m, block_size):
+        end = min(m, start + block_size)
+        sub = W_E[start:end].tocoo()
+        if sub.nnz == 0:
+            continue
+        indices = torch.stack(
+            [
+                torch.from_numpy(sub.row.astype(np.int64, copy=False)),
+                torch.from_numpy(sub.col.astype(np.int64, copy=False)),
+            ],
+            dim=0,
+        ).to(device=Q_all.device)
+        values = torch.from_numpy(sub.data.astype(np.float32, copy=False)).to(
+            device=Q_all.device, dtype=Q_all.dtype
+        )
+        W_block = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(end - start, m),
+            device=Q_all.device,
+            dtype=Q_all.dtype,
+        ).coalesce()
+        WQ_block = torch.sparse.mm(W_block, Q_all)
+        numerator = numerator + (Q_all[start:end] * WQ_block).sum()
+    return numerator
+
+
+def edge_trace_mincut_loss_global(
+    Q_all: torch.Tensor,
+    W_E,
+    degree,
+    K: int,
+    lambda_orth: float = 1.0,
+    eps: float = 1e-12,
+    row_block_size: int = 65536,
+) -> tuple:
+    """Global trace mincut over all temporal edge events.
+
+    Computes O(nnz(W_E) K + M K^2) work without materializing dense W_E or D_E.
+    The legacy sum-of-ratios normalized association loss is intentionally kept
+    separate in edge_ncut_loss_global for compatibility and diagnostics.
+    """
+    if Q_all.dim() != 2:
+        raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
+    m = int(Q_all.size(0))
+    k = int(Q_all.size(1))
+    if k != int(K):
+        raise ValueError(f"Q_all has K={k}, expected K={K}")
+
+    if isinstance(W_E, torch.Tensor):
+        if W_E.shape[0] != W_E.shape[1] or int(W_E.shape[0]) != m:
+            raise ValueError(f"W_E shape={tuple(W_E.shape)} does not match Q_all rows={m}")
+        if W_E.layout not in (torch.sparse_coo, torch.sparse_csr):
+            raise ValueError(f"W_E tensor must be sparse COO/CSR, got layout={W_E.layout}")
+        W_sparse = W_E.to(device=Q_all.device, dtype=Q_all.dtype)
+        WQ = torch.sparse.mm(W_sparse, Q_all)
+        numerator = (Q_all * WQ).sum()
+        nnz = int(W_sparse._nnz())
+    else:
+        W_csr = W_E.tocsr()
+        if W_csr.shape[0] != W_csr.shape[1] or int(W_csr.shape[0]) != m:
+            raise ValueError(f"W_E shape={W_csr.shape} does not match Q_all rows={m}")
+        numerator = _sparse_block_wq_numerator(W_csr, Q_all, int(row_block_size))
+        nnz = int(W_csr.nnz)
+
+    degree_t = _as_degree_tensor(degree, Q_all)
+    if int(degree_t.numel()) != m:
+        raise ValueError(f"degree length={degree_t.numel()} does not match Q_all rows={m}")
+    denominator = (degree_t.unsqueeze(1) * Q_all.square()).sum()
+    denom_value = float(denominator.detach().cpu())
+    stats = {
+        "M": m,
+        "K": int(K),
+        "W_nnz": nnz,
+        "numerator": float(numerator.detach().cpu()),
+        "denominator": denom_value,
+        "degree_min": float(degree_t.detach().min().cpu()) if degree_t.numel() else 0.0,
+        "degree_max": float(degree_t.detach().max().cpu()) if degree_t.numel() else 0.0,
+        "Q_min": float(Q_all.detach().min().cpu()) if Q_all.numel() else 0.0,
+        "Q_max": float(Q_all.detach().max().cpu()) if Q_all.numel() else 0.0,
+    }
+    _check_scalar_finite("trace_mincut numerator", numerator, stats)
+    _check_scalar_finite("trace_mincut denominator", denominator, stats)
+    if denom_value <= 0.0:
+        details = ", ".join(f"{key}={value}" for key, value in stats.items())
+        raise FloatingPointError(f"trace_mincut denominator is not positive: {details}")
+
+    cut_loss = -numerator / (denominator + float(eps))
+    QtQ = Q_all.t().mm(Q_all)
+    QtQ_norm = torch.linalg.norm(QtQ, ord="fro").clamp_min(float(eps))
+    QtQ_normalized = QtQ / QtQ_norm
+    target = torch.eye(int(K), dtype=Q_all.dtype, device=Q_all.device) / (float(K) ** 0.5)
+    orth_loss = torch.linalg.norm(QtQ_normalized - target, ord="fro")
+    total_cluster_loss = cut_loss + float(lambda_orth) * orth_loss
+
+    stats.update(
+        {
+            "cut_loss": float(cut_loss.detach().cpu()),
+            "orth_loss": float(orth_loss.detach().cpu()),
+            "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
+        }
+    )
+    _check_scalar_finite("trace_mincut cut_loss", cut_loss, stats)
+    _check_scalar_finite("trace_mincut orth_loss", orth_loss, stats)
+    _check_scalar_finite("trace_mincut total_cluster_loss", total_cluster_loss, stats)
+    return total_cluster_loss, cut_loss, orth_loss
 
 
 def edge_ppr_proximity_loss(
@@ -104,6 +258,33 @@ def projection_loss(Q_batch: torch.Tensor, src_batch: torch.Tensor, dst_batch: t
     su = S.index_select(0, src_batch.long())
     sv = S.index_select(0, dst_batch.long())
     return -(Q_batch * torch.log(su * sv + 1e-8)).sum(dim=1).mean()
+
+
+def project_edge_assignments_to_nodes_global(
+    Q_all: torch.Tensor,
+    src_all: torch.Tensor,
+    dst_all: torch.Tensor,
+    num_nodes: int,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    K = Q_all.size(1)
+    S_raw = torch.zeros((int(num_nodes), K), dtype=Q_all.dtype, device=Q_all.device)
+    S_raw.index_add_(0, src_all.long(), Q_all)
+    S_raw.index_add_(0, dst_all.long(), Q_all)
+    return S_raw / S_raw.sum(dim=1, keepdim=True).clamp_min(float(eps))
+
+
+def projection_loss_global(
+    Q_all: torch.Tensor,
+    src_all: torch.Tensor,
+    dst_all: torch.Tensor,
+    num_nodes: int,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    S_all = project_edge_assignments_to_nodes_global(Q_all, src_all, dst_all, num_nodes, eps)
+    su = S_all.index_select(0, src_all.long())
+    sv = S_all.index_select(0, dst_all.long())
+    return -(Q_all * torch.log(su * sv + float(eps))).sum(dim=1).mean()
 
 
 def balance_loss(Q: torch.Tensor, K: int) -> torch.Tensor:

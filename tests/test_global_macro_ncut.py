@@ -10,10 +10,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from edge_losses import edge_ncut_loss, edge_ncut_loss_global
+from edge_losses import (
+    edge_ncut_loss,
+    edge_ncut_loss_global,
+    edge_trace_mincut_loss_global,
+    project_edge_assignments_to_nodes_global,
+    projection_loss_global,
+    scipy_csr_to_torch_sparse_coo,
+)
 from edge_metrics import align_predicted_labels, evaluate_node_clustering
 from edge_model import EdgeHiNoSModel
 from edge_proximity import build_temporal_edge_event_transition, sparse_row_topk
+from edge_train import build_optimizer_for_node_emb_mode
 
 
 def _toy_affinity():
@@ -70,6 +78,137 @@ def test_global_ncut_backpropagates_to_model_parameters():
     assert grads
     assert all(torch.isfinite(g).all() for g in grads)
     assert any(float(g.abs().sum()) > 0.0 for g in grads)
+
+
+def test_trace_mincut_matches_dense_reference_sparse_and_block():
+    torch.manual_seed(2)
+    W = _toy_affinity()
+    Q = torch.softmax(torch.randn(4, 3), dim=1)
+    degree = np.asarray(W.sum(axis=1)).ravel().astype(np.float32)
+    W_dense = torch.from_numpy(W.toarray()).float()
+    degree_t = torch.from_numpy(degree).float()
+    lambda_orth = 0.7
+
+    reference_cut = -torch.trace(Q.t() @ W_dense @ Q) / torch.trace(Q.t() @ torch.diag(degree_t) @ Q)
+    QtQ = Q.t() @ Q
+    reference_orth = torch.linalg.norm(
+        QtQ / torch.linalg.norm(QtQ, ord="fro") - torch.eye(3) / (3.0 ** 0.5),
+        ord="fro",
+    )
+    reference_total = reference_cut + lambda_orth * reference_orth
+
+    total_block, cut_block, orth_block = edge_trace_mincut_loss_global(
+        Q, W, degree, 3, lambda_orth=lambda_orth, row_block_size=2
+    )
+    W_sparse = scipy_csr_to_torch_sparse_coo(W, Q.device, Q.dtype)
+    total_sparse, cut_sparse, orth_sparse = edge_trace_mincut_loss_global(
+        Q, W_sparse, degree, 3, lambda_orth=lambda_orth, row_block_size=2
+    )
+
+    assert abs(float(cut_block - reference_cut)) < 1e-5
+    assert abs(float(orth_block - reference_orth)) < 1e-5
+    assert abs(float(total_block - reference_total)) < 1e-5
+    assert abs(float(cut_sparse - reference_cut)) < 1e-5
+    assert abs(float(orth_sparse - reference_orth)) < 1e-5
+    assert abs(float(total_sparse - reference_total)) < 1e-5
+
+
+def test_trace_numerator_equals_q_times_wq():
+    torch.manual_seed(3)
+    W = torch.from_numpy(_toy_affinity().toarray()).float()
+    Q = torch.softmax(torch.randn(4, 2), dim=1)
+    trace_value = torch.trace(Q.t() @ W @ Q)
+    q_wq_value = (Q * (W @ Q)).sum()
+    assert abs(float(trace_value - q_wq_value)) < 1e-6
+
+
+def test_trace_denominator_equals_degree_weighted_q_square():
+    torch.manual_seed(4)
+    W = torch.from_numpy(_toy_affinity().toarray()).float()
+    degree = W.sum(dim=1)
+    Q = torch.softmax(torch.randn(4, 2), dim=1)
+    trace_value = torch.trace(Q.t() @ torch.diag(degree) @ Q)
+    weighted_value = (degree.unsqueeze(1) * Q.square()).sum()
+    assert abs(float(trace_value - weighted_value)) < 1e-6
+
+
+def test_trace_orthogonality_term_matches_formula():
+    torch.manual_seed(5)
+    Q = torch.softmax(torch.randn(5, 3), dim=1)
+    QtQ = Q.t() @ Q
+    expected = torch.linalg.norm(
+        QtQ / torch.linalg.norm(QtQ, ord="fro") - torch.eye(3) / (3.0 ** 0.5),
+        ord="fro",
+    )
+    W = sp.eye(5, format="csr", dtype=np.float32)
+    total, cut, got = edge_trace_mincut_loss_global(Q, W, np.ones(5, dtype=np.float32), 3)
+    del total, cut
+    assert abs(float(got - expected)) < 1e-6
+
+
+def test_trace_mincut_projection_joint_backward_is_finite_and_nonzero():
+    torch.manual_seed(6)
+    W = _toy_affinity()
+    logits = torch.randn(4, 3, requires_grad=True)
+    Q = torch.softmax(logits, dim=1)
+    degree = np.asarray(W.sum(axis=1)).ravel().astype(np.float32)
+    cluster_loss, cut_loss, orth_loss = edge_trace_mincut_loss_global(Q, W, degree, 3, row_block_size=2)
+    proj_loss = projection_loss_global(
+        Q,
+        torch.tensor([0, 1, 2, 0], dtype=torch.long),
+        torch.tensor([1, 2, 3, 3], dtype=torch.long),
+        num_nodes=4,
+    )
+    loss = cluster_loss + proj_loss
+    loss.backward()
+    assert torch.isfinite(cluster_loss)
+    assert torch.isfinite(cut_loss)
+    assert torch.isfinite(orth_loss)
+    assert torch.isfinite(proj_loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert float(logits.grad.abs().sum()) > 0.0
+
+
+def test_global_projection_matches_explicit_incidence_matrix():
+    torch.manual_seed(7)
+    Q = torch.softmax(torch.randn(4, 3), dim=1)
+    src = torch.tensor([0, 1, 2, 0], dtype=torch.long)
+    dst = torch.tensor([1, 2, 3, 3], dtype=torch.long)
+    B = torch.zeros((4, 4), dtype=Q.dtype)
+    for i, (u, v) in enumerate(zip(src.tolist(), dst.tolist())):
+        B[u, i] += 1.0
+        B[v, i] += 1.0
+    S_ref = B @ Q
+    S_ref = S_ref / S_ref.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    S_got = project_edge_assignments_to_nodes_global(Q, src, dst, num_nodes=4)
+    assert float((S_ref - S_got).abs().max()) < 1e-6
+
+
+def test_node_embedding_optimizer_modes():
+    rng = np.random.RandomState(8)
+    initial = rng.normal(0.0, 0.1, size=(4, 5)).astype(np.float32)
+
+    frozen_model = EdgeHiNoSModel(initial, 3, 6, 8, 5, 2, False)
+    frozen_opt, frozen_info = build_optimizer_for_node_emb_mode(frozen_model, 1e-4, "frozen", 1e-5)
+    _, Q = frozen_model(torch.tensor([0, 1]), torch.tensor([1, 2]), torch.randn(2, 3))
+    Q.sum().backward()
+    assert frozen_info["node_emb_trainable"] is False
+    assert frozen_model.node_emb.grad is None
+    assert all(id(frozen_model.node_emb) not in {id(p) for p in group["params"]} for group in frozen_opt.param_groups)
+
+    small_model = EdgeHiNoSModel(initial, 3, 6, 8, 5, 2, False)
+    small_opt, small_info = build_optimizer_for_node_emb_mode(small_model, 1e-4, "small_lr", 1e-5)
+    group_lrs = sorted(group["lr"] for group in small_opt.param_groups)
+    group_param_ids = [id(p) for group in small_opt.param_groups for p in group["params"]]
+    assert small_info["node_emb_trainable"] is True
+    assert group_lrs == [1e-5, 1e-4]
+    assert len(group_param_ids) == len(set(group_param_ids))
+
+    full_model = EdgeHiNoSModel(initial, 3, 6, 8, 5, 2, False)
+    full_opt, full_info = build_optimizer_for_node_emb_mode(full_model, 1e-4, "full", 1e-5)
+    assert full_info["node_emb_trainable"] is True
+    assert [group["lr"] for group in full_opt.param_groups] == [1e-4]
 
 
 def test_sparse_row_topk_negative_keeps_matrix():

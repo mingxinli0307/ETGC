@@ -43,14 +43,21 @@ def build_parser():
         default="temporal_state_forest",
     )
     parser.add_argument("--forest_samples", type=int, default=5)
-    parser.add_argument("--ncut_scope", choices=["batch", "global"], default="batch")
+    parser.add_argument("--ncut_scope", choices=["batch", "global"], default="global")
+    parser.add_argument("--cluster_loss_type", choices=["trace_mincut", "legacy_ncut"], default="trace_mincut")
     parser.add_argument("--global_q_chunk_size", type=int, default=8192)
     parser.add_argument("--global_ncut_row_block_size", type=int, default=65536)
+    parser.add_argument("--global_warmup_epochs", type=int, default=0)
     parser.add_argument("--quiet", type=int, default=0)
     parser.add_argument("--lambda_prox", type=float, default=1.0)
     parser.add_argument("--lambda_edge_ncut", type=float, default=0.5)
+    parser.add_argument("--lambda_orth", type=float, default=1.0)
     parser.add_argument("--lambda_proj", type=float, default=0.2)
     parser.add_argument("--lambda_bal", type=float, default=50.0)
+    parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="full")
+    parser.add_argument("--node_emb_lr", type=float, default=1e-5)
+    parser.add_argument("--diagnostic_stages", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--output_dir", default="")
     parser.add_argument("--eval_every", type=int, default=1)
     parser.add_argument("--save_embeddings", type=int, default=0)
     return parser
@@ -71,18 +78,25 @@ def print_config(args, K=None):
     print("time_usage=raw_normalized_float_timestamp")
     print(f"K_edge=K_node={K if K is not None else 'from node2label unique labels'}")
     print("projection=S=RowNorm(B_T Q)")
+    print("cluster_objective=global trace mincut" if args.cluster_loss_type == "trace_mincut" else "cluster_objective=legacy ncut")
+    print("trace_mincut_complexity=O(nnz(W_E) K + M K^2)")
     print(
         f"alpha={args.alpha}, T={args.T}, beta={args.beta}, edge_neighbor_k={args.edge_neighbor_k}, "
         f"edge_ppr_topk={args.edge_ppr_topk}, forest_samples={args.forest_samples}"
     )
     print(
         f"ncut_scope={args.ncut_scope}, global_q_chunk_size={args.global_q_chunk_size}, "
-        f"global_ncut_row_block_size={args.global_ncut_row_block_size}, F1_type=macro"
+        f"global_ncut_row_block_size={args.global_ncut_row_block_size}, "
+        f"global_warmup_epochs={args.global_warmup_epochs}, F1_type=macro"
     )
+    print(f"cluster_loss_type={args.cluster_loss_type}, lambda_orth={args.lambda_orth}")
     print(
         f"lambda_prox={args.lambda_prox}, lambda_edge_ncut={args.lambda_edge_ncut}, "
         f"lambda_proj={args.lambda_proj}, lambda_bal={args.lambda_bal}"
     )
+    print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
+    print(f"node_emb_mode={args.node_emb_mode}, node_emb_lr={args.node_emb_lr}")
+    print(f"diagnostic_stages={args.diagnostic_stages}")
     print("====================================\n")
 
 
@@ -99,16 +113,28 @@ def main(args):
     trainer = EdgeHiNoSTrainer(args)
     print_config(args, trainer.K)
     stats = trainer.prox_stats
+    trainer.write_config_json()
     print(f"seed={args.seed}")
     print(f"resolved_device={trainer.device}")
     print(f"num_nodes={trainer.data.num_nodes} num_events={trainer.data.num_events} K={trainer.K}")
     print(f"P_E shape={stats['P_shape']} nnz={stats['P_nnz']} avg_outdegree={stats['P_avg_outdegree']:.4f}")
     print(f"Pi_E shape={stats['Pi_shape']} nnz={stats['Pi_nnz']} avg_row_nnz={stats['Pi_avg_row_nnz']:.4f}")
     print(f"W_E shape={stats['W_shape']} nnz={stats['W_nnz']}")
+    print(f"W_E avg_row_nnz={stats['W_avg_row_nnz']:.4f}")
     print(f"edge_ppr_topk={args.edge_ppr_topk}")
+    print(f"edge_neighbor_k={args.edge_neighbor_k}")
+    print(f"forest_samples={args.forest_samples}")
     print(f"Pi_E nnz={stats['Pi_nnz']}")
     print(f"W_E nnz={stats['W_nnz']}")
+    print(f"W_E average nnz per row={stats['W_avg_row_nnz']:.4f}")
     print(f"ncut_scope={args.ncut_scope}")
+    print(f"cluster_loss_type={args.cluster_loss_type}")
+    print(f"lambda_orth={args.lambda_orth}")
+    print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
+    print(f"W_E_sparse_mode={trainer.W_E_sparse_mode}")
+    print(f"node_emb_mode_effective={trainer.node_emb_optimizer_info['node_emb_mode']}")
+    print(f"node_emb_lr_effective={trainer.node_emb_optimizer_info['node_emb_lr']}")
+    print(f"other_lr_effective={trainer.node_emb_optimizer_info['other_lr']}")
     print("F1_type=macro")
     if trainer.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(trainer.device)
@@ -119,6 +145,12 @@ def main(args):
     else:
         peak_gpu_memory_mb = 0.0
     runtime_seconds = time.time() - start_time
+    trainer.write_result_json(
+        best_epoch=best_epoch,
+        best_metrics=metrics,
+        final_metrics=getattr(trainer, "final_metrics", metrics),
+        runtime_seconds=runtime_seconds,
+    )
     print("\nFinal Results:")
     print(f"best_epoch={best_epoch}")
     for key in ["ACC", "NMI", "ARI", "Macro_F1"]:
