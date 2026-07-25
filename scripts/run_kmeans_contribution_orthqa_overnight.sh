@@ -10,7 +10,7 @@ RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/logs/kmeans_contribution_orthqa_overnight/${RUN_TIMESTAMP}}"
 CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-${ROOT_DIR}/logs/trace_mincut_global/20260724_002532/phase1_diagnosis}"
 
-GROUPS=("all")
+SELECTED_GROUPS=("all")
 RESUME=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,7 +19,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --all)
-      GROUPS=("all")
+      SELECTED_GROUPS=("all")
       shift
       ;;
     --group)
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
         echo "--group requires A, B, C, or D" >&2
         exit 2
       fi
-      GROUPS=("$2")
+      SELECTED_GROUPS=("$2")
       shift 2
       ;;
     *)
@@ -64,7 +64,7 @@ cat > "${OUT_DIR}/code_info/common_config.json" <<EOF
 {
   "method": "ETGC",
   "forest_seed": 20260725,
-  "groups": ["${GROUPS[*]}"],
+  "groups": ["${SELECTED_GROUPS[*]}"],
   "epochs": 30,
   "edge_ppr_method": "temporal_state_forest",
   "edge_ppr_topk": -1,
@@ -91,7 +91,7 @@ CMD=(
   "--python" "${PYTHON_BIN}"
   "--device" "${DEVICE_ARG}"
   "--config-source-dir" "${CONFIG_SOURCE_DIR}"
-  "--groups" "${GROUPS[@]}"
+  "--groups" "${SELECTED_GROUPS[@]}"
 )
 if [[ "${RESUME}" -eq 1 ]]; then
   CMD+=("--resume")
