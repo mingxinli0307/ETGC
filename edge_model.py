@@ -67,7 +67,7 @@ class EdgeHiNoSModel(nn.Module):
             nn.Linear(cluster_hidden_dim, K),
         )
 
-    def forward(self, src: torch.Tensor, dst: torch.Tensor, time_feat: torch.Tensor):
+    def forward(self, src: torch.Tensor, dst: torch.Tensor, time_feat: torch.Tensor, return_logits: bool = False):
         h_u = self.node_emb.index_select(0, src.long())
         h_v = self.node_emb.index_select(0, dst.long())
         if self.directed:
@@ -76,5 +76,8 @@ class EdgeHiNoSModel(nn.Module):
             pair_feat = torch.cat([h_u + h_v, torch.abs(h_u - h_v), h_u * h_v], dim=-1)
         x_e = torch.cat([pair_feat, time_feat], dim=-1)
         r_e = self.edge_mlp(x_e)
-        q_e = F.softmax(self.cluster_head(r_e), dim=-1)
+        logits = self.cluster_head(r_e)
+        q_e = F.softmax(logits, dim=-1)
+        if return_logits:
+            return r_e, q_e, logits
         return r_e, q_e

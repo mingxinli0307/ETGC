@@ -57,6 +57,9 @@ def build_parser():
     parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="full")
     parser.add_argument("--node_emb_lr", type=float, default=1e-5)
     parser.add_argument("--diagnostic_stages", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--uniform_collapse_diagnostic", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--diagnostic_output_dir", default="diagnostics/uniform_collapse")
+    parser.add_argument("--diagnostic_only_first_epoch", type=int, default=1)
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--eval_every", type=int, default=1)
     parser.add_argument("--save_embeddings", type=int, default=0)
@@ -97,6 +100,9 @@ def print_config(args, K=None):
     print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
     print(f"node_emb_mode={args.node_emb_mode}, node_emb_lr={args.node_emb_lr}")
     print(f"diagnostic_stages={args.diagnostic_stages}")
+    print(f"uniform_collapse_diagnostic={args.uniform_collapse_diagnostic}")
+    print(f"diagnostic_output_dir={args.diagnostic_output_dir}")
+    print(f"diagnostic_only_first_epoch={args.diagnostic_only_first_epoch}")
     print("====================================\n")
 
 
@@ -109,6 +115,7 @@ def main(args):
     if args.feature_path:
         args.feature_path = resolve_path(cur_dir, args.feature_path)
     args.cache_dir = resolve_path(cur_dir, args.cache_dir)
+    args.diagnostic_output_dir = resolve_path(cur_dir, args.diagnostic_output_dir)
     set_random_seed(args.seed)
     trainer = EdgeHiNoSTrainer(args)
     print_config(args, trainer.K)
