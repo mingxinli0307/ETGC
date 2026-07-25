@@ -8,10 +8,12 @@ import numpy as np
 import torch
 from torch.optim import Adam
 from tqdm import tqdm
+from sklearn.metrics import adjusted_rand_score
 
 from edge_data import load_edge_event_data
 from edge_losses import (
     balance_loss,
+    edge_orthqa_penalty_global,
     edge_ncut_loss,
     edge_ncut_loss_global,
     edge_ppr_proximity_loss,
@@ -21,17 +23,38 @@ from edge_losses import (
     scipy_csr_to_torch_sparse_coo,
 )
 from edge_metrics import evaluate_node_clustering
-from edge_model import EdgeHiNoSModel, initialize_cluster_output_from_prototypes, load_pretrained_node_features
+from edge_model import (
+    EdgeHiNoSModel,
+    assign_all_to_centers,
+    fit_kmeans_centers,
+    initialize_cluster_output_from_prototypes,
+    initialize_cluster_output_random_event,
+    initialize_cluster_output_random_orthogonal,
+    load_pretrained_node_features,
+    tensor_checksum,
+)
 from edge_proximity import compute_edge_ppr_cached
 from edge_time import build_edge_time_features
 from edge_uniform_diagnostic import (
     cluster_head_gradient_diagnostics,
+    cluster_volume_statistics,
     compute_uniform_collapse_stage,
     print_stage_summary,
     uniform_delta,
     write_diagnostic_outputs,
 )
 from utils import choose_device, ensure_dir
+
+
+def edge_hard_labels_to_node_predictions(edge_labels: np.ndarray, src: np.ndarray, dst: np.ndarray, num_nodes: int, K: int) -> np.ndarray:
+    edge_labels = np.asarray(edge_labels, dtype=np.int64).reshape(-1)
+    q_hard = np.zeros((int(edge_labels.shape[0]), int(K)), dtype=np.float32)
+    q_hard[np.arange(edge_labels.shape[0]), edge_labels] = 1.0
+    S = np.zeros((int(num_nodes), int(K)), dtype=np.float32)
+    np.add.at(S, np.asarray(src, dtype=np.int64), q_hard)
+    np.add.at(S, np.asarray(dst, dtype=np.int64), q_hard)
+    S = S / np.maximum(S.sum(axis=1, keepdims=True), 1e-8)
+    return S.argmax(axis=1).astype(np.int64)
 
 
 def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb_mode: str, node_emb_lr: float):
@@ -91,7 +114,10 @@ class EdgeHiNoSTrainer:
     def __init__(self, args):
         self.args = args
         self.device = choose_device(args.device)
-        self.rng = np.random.RandomState(int(args.seed))
+        self.model_seed = int(getattr(args, "model_seed", args.seed))
+        self.prototype_seed = int(getattr(args, "prototype_seed", self.model_seed))
+        self.forest_seed = int(getattr(args, "forest_seed", args.seed))
+        self.rng = np.random.RandomState(self.model_seed)
         self.ncut_scope = str(getattr(args, "ncut_scope", "batch")).lower()
         if self.ncut_scope not in {"batch", "global"}:
             raise ValueError(f"Unsupported ncut_scope: {self.ncut_scope}")
@@ -121,7 +147,7 @@ class EdgeHiNoSTrainer:
             edge_neighbor_k=args.edge_neighbor_k,
             edge_ppr_topk=args.edge_ppr_topk,
             beta=args.beta,
-            seed=args.seed,
+            seed=self.forest_seed,
             quiet=bool(int(getattr(args, "quiet", 0))),
         )
         self.Pi_E.sort_indices()
@@ -143,7 +169,7 @@ class EdgeHiNoSTrainer:
 
         feature_path = self._resolve_feature_path()
         node_features = load_pretrained_node_features(
-            feature_path, self.data.num_nodes, int(args.edge_dim), int(args.seed)
+            feature_path, self.data.num_nodes, int(args.edge_dim), self.model_seed
         )
         self.model = EdgeHiNoSModel(
             initial_node_features=node_features,
@@ -164,12 +190,17 @@ class EdgeHiNoSTrainer:
         self.metrics_csv_path = os.path.join(self.output_dir, "metrics.csv") if self.output_dir else ""
         self.epoch_records = []
         self.best_epoch_record = None
-        self.uniform_collapse_diagnostic = bool(int(getattr(args, "uniform_collapse_diagnostic", 0)))
+        self.overnight_diagnostic = bool(int(getattr(args, "overnight_diagnostic", 0)))
+        self.uniform_collapse_diagnostic = bool(int(getattr(args, "uniform_collapse_diagnostic", 0))) or self.overnight_diagnostic
         self.diagnostic_only_first_epoch = bool(int(getattr(args, "diagnostic_only_first_epoch", 1)))
         self.uniform_diag_dir = self._resolve_uniform_diag_dir()
         self.uniform_diag_stages = {}
         self.uniform_diag_delta = {}
         self.uniform_diag_after_first_done = False
+        self.diagnostic_epochs = self._parse_diagnostic_epochs(getattr(args, "diagnostic_epochs", "1,5,10,20,30"))
+        self.init_reference = None
+        self.init_reference_weight = None
+        self.init_reference_metrics = None
         self.model_init_info = self._current_cluster_output_stats()
         self.model_init_info["cluster_output_bias_mode"] = str(getattr(args, "cluster_output_bias_mode", "default"))
         self.model_init_info["cluster_input_norm"] = str(getattr(args, "cluster_input_norm", "none"))
@@ -178,20 +209,40 @@ class EdgeHiNoSTrainer:
         self.model_init_info["cluster_output_weight_l2_initial"] = self.model_init_info["cluster_output_weight_l2"]
         self.model_init_info["prototype_init_executed"] = False
         self._record_uniform_stage_no_grad("after_model_initialization")
-        if str(getattr(args, "cluster_init_mode", "random")).lower() == "prototype":
-            self.model_init_info.update(self._initialize_cluster_output_prototypes())
-            self.model_init_info["prototype_init_executed"] = True
-            self.model_init_info["cluster_output_bias_l2_after_prototype"] = self._current_cluster_output_stats()["output_bias_l2"]
-            self.model_init_info["cluster_output_weight_l2_after_prototype"] = self._current_cluster_output_stats()["cluster_output_weight_l2"]
-            self._record_uniform_stage_no_grad("after_prototype_initialization")
-        elif str(getattr(args, "cluster_init_mode", "random")).lower() != "random":
-            raise ValueError(f"Unsupported cluster_init_mode: {getattr(args, 'cluster_init_mode', None)}")
-        self.optimizer, self.node_emb_optimizer_info = build_optimizer_for_node_emb_mode(
-            self.model,
-            lr=float(args.learning_rate),
-            node_emb_mode=getattr(args, "node_emb_mode", "full"),
-            node_emb_lr=float(getattr(args, "node_emb_lr", 1e-5)),
-        )
+        self._apply_cluster_initialization()
+        self.model_init_info["cluster_output_bias_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["output_bias_l2"]
+        self.model_init_info["cluster_output_weight_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["cluster_output_weight_l2"]
+        self._record_uniform_stage_no_grad("after_cluster_initialization")
+        self._capture_init_reference()
+        if bool(int(getattr(args, "direct_kmeans_eval", 0))):
+            self.optimizer = None
+            self.node_emb_optimizer_info = {
+                "node_emb_mode": str(getattr(args, "node_emb_mode", "full")),
+                "node_emb_trainable": bool(self.model.node_emb.requires_grad),
+                "node_emb_lr": 0.0,
+                "other_lr": 0.0,
+                "param_group_lrs": [],
+                "optimizer_created": False,
+            }
+        else:
+            self.optimizer, self.node_emb_optimizer_info = build_optimizer_for_node_emb_mode(
+                self.model,
+                lr=float(args.learning_rate),
+                node_emb_mode=getattr(args, "node_emb_mode", "full"),
+                node_emb_lr=float(getattr(args, "node_emb_lr", 1e-5)),
+            )
+
+    @staticmethod
+    def _parse_diagnostic_epochs(value) -> set:
+        if value is None:
+            return set()
+        result = set()
+        for part in str(value).replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            result.add(int(part))
+        return result
 
     def _resolve_feature_path(self) -> str:
         if getattr(self.args, "feature_path", ""):
@@ -318,17 +369,114 @@ class EdgeHiNoSTrainer:
             "cluster_output_weight_l2": float(torch.linalg.norm(self.model.cluster_output.weight.detach()).cpu()),
         }
 
-    def _initialize_cluster_output_prototypes(self) -> dict:
+    def _apply_cluster_initialization(self) -> None:
+        mode = str(getattr(self.args, "cluster_init_mode", "random")).lower()
+        if mode == "random":
+            self.model_init_info["cluster_init_mode_effective"] = "random"
+            self.model_init_info["initial_cluster_weight_checksum"] = tensor_checksum(
+                self.model.cluster_output.weight.detach()
+            )
+            return
+        if mode == "random_orthogonal":
+            self.model_init_info.update(
+                initialize_cluster_output_random_orthogonal(self.model, self.K, seed=self.prototype_seed)
+            )
+            return
         hidden = self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
+        self.model_init_info["cluster_hidden_checksum"] = tensor_checksum(hidden)
+        if mode == "random_event":
+            self.model_init_info.update(
+                initialize_cluster_output_random_event(
+                    self.model,
+                    hidden,
+                    K=self.K,
+                    seed=self.prototype_seed,
+                )
+            )
+            return
+        if mode == "kmeans_plus_plus":
+            self.model_init_info.update(
+                initialize_cluster_output_from_prototypes(
+                    self.model,
+                    hidden,
+                    K=self.K,
+                    seed=self.prototype_seed,
+                    sample_size=int(getattr(self.args, "prototype_sample_size", 20000)),
+                    lloyd_iters=0,
+                )
+            )
+            self.model_init_info["prototype_init_executed"] = True
+            self.model_init_info["cluster_init_mode_effective"] = "kmeans_plus_plus"
+            self._record_uniform_stage_no_grad("after_prototype_initialization")
+            return
+        if mode == "prototype":
+            self.model_init_info.update(self._initialize_cluster_output_prototypes(hidden=hidden))
+            self.model_init_info["prototype_init_executed"] = True
+            self._record_uniform_stage_no_grad("after_prototype_initialization")
+            return
+        raise ValueError(f"Unsupported cluster_init_mode: {getattr(self.args, 'cluster_init_mode', None)}")
+
+    def _initialize_cluster_output_prototypes(self, hidden=None) -> dict:
+        if hidden is None:
+            hidden = self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
         stats = initialize_cluster_output_from_prototypes(
             self.model,
             hidden,
             K=self.K,
-            seed=int(self.args.seed),
+            seed=self.prototype_seed,
             sample_size=int(getattr(self.args, "prototype_sample_size", 20000)),
             lloyd_iters=int(getattr(self.args, "prototype_lloyd_iters", 10)),
         )
         return stats
+
+    def _predict_nodes_from_edge_labels(self, edge_labels: np.ndarray) -> np.ndarray:
+        return edge_hard_labels_to_node_predictions(edge_labels, self.data.src, self.data.dst, self.data.num_nodes, self.K)
+
+    def _direct_kmeans_metrics_from_hidden(self, hidden: torch.Tensor, lloyd_iters: int) -> dict:
+        raw_centers, fit_stats = fit_kmeans_centers(
+            hidden,
+            K=self.K,
+            seed=self.prototype_seed,
+            sample_size=int(getattr(self.args, "prototype_sample_size", 20000)),
+            max_iters=int(lloyd_iters),
+        )
+        labels_t = assign_all_to_centers(
+            hidden,
+            raw_centers.to(device=hidden.device, dtype=hidden.dtype),
+            chunk_size=int(getattr(self.args, "global_q_chunk_size", 8192)),
+        )
+        edge_labels = labels_t.detach().cpu().numpy().astype(np.int64)
+        pred_node = self._predict_nodes_from_edge_labels(edge_labels)
+        metrics = evaluate_node_clustering(self.data.labels, pred_node)
+        counts = np.bincount(edge_labels, minlength=self.K)[: self.K]
+        ratios = counts.astype(np.float64) / max(1, counts.sum())
+        inertia = 0.0
+        chunk_size = max(1, int(getattr(self.args, "global_q_chunk_size", 8192)))
+        for start in range(0, int(hidden.size(0)), chunk_size):
+            h = hidden[start : start + chunk_size]
+            c = raw_centers.index_select(0, labels_t[start : start + chunk_size].to(raw_centers.device))
+            inertia += float((h.cpu() - c.cpu()).square().sum())
+        degree = np.asarray(self.W_E_degree_np, dtype=np.float64)
+        volumes = np.bincount(edge_labels, weights=degree, minlength=self.K)[: self.K]
+        volume_ratios = volumes / max(float(volumes.sum()), 1e-12)
+        metrics.update(
+            {
+                "direct_kmeans_inertia": float(inertia),
+                "edge_hard_active_clusters": int(np.sum(counts > 0)),
+                "edge_hard_largest_ratio": float(ratios.max()) if ratios.size else 0.0,
+                "node_hard_active_clusters": int(len(np.unique(pred_node))),
+                "node_hard_largest_ratio": float(
+                    np.bincount(pred_node, minlength=self.K).max() / max(1, int(pred_node.shape[0]))
+                ),
+                "cluster_volume_min_ratio": float(volume_ratios.min()) if volume_ratios.size else 0.0,
+                "cluster_volume_max_ratio": float(volume_ratios.max()) if volume_ratios.size else 0.0,
+                "cluster_volume_std": float(volume_ratios.std()) if volume_ratios.size else 0.0,
+                "kmeans_center_checksum": fit_stats["kmeans_center_checksum"],
+                "prototype_center_checksum": fit_stats["kmeans_center_checksum"],
+                "kmeans_lloyd_iters_run": fit_stats["kmeans_lloyd_iters_run"],
+            }
+        )
+        return metrics
 
     def _resolve_uniform_diag_dir(self) -> str:
         if not self.uniform_collapse_diagnostic:
@@ -353,6 +501,34 @@ class EdgeHiNoSTrainer:
             }
         )
         return cfg
+
+    def _overnight_stage_extra_stats(self, q_all: torch.Tensor) -> dict:
+        degree_t = torch.from_numpy(self.W_E_degree_np).to(device=q_all.device, dtype=q_all.dtype)
+        extra = self._current_cluster_output_stats()
+        extra.update(cluster_volume_statistics(q_all, degree_t))
+        selected = str(getattr(self.args, "orth_type", "orth")).lower()
+        penalty_weight = float(getattr(self.args, "lambda_orth", 1.0))
+        extra["penalty_type"] = selected
+        extra["penalty_weight"] = penalty_weight
+        with torch.no_grad():
+            _, cut_loss, orth_original = edge_trace_mincut_loss_global(
+                q_all,
+                self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+                self.W_E_degree_np,
+                self.K,
+                lambda_orth=1.0,
+                row_block_size=int(self.args.global_ncut_row_block_size),
+                orth_type="orth",
+            )
+            orthqa_loss = edge_orthqa_penalty_global(q_all, degree_t)
+        extra["cut_loss"] = float(cut_loss.detach().cpu())
+        extra["orth_original_loss"] = float(orth_original.detach().cpu())
+        extra["orthqa_loss"] = float(orthqa_loss.detach().cpu())
+        extra["selected_penalty_loss"] = (
+            extra["orthqa_loss"] if selected == "orthqa" else extra["orth_original_loss"]
+        )
+        extra["orth_loss"] = extra["selected_penalty_loss"]
+        return extra
 
     def _write_uniform_diagnostics(self) -> None:
         if not self.uniform_collapse_diagnostic or not self.uniform_diag_dir:
@@ -383,7 +559,7 @@ class EdgeHiNoSTrainer:
             edge_repr_all=edge_repr_all,
             cluster_input_all=cluster_input_all,
             labels=torch.from_numpy(self.data.labels).long().to(self.device),
-            extra_stats=self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
         )
         self.uniform_diag_stages[stage_name] = stats
         if "initial_before_training" not in self.uniform_diag_stages:
@@ -391,7 +567,16 @@ class EdgeHiNoSTrainer:
         self._write_uniform_diagnostics()
         print_stage_summary(stage_name, stats)
 
-    def _record_uniform_before_global(self, q_all, logits_all, edge_repr_all, cluster_input_all, cut_loss, orth_loss) -> None:
+    def _record_uniform_before_global(
+        self,
+        q_all,
+        logits_all,
+        edge_repr_all,
+        cluster_input_all,
+        cut_loss,
+        orth_loss,
+        stage_name: str = "before_first_global_update",
+    ) -> None:
         if not self.uniform_collapse_diagnostic:
             return
         grad_stats = cluster_head_gradient_diagnostics(
@@ -399,8 +584,11 @@ class EdgeHiNoSTrainer:
             orth_loss,
             [p for p in self.model.cluster_head.parameters() if p.requires_grad],
         )
+        grad_stats["cut_penalty_grad_cosine"] = grad_stats.get("cut_orth_grad_cosine")
+        if str(getattr(self.args, "orth_type", "orth")).lower() == "orthqa":
+            grad_stats["orthqa_cluster_head_grad_l2"] = grad_stats.get("orth_cluster_head_grad_l2", 0.0)
         stats = compute_uniform_collapse_stage(
-            "before_first_global_update",
+            stage_name,
             q_all,
             logits_all,
             self.src_t,
@@ -413,11 +601,11 @@ class EdgeHiNoSTrainer:
             cut_loss=cut_loss,
             orth_loss=orth_loss,
             grad_stats=grad_stats,
-            extra_stats=self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
         )
-        self.uniform_diag_stages["before_first_global_update"] = stats
+        self.uniform_diag_stages[stage_name] = stats
         self._write_uniform_diagnostics()
-        print_stage_summary("before_global", stats)
+        print_stage_summary("before_global" if stage_name == "before_first_global_update" else stage_name, stats)
 
     def _record_uniform_after_global(self) -> None:
         if not self.uniform_collapse_diagnostic:
@@ -436,7 +624,7 @@ class EdgeHiNoSTrainer:
             edge_repr_all=edge_repr_all,
             cluster_input_all=cluster_input_all,
             labels=torch.from_numpy(self.data.labels).long().to(self.device),
-            extra_stats=self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
         )
         self.uniform_diag_stages["after_first_global_update"] = stats
         initial = self.uniform_diag_stages.get("after_model_initialization", self.uniform_diag_stages.get("initial_before_training", {}))
@@ -478,6 +666,130 @@ class EdgeHiNoSTrainer:
         metrics.update(self._q_distribution_stats(Q))
         return metrics, S
 
+    def _capture_init_reference(self) -> None:
+        Q = self.infer_Q()
+        metrics, S = self._evaluate_from_Q(Q)
+        self.init_reference = {
+            "Q": Q.astype(np.float32, copy=True),
+            "edge_labels": Q.argmax(axis=1).astype(np.int64),
+            "node_labels": S.argmax(axis=1).astype(np.int64),
+        }
+        self.init_reference_weight = self.model.cluster_output.weight.detach().cpu().clone()
+        self.init_reference_metrics = metrics.copy()
+        self.model_init_info["initial_Q_summary_checksum"] = self._q_summary_checksum(Q)
+        self.model_init_info["initial_cluster_weight_checksum"] = tensor_checksum(self.init_reference_weight)
+
+    @staticmethod
+    def _q_summary_checksum(Q: np.ndarray) -> str:
+        summary = np.asarray(
+            [
+                float(np.mean(Q)),
+                float(np.std(Q)),
+                float(np.min(Q)),
+                float(np.max(Q)),
+                float(np.sum(Q * Q)),
+            ],
+            dtype=np.float64,
+        )
+        import hashlib
+
+        return hashlib.sha256(summary.tobytes()).hexdigest()
+
+    def _compute_init_final_change_metrics(self, final_metrics: dict) -> dict:
+        if not self.init_reference:
+            return {}
+        Q_final = self.infer_Q()
+        metrics_final, S_final = self._evaluate_from_Q(Q_final)
+        node_final = S_final.argmax(axis=1).astype(np.int64)
+        edge_final = Q_final.argmax(axis=1).astype(np.int64)
+        Q_init = self.init_reference["Q"]
+        weight_final = self.model.cluster_output.weight.detach().cpu()
+        weight_init = self.init_reference_weight
+        q_drift = float(np.linalg.norm(Q_final.astype(np.float64) - Q_init.astype(np.float64)) / (max(1, Q_init.shape[0]) ** 0.5))
+        weight_drift = float(
+            torch.linalg.norm(weight_final - weight_init).item()
+            / (torch.linalg.norm(weight_init).item() + 1e-12)
+        )
+        cut_init = self.uniform_diag_stages.get("after_cluster_initialization", {}).get("cut_loss")
+        cut_final = self.uniform_diag_stages.get("final_epoch", {}).get("cut_loss")
+        result = {
+            "node_prediction_ari_init_final": float(adjusted_rand_score(self.init_reference["node_labels"], node_final)),
+            "edge_prediction_ari_init_final": float(adjusted_rand_score(self.init_reference["edge_labels"], edge_final)),
+            "q_drift_fro_normalized": q_drift,
+            "cluster_weight_drift_relative": weight_drift,
+            "macro_f1_delta_final_init": float(metrics_final.get("Macro_F1", final_metrics.get("Macro_F1", 0.0)) - self.init_reference_metrics.get("Macro_F1", 0.0)),
+            "macro_f1_delta_best_init": float((getattr(self, "best_metrics_for_result", {}) or {}).get("Macro_F1", 0.0) - self.init_reference_metrics.get("Macro_F1", 0.0)),
+            "MacroF1_init": float(self.init_reference_metrics.get("Macro_F1", 0.0)),
+            "MacroF1_final": float(metrics_final.get("Macro_F1", final_metrics.get("Macro_F1", 0.0))),
+        }
+        if cut_init is not None and cut_final is not None:
+            result["cut_delta_final_init"] = float(cut_final) - float(cut_init)
+        return result
+
+    def run_init_only_eval(self) -> dict:
+        metrics = (self.init_reference_metrics or self._evaluate_stage()).copy()
+        self._init_metrics_csv()
+        init_stage = self.uniform_diag_stages.get("after_cluster_initialization", {})
+        self._append_epoch_record(
+            {
+                "epoch": 0,
+                "ACC": metrics.get("ACC", 0.0),
+                "NMI": metrics.get("NMI", 0.0),
+                "ARI": metrics.get("ARI", 0.0),
+                "Macro_F1": metrics.get("Macro_F1", 0.0),
+                "penalty_type": str(getattr(self.args, "orth_type", "orth")).lower(),
+                "penalty_weight": float(getattr(self.args, "lambda_orth", 1.0)),
+                "edge_hard_active_clusters": init_stage.get("num_active_edge_clusters", ""),
+                "edge_hard_largest_ratio": init_stage.get("largest_edge_cluster_ratio", ""),
+                "node_hard_active_clusters": init_stage.get("num_active_node_clusters", ""),
+                "node_hard_largest_ratio": init_stage.get("largest_node_cluster_ratio", ""),
+                "q_rank1_energy_ratio": init_stage.get("q_rank1_energy_ratio", ""),
+                "q_effective_rank": init_stage.get("q_effective_rank", ""),
+                "q_centered_energy": init_stage.get("q_centered_energy", ""),
+            }
+        )
+        self.final_metrics = metrics.copy()
+        self.training_change_metrics = self._compute_init_final_change_metrics(metrics)
+        return metrics
+
+    def run_direct_kmeans_eval(self) -> dict:
+        hidden = self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
+        metrics = self._direct_kmeans_metrics_from_hidden(
+            hidden,
+            lloyd_iters=int(getattr(self.args, "prototype_lloyd_iters", 10)),
+        )
+        self._init_metrics_csv()
+        self._append_epoch_record(
+            {
+                "epoch": 0,
+                "ACC": metrics.get("ACC", 0.0),
+                "NMI": metrics.get("NMI", 0.0),
+                "ARI": metrics.get("ARI", 0.0),
+                "Macro_F1": metrics.get("Macro_F1", 0.0),
+                "edge_hard_active_clusters": metrics.get("edge_hard_active_clusters", ""),
+                "edge_hard_largest_ratio": metrics.get("edge_hard_largest_ratio", ""),
+                "node_hard_active_clusters": metrics.get("node_hard_active_clusters", ""),
+                "node_hard_largest_ratio": metrics.get("node_hard_largest_ratio", ""),
+            }
+        )
+        if self.output_dir:
+            ensure_dir(self.output_dir)
+            with open(os.path.join(self.output_dir, "diagnostic.json"), "w", encoding="utf-8") as writer:
+                json.dump(
+                    {
+                        "config": self._uniform_diag_config(),
+                        "direct_kmeans": metrics,
+                        "after_model_initialization": self.uniform_diag_stages.get("after_model_initialization"),
+                    },
+                    writer,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+        self.final_metrics = metrics.copy()
+        self.training_change_metrics = {}
+        return metrics
+
     def _evaluate_stage(self) -> dict:
         Q = self.infer_Q()
         metrics, _ = self._evaluate_from_Q(Q)
@@ -503,6 +815,9 @@ class EdgeHiNoSTrainer:
             "orth_loss",
             "orth_original_loss",
             "orthqa_loss",
+            "selected_penalty_loss",
+            "penalty_type",
+            "penalty_weight",
             "cluster_loss",
             "projection_loss",
             "global_total_loss",
@@ -511,6 +826,19 @@ class EdgeHiNoSTrainer:
             "max_cluster_ratio",
             "min_cluster_ratio",
             "empty_cluster_count",
+            "edge_hard_active_clusters",
+            "edge_hard_largest_ratio",
+            "node_hard_active_clusters",
+            "node_hard_largest_ratio",
+            "q_rank1_energy_ratio",
+            "q_effective_rank",
+            "q_centered_energy",
+            "q_centered_effective_rank",
+            "q_margin_mean",
+            "q_margin_p99",
+            "cluster_volume_coefficient_of_variation",
+            "hard_cluster_volume_cv",
+            "logits_bias_to_event_variation_ratio",
             "cluster_forward_seconds",
             "cluster_backward_seconds",
             "epoch_seconds",
@@ -561,6 +889,9 @@ class EdgeHiNoSTrainer:
                 "M": int(self.data.num_events),
                 "N": int(self.data.num_nodes),
                 "K": int(self.K),
+                "model_seed": self.model_seed,
+                "prototype_seed": self.prototype_seed,
+                "forest_seed": self.forest_seed,
                 "Pi_E_nnz": int(self.Pi_E.nnz),
                 "W_E_nnz": int(self.W_E.nnz),
                 "W_E_avg_nnz_per_row": float(self.W_E.nnz / max(1, self.W_E.shape[0])),
@@ -582,6 +913,9 @@ class EdgeHiNoSTrainer:
             "status": "success",
             "dataset": self.args.dataset,
             "seed": int(self.args.seed),
+            "model_seed": self.model_seed,
+            "prototype_seed": self.prototype_seed,
+            "forest_seed": self.forest_seed,
             "best_epoch": int(best_epoch),
             "best_metrics": best_metrics,
             "final_metrics": final_metrics,
@@ -595,6 +929,7 @@ class EdgeHiNoSTrainer:
             "W_E_sparse_mode": self.W_E_sparse_mode,
             "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
             "model_init_info": self.model_init_info,
+            "training_change_metrics": getattr(self, "training_change_metrics", {}),
         }
         with open(os.path.join(self.output_dir, "result.json"), "w", encoding="utf-8") as writer:
             json.dump(result, writer, indent=2, sort_keys=True)
@@ -635,7 +970,7 @@ class EdgeHiNoSTrainer:
                 if lambda_prox > 0.0:
                     order = self.rng.permutation(m)
                     iterator = range(0, m, batch_size)
-                    for start in tqdm(iterator, desc=f"Edge-HiNoS epoch {epoch}", leave=False, disable=quiet):
+                    for start in tqdm(iterator, desc=f"ETGC epoch {epoch}", leave=False, disable=quiet):
                         batch_ids = order[start : start + batch_size]
                         union_ids = self._batch_union_ids(batch_ids)
                         local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
@@ -652,7 +987,7 @@ class EdgeHiNoSTrainer:
             else:
                 order = self.rng.permutation(m)
                 iterator = range(0, m, batch_size)
-                for start in tqdm(iterator, desc=f"Edge-HiNoS epoch {epoch}", leave=False, disable=quiet):
+                for start in tqdm(iterator, desc=f"ETGC epoch {epoch}", leave=False, disable=quiet):
                     batch_ids = order[start : start + batch_size]
                     union_ids = self._batch_union_ids(batch_ids)
                     local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
@@ -697,7 +1032,7 @@ class EdgeHiNoSTrainer:
             cluster_forward_seconds = 0.0
             cluster_backward_seconds = 0.0
             global_q_forwards = 0
-            if self.ncut_scope == "global" and epoch >= warmup_epochs:
+            if self.ncut_scope == "global" and epoch > warmup_epochs:
                 self.model.train()
                 self.optimizer.zero_grad(set_to_none=True)
                 should_uniform_diag = (
@@ -705,7 +1040,12 @@ class EdgeHiNoSTrainer:
                     and not self.uniform_diag_after_first_done
                     and (not self.diagnostic_only_first_epoch or epoch == 1)
                 )
-                if should_uniform_diag:
+                should_grad_epoch_diag = (
+                    self.overnight_diagnostic
+                    and epoch in {1, int(self.args.epoch)}
+                    and epoch > warmup_epochs
+                )
+                if should_uniform_diag or should_grad_epoch_diag:
                     q_all, logits_all, edge_repr_all, cluster_input_all = self._forward_all_q_logits_with_grad(
                         int(self.args.global_q_chunk_size)
                     )
@@ -770,6 +1110,16 @@ class EdgeHiNoSTrainer:
                     self._record_uniform_before_global(
                         q_all, logits_all, edge_repr_all, cluster_input_all, cut_loss, orth_loss
                     )
+                elif should_grad_epoch_diag:
+                    self._record_uniform_before_global(
+                        q_all,
+                        logits_all,
+                        edge_repr_all,
+                        cluster_input_all,
+                        cut_loss,
+                        orth_loss,
+                        stage_name=f"before_global_epoch_{epoch}",
+                    )
 
                 if global_loss.requires_grad and (
                     lambda_edge_ncut != 0.0 or lambda_proj != 0.0 or (self.cluster_loss_type == "legacy_ncut" and lambda_bal != 0.0)
@@ -800,6 +1150,10 @@ class EdgeHiNoSTrainer:
                 peak_gpu_memory_mb = 0.0
             epoch_seconds = time.time() - epoch_start
             total_runtime_seconds = time.time() - total_start
+            stage_stats_for_epoch = {}
+            if self.overnight_diagnostic and epoch in self.diagnostic_epochs:
+                self._record_uniform_stage_no_grad(f"epoch_{epoch}")
+                stage_stats_for_epoch = self.uniform_diag_stages.get(f"epoch_{epoch}", {})
             record = {
                 "epoch": epoch,
                 "ACC": metrics.get("ACC", 0.0),
@@ -810,6 +1164,9 @@ class EdgeHiNoSTrainer:
                 "orth_loss": orth_loss_value,
                 "orth_original_loss": orth_original_loss_value,
                 "orthqa_loss": orthqa_loss_value,
+                "selected_penalty_loss": orth_loss_value,
+                "penalty_type": str(getattr(self.args, "orth_type", "orth")).lower(),
+                "penalty_weight": float(getattr(self.args, "lambda_orth", 1.0)),
                 "cluster_loss": cluster_loss_value,
                 "projection_loss": projection_loss_value,
                 "global_total_loss": global_total_loss_value,
@@ -818,6 +1175,19 @@ class EdgeHiNoSTrainer:
                 "max_cluster_ratio": metrics.get("max_cluster_ratio", 0.0),
                 "min_cluster_ratio": metrics.get("min_cluster_ratio", 0.0),
                 "empty_cluster_count": metrics.get("empty_cluster_count", 0),
+                "edge_hard_active_clusters": stage_stats_for_epoch.get("num_active_edge_clusters", ""),
+                "edge_hard_largest_ratio": stage_stats_for_epoch.get("largest_edge_cluster_ratio", ""),
+                "node_hard_active_clusters": stage_stats_for_epoch.get("num_active_node_clusters", ""),
+                "node_hard_largest_ratio": stage_stats_for_epoch.get("largest_node_cluster_ratio", ""),
+                "q_rank1_energy_ratio": stage_stats_for_epoch.get("q_rank1_energy_ratio", ""),
+                "q_effective_rank": stage_stats_for_epoch.get("q_effective_rank", ""),
+                "q_centered_energy": stage_stats_for_epoch.get("q_centered_energy", ""),
+                "q_centered_effective_rank": stage_stats_for_epoch.get("q_centered_effective_rank", ""),
+                "q_margin_mean": stage_stats_for_epoch.get("q_margin_mean", ""),
+                "q_margin_p99": stage_stats_for_epoch.get("q_margin_p99", ""),
+                "cluster_volume_coefficient_of_variation": stage_stats_for_epoch.get("cluster_volume_coefficient_of_variation", ""),
+                "hard_cluster_volume_cv": stage_stats_for_epoch.get("hard_cluster_volume_cv", ""),
+                "logits_bias_to_event_variation_ratio": stage_stats_for_epoch.get("logits_bias_to_event_variation_ratio", ""),
                 "cluster_forward_seconds": cluster_forward_seconds,
                 "cluster_backward_seconds": cluster_backward_seconds,
                 "epoch_seconds": epoch_seconds,
@@ -862,6 +1232,7 @@ class EdgeHiNoSTrainer:
                     f"epoch={epoch} ACC={metrics['ACC']:.4f} NMI={metrics['NMI']:.4f} "
                     f"ARI={metrics['ARI']:.4f} Macro_F1={metrics['Macro_F1']:.4f} "
                     f"cut={cut_loss_value:.4f} orth={orth_loss_value:.4f} "
+                    f"penalty_type={str(getattr(self.args, 'orth_type', 'orth')).lower()} "
                     f"proj={projection_loss_value:.4f} cluster={cluster_loss_value:.4f} "
                     f"global={global_total_loss_value:.4f} prox={record['prox_loss']:.4f} "
                     f"entropy={record['Q_mean_entropy']:.4f} max_ratio={record['max_cluster_ratio']:.4f} "
@@ -872,6 +1243,8 @@ class EdgeHiNoSTrainer:
                     f"global_q_forwards={global_q_forwards}"
                 )
         self._record_uniform_final_epoch()
+        self.best_metrics_for_result = best_metrics or {}
+        self.training_change_metrics = self._compute_init_final_change_metrics(final_metrics)
         if int(self.args.save_embeddings):
             self.save_outputs()
         self.final_metrics = final_metrics

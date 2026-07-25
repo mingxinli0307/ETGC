@@ -211,6 +211,41 @@ def prefixed_feature_statistics(features: torch.Tensor, suffix: str) -> dict:
     return {f"{key}_{suffix}": value for key, value in stats.items()}
 
 
+def cluster_volume_statistics(Q: torch.Tensor, degree: torch.Tensor, eps: float = EPS) -> dict:
+    Q = Q.detach()
+    degree = degree.detach().to(device=Q.device, dtype=Q.dtype).reshape(-1)
+    if degree.numel() != Q.size(0):
+        raise ValueError(f"degree length={degree.numel()} does not match Q rows={Q.size(0)}")
+    volume = (degree.unsqueeze(1) * Q).sum(dim=0)
+    volume_ratio = volume / volume.sum().clamp_min(float(eps))
+    hard = torch.argmax(Q, dim=1)
+    hard_volume = torch.zeros((Q.size(1),), dtype=Q.dtype, device=Q.device)
+    hard_volume.index_add_(0, hard.long(), degree)
+    hard_ratio = hard_volume / hard_volume.sum().clamp_min(float(eps))
+    top2 = torch.topk(Q, k=min(2, Q.size(1)), dim=1).values
+    top1 = top2[:, 0] if top2.numel() else Q.new_zeros((Q.size(0),))
+    top2_value = top2[:, 1] if Q.size(1) > 1 else Q.new_zeros((Q.size(0),))
+    margin = top1 - top2_value
+    entropy = -(Q * torch.log(Q.clamp_min(float(eps)))).sum(dim=1)
+    return {
+        "cluster_volume_min_ratio": _float(volume_ratio.min()) if volume_ratio.numel() else 0.0,
+        "cluster_volume_max_ratio": _float(volume_ratio.max()) if volume_ratio.numel() else 0.0,
+        "cluster_volume_std": _float(volume_ratio.std(unbiased=False)) if volume_ratio.numel() else 0.0,
+        "cluster_volume_coefficient_of_variation": _float(
+            volume_ratio.std(unbiased=False) / volume_ratio.mean().clamp_min(float(eps))
+        ) if volume_ratio.numel() else 0.0,
+        "hard_cluster_volume_min_ratio": _float(hard_ratio.min()) if hard_ratio.numel() else 0.0,
+        "hard_cluster_volume_max_ratio": _float(hard_ratio.max()) if hard_ratio.numel() else 0.0,
+        "hard_cluster_volume_cv": _float(
+            hard_ratio.std(unbiased=False) / hard_ratio.mean().clamp_min(float(eps))
+        ) if hard_ratio.numel() else 0.0,
+        "mean_assignment_entropy": _float(entropy.mean()) if entropy.numel() else 0.0,
+        "mean_top1_probability": _float(top1.mean()) if top1.numel() else 0.0,
+        "mean_top2_probability": _float(top2_value.mean()) if top2_value.numel() else 0.0,
+        "mean_top1_top2_margin": _float(margin.mean()) if margin.numel() else 0.0,
+    }
+
+
 def cluster_head_param_l2(cluster_params: Iterable[torch.nn.Parameter]) -> float:
     total = 0.0
     for param in cluster_params:
@@ -387,6 +422,17 @@ SUMMARY_FIELDNAMES = [
     "logits_cluster_mean_std",
     "logits_within_cluster_event_std",
     "logits_bias_to_event_variation_ratio",
+    "cluster_volume_min_ratio",
+    "cluster_volume_max_ratio",
+    "cluster_volume_std",
+    "cluster_volume_coefficient_of_variation",
+    "hard_cluster_volume_min_ratio",
+    "hard_cluster_volume_max_ratio",
+    "hard_cluster_volume_cv",
+    "mean_assignment_entropy",
+    "mean_top1_probability",
+    "mean_top2_probability",
+    "mean_top1_top2_margin",
     "q_uniform_l2_mean",
     "q_uniform_l1_mean",
     "q_uniform_max_abs",
@@ -423,11 +469,18 @@ SUMMARY_FIELDNAMES = [
     "Macro_F1",
     "cut_loss",
     "orth_loss",
+    "orth_original_loss",
+    "orthqa_loss",
+    "selected_penalty_loss",
+    "penalty_type",
+    "penalty_weight",
     "cut_cluster_head_grad_l2",
     "orth_cluster_head_grad_l2",
+    "orthqa_cluster_head_grad_l2",
     "cut_grad_to_param_ratio",
     "orth_grad_to_param_ratio",
     "cut_orth_grad_cosine",
+    "cut_penalty_grad_cosine",
 ]
 
 
@@ -446,10 +499,12 @@ def write_diagnostic_outputs(
         "config": config,
         "after_model_initialization": stages.get("after_model_initialization"),
         "after_prototype_initialization": stages.get("after_prototype_initialization"),
+        "after_cluster_initialization": stages.get("after_cluster_initialization"),
         "initial_before_training": stages.get("initial_before_training"),
         "before_first_global_update": stages.get("before_first_global_update"),
         "after_first_global_update": stages.get("after_first_global_update"),
         "final_epoch": stages.get("final_epoch"),
+        "stages": stages,
         "delta_initial_to_after_first_global": delta or {},
     }
     with open(os.path.join(output_dir, "diagnostic.json"), "w", encoding="utf-8") as writer:
@@ -457,14 +512,20 @@ def write_diagnostic_outputs(
     with open(os.path.join(output_dir, "diagnostic_summary.csv"), "w", encoding="utf-8", newline="") as writer:
         csv_writer = csv.DictWriter(writer, fieldnames=SUMMARY_FIELDNAMES)
         csv_writer.writeheader()
-        for stage_name in [
+        ordered = [
             "after_model_initialization",
             "after_prototype_initialization",
+            "after_cluster_initialization",
             "initial_before_training",
             "before_first_global_update",
             "after_first_global_update",
             "final_epoch",
-        ]:
+        ]
+        dynamic = sorted(
+            [name for name in stages if name not in set(ordered)],
+            key=lambda x: (0 if x.startswith("epoch_") else 1, x),
+        )
+        for stage_name in ordered + dynamic:
             stage = stages.get(stage_name)
             if not stage:
                 continue

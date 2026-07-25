@@ -1,9 +1,15 @@
+import hashlib
 import os
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def tensor_checksum(tensor: torch.Tensor) -> str:
+    arr = tensor.detach().cpu().contiguous().numpy()
+    return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
 def load_pretrained_node_features(path: str, num_nodes: int, fallback_dim: int, seed: int) -> np.ndarray:
@@ -150,14 +156,14 @@ def feature_common_variation_statistics(features: torch.Tensor, eps: float = 1e-
     }
 
 
-def torch_kmeans_plus_plus(
+def fit_kmeans_centers(
     features: torch.Tensor,
     K: int,
     seed: int,
     sample_size: int = 20000,
     max_iters: int = 10,
     eps: float = 1e-12,
-) -> torch.Tensor:
+) -> tuple:
     if features.dim() != 2:
         raise ValueError(f"features must be 2D, got shape={tuple(features.shape)}")
     n = int(features.size(0))
@@ -204,6 +210,7 @@ def torch_kmeans_plus_plus(
         min_dist = torch.minimum(min_dist, dist)
     C = torch.stack(centers, dim=0)
     max_iters = max(0, int(max_iters))
+    lloyd_iters_run = 0
     for _ in range(max_iters):
         dist = torch.cdist(X, C).square()
         assign = torch.argmin(dist, dim=1)
@@ -218,11 +225,39 @@ def torch_kmeans_plus_plus(
                 new_centers.append(X[farthest].clone())
                 min_current[farthest] = -1.0
         new_C = torch.stack(new_centers, dim=0)
+        lloyd_iters_run += 1
         if torch.allclose(new_C, C, atol=1e-6, rtol=1e-5):
             C = new_C
             break
         C = new_C
-    return C / torch.linalg.norm(C, dim=1, keepdim=True).clamp_min(float(eps))
+    if not torch.isfinite(C).all():
+        raise FloatingPointError("KMeans centers contain NaN or Inf values")
+    stats = {
+        "kmeans_sample_size": int(n_sample),
+        "kmeans_lloyd_iters_requested": int(max_iters),
+        "kmeans_lloyd_iters_run": int(lloyd_iters_run),
+        "kmeans_center_checksum": tensor_checksum(C),
+    }
+    return C, stats
+
+
+def torch_kmeans_plus_plus(
+    features: torch.Tensor,
+    K: int,
+    seed: int,
+    sample_size: int = 20000,
+    max_iters: int = 10,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    centers, _ = fit_kmeans_centers(
+        features,
+        K=K,
+        seed=seed,
+        sample_size=sample_size,
+        max_iters=max_iters,
+        eps=eps,
+    )
+    return centers / torch.linalg.norm(centers, dim=1, keepdim=True).clamp_min(float(eps))
 
 
 def prototype_pairwise_statistics(prototypes: torch.Tensor) -> dict:
@@ -250,6 +285,103 @@ def prototype_pairwise_statistics(prototypes: torch.Tensor) -> dict:
     }
 
 
+def initial_weight_pairwise_statistics(weight: torch.Tensor, prefix: str = "initial_weight") -> dict:
+    stats = prototype_pairwise_statistics(weight)
+    return {
+        f"{prefix}_pairwise_cosine_mean": stats["prototype_pairwise_cosine_mean"],
+        f"{prefix}_pairwise_cosine_min": stats["prototype_pairwise_cosine_min"],
+        f"{prefix}_pairwise_cosine_max": stats["prototype_pairwise_cosine_max"],
+    }
+
+
+@torch.no_grad()
+def _copy_cluster_output_weight(model: EdgeHiNoSModel, weight: torch.Tensor, zero_bias: bool = True) -> None:
+    weight = weight.to(device=model.cluster_output.weight.device, dtype=model.cluster_output.weight.dtype)
+    if tuple(model.cluster_output.weight.shape) != tuple(weight.shape):
+        raise ValueError(
+            f"Initial weight shape={tuple(weight.shape)} does not match cluster output weight "
+            f"shape={tuple(model.cluster_output.weight.shape)}"
+        )
+    model.cluster_output.weight.copy_(weight)
+    if zero_bias and model.cluster_output.bias is not None:
+        nn.init.zeros_(model.cluster_output.bias)
+
+
+@torch.no_grad()
+def initialize_cluster_output_random_orthogonal(
+    model: EdgeHiNoSModel,
+    K: int,
+    seed: int,
+    eps: float = 1e-12,
+) -> dict:
+    K = int(K)
+    d = int(model.cluster_output.weight.size(1))
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    if K <= d:
+        base = torch.randn(d, K, generator=gen)
+        q, _ = torch.linalg.qr(base, mode="reduced")
+        weight = q.t().contiguous()
+        strict = True
+        note = "strict_row_orthogonal"
+    else:
+        pieces = []
+        remaining = K
+        while remaining > 0:
+            block_rows = min(d, remaining)
+            base = torch.randn(d, block_rows, generator=gen)
+            q, _ = torch.linalg.qr(base, mode="reduced")
+            pieces.append(q.t().contiguous())
+            remaining -= block_rows
+        weight = torch.cat(pieces, dim=0)[:K]
+        strict = False
+        note = "K_gt_dim_block_orthogonal_not_globally_strict"
+    weight = weight / torch.linalg.norm(weight, dim=1, keepdim=True).clamp_min(float(eps))
+    _copy_cluster_output_weight(model, weight, zero_bias=True)
+    stats = initial_weight_pairwise_statistics(model.cluster_output.weight.detach())
+    stats.update(
+        {
+            "cluster_init_mode_effective": "random_orthogonal",
+            "strict_orthogonal_rows": bool(strict),
+            "random_orthogonal_note": note,
+            "initial_cluster_weight_checksum": tensor_checksum(model.cluster_output.weight.detach()),
+        }
+    )
+    return stats
+
+
+@torch.no_grad()
+def initialize_cluster_output_random_event(
+    model: EdgeHiNoSModel,
+    cluster_hidden: torch.Tensor,
+    K: int,
+    seed: int,
+    eps: float = 1e-12,
+) -> dict:
+    if cluster_hidden.dim() != 2:
+        raise ValueError(f"cluster_hidden must be 2D, got shape={tuple(cluster_hidden.shape)}")
+    K = int(K)
+    n = int(cluster_hidden.size(0))
+    if n < K:
+        raise ValueError(f"random_event initialization needs at least K events, got M={n}, K={K}")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    indices = torch.randperm(n, generator=gen)[:K].to(device=cluster_hidden.device)
+    weight = cluster_hidden.index_select(0, indices).detach()
+    weight = weight / torch.linalg.norm(weight, dim=1, keepdim=True).clamp_min(float(eps))
+    _copy_cluster_output_weight(model, weight, zero_bias=True)
+    stats = initial_weight_pairwise_statistics(model.cluster_output.weight.detach())
+    stats.update(
+        {
+            "cluster_init_mode_effective": "random_event",
+            "random_event_unique_count": int(torch.unique(indices).numel()),
+            "random_event_index_checksum": tensor_checksum(indices.to(dtype=torch.int64)),
+            "initial_cluster_weight_checksum": tensor_checksum(model.cluster_output.weight.detach()),
+        }
+    )
+    return stats
+
+
 @torch.no_grad()
 def initialize_cluster_output_from_prototypes(
     model: EdgeHiNoSModel,
@@ -259,28 +391,39 @@ def initialize_cluster_output_from_prototypes(
     sample_size: int = 20000,
     lloyd_iters: int = 10,
 ) -> dict:
-    prototypes = torch_kmeans_plus_plus(
+    raw_centers, fit_stats = fit_kmeans_centers(
         cluster_hidden,
         K=int(K),
         seed=int(seed),
         sample_size=int(sample_size),
         max_iters=int(lloyd_iters),
-    ).to(device=model.cluster_output.weight.device, dtype=model.cluster_output.weight.dtype)
-    if tuple(model.cluster_output.weight.shape) != tuple(prototypes.shape):
-        raise ValueError(
-            f"Prototype shape={tuple(prototypes.shape)} does not match cluster output weight "
-            f"shape={tuple(model.cluster_output.weight.shape)}"
-        )
-    model.cluster_output.weight.copy_(prototypes)
-    if model.cluster_output.bias is not None:
-        nn.init.zeros_(model.cluster_output.bias)
+    )
+    prototypes = raw_centers / torch.linalg.norm(raw_centers, dim=1, keepdim=True).clamp_min(1e-12)
+    prototypes = prototypes.to(device=model.cluster_output.weight.device, dtype=model.cluster_output.weight.dtype)
+    _copy_cluster_output_weight(model, prototypes, zero_bias=True)
     stats = prototype_pairwise_statistics(prototypes)
     stats.update(
         {
+            "cluster_init_mode_effective": "prototype",
             "prototype_shape": [int(prototypes.size(0)), int(prototypes.size(1))],
             "prototype_sample_size": int(min(int(sample_size), int(cluster_hidden.size(0)))),
             "prototype_lloyd_iters": int(lloyd_iters),
             "prototype_weight_l2": float(torch.linalg.norm(model.cluster_output.weight.detach()).cpu()),
+            "prototype_center_checksum": fit_stats["kmeans_center_checksum"],
+            "initial_cluster_weight_checksum": tensor_checksum(model.cluster_output.weight.detach()),
         }
     )
+    stats.update(fit_stats)
     return stats
+
+
+@torch.no_grad()
+def assign_all_to_centers(features: torch.Tensor, centers: torch.Tensor, chunk_size: int = 8192) -> torch.Tensor:
+    if features.dim() != 2 or centers.dim() != 2:
+        raise ValueError("features and centers must be 2D tensors")
+    labels = []
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, int(features.size(0)), chunk_size):
+        dist = torch.cdist(features[start : start + chunk_size], centers).square()
+        labels.append(torch.argmin(dist, dim=1).detach())
+    return torch.cat(labels, dim=0)

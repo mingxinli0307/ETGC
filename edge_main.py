@@ -10,11 +10,14 @@ from utils import resolve_path, set_random_seed
 
 def build_parser():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
-    parser = argparse.ArgumentParser(description="Edge-HiNoS over temporal edge events.")
+    parser = argparse.ArgumentParser(description="ETGC over temporal edge events.")
     parser.add_argument("--dataset", default="school")
     parser.add_argument("--directed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model_seed", type=int, default=None)
+    parser.add_argument("--prototype_seed", type=int, default=None)
+    parser.add_argument("--forest_seed", type=int, default=None)
     parser.add_argument("--data_root", default=os.path.join(cur_dir, "dataset"))
     parser.add_argument("--emb_root", default=os.path.join(cur_dir, "emb"))
     parser.add_argument("--pretrain_emb_dir", default=os.path.join(cur_dir, "pretrain"))
@@ -59,9 +62,17 @@ def build_parser():
     parser.add_argument("--node_emb_lr", type=float, default=1e-5)
     parser.add_argument("--cluster_output_bias_mode", choices=["default", "zero", "none"], default="default")
     parser.add_argument("--cluster_input_norm", choices=["none", "layernorm"], default="none")
-    parser.add_argument("--cluster_init_mode", choices=["random", "prototype"], default="random")
+    parser.add_argument(
+        "--cluster_init_mode",
+        choices=["random", "random_orthogonal", "random_event", "kmeans_plus_plus", "prototype"],
+        default="random",
+    )
     parser.add_argument("--prototype_sample_size", type=int, default=20000)
     parser.add_argument("--prototype_lloyd_iters", type=int, default=10)
+    parser.add_argument("--direct_kmeans_eval", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--init_only", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--overnight_diagnostic", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--diagnostic_epochs", default="1,5,10,20,30")
     parser.add_argument("--diagnostic_stages", type=int, choices=[0, 1], default=0)
     parser.add_argument("--uniform_collapse_diagnostic", type=int, choices=[0, 1], default=0)
     parser.add_argument("--diagnostic_output_dir", default="diagnostics/uniform_collapse")
@@ -77,10 +88,11 @@ def get_args():
 
 
 def print_config(args, K=None):
-    print("\n========== Edge-HiNoS Run ==========")
-    print("mode=Edge-HiNoS")
+    print("\n========== ETGC Run ==========")
+    print("mode=ETGC")
     print("object=temporal edge event")
     print(f"dataset={args.dataset}, device={args.device}, directed={bool(args.directed)}")
+    print(f"seed={args.seed}, model_seed={args.model_seed}, prototype_seed={args.prototype_seed}, forest_seed={args.forest_seed}")
     print(f"edge_ppr_method={args.edge_ppr_method}")
     print("default_proximity=state-expanded temporal subdivision forest")
     print(f"successor_limit={args.edge_neighbor_k}, with <=0 meaning all successors")
@@ -109,6 +121,8 @@ def print_config(args, K=None):
     print(f"cluster_input_norm={args.cluster_input_norm}")
     print(f"cluster_init_mode={args.cluster_init_mode}")
     print(f"prototype_sample_size={args.prototype_sample_size}, prototype_lloyd_iters={args.prototype_lloyd_iters}")
+    print(f"direct_kmeans_eval={args.direct_kmeans_eval}, init_only={args.init_only}")
+    print(f"overnight_diagnostic={args.overnight_diagnostic}, diagnostic_epochs={args.diagnostic_epochs}")
     print(f"diagnostic_stages={args.diagnostic_stages}")
     print(f"uniform_collapse_diagnostic={args.uniform_collapse_diagnostic}")
     print(f"diagnostic_output_dir={args.diagnostic_output_dir}")
@@ -119,6 +133,13 @@ def print_config(args, K=None):
 def main(args):
     start_time = time.time()
     cur_dir = os.path.dirname(os.path.abspath(__file__))
+    if args.model_seed is None:
+        args.model_seed = int(args.seed)
+    if args.prototype_seed is None:
+        args.prototype_seed = int(args.model_seed)
+    if args.forest_seed is None:
+        args.forest_seed = int(args.seed)
+    args.seed = int(args.model_seed)
     args.data_root = resolve_path(cur_dir, args.data_root)
     args.emb_root = resolve_path(cur_dir, args.emb_root)
     args.pretrain_emb_dir = resolve_path(cur_dir, args.pretrain_emb_dir)
@@ -126,12 +147,15 @@ def main(args):
         args.feature_path = resolve_path(cur_dir, args.feature_path)
     args.cache_dir = resolve_path(cur_dir, args.cache_dir)
     args.diagnostic_output_dir = resolve_path(cur_dir, args.diagnostic_output_dir)
-    set_random_seed(args.seed)
+    set_random_seed(args.model_seed)
     trainer = EdgeHiNoSTrainer(args)
     print_config(args, trainer.K)
     stats = trainer.prox_stats
     trainer.write_config_json()
     print(f"seed={args.seed}")
+    print(f"model_seed={args.model_seed}")
+    print(f"prototype_seed={args.prototype_seed}")
+    print(f"forest_seed={args.forest_seed}")
     print(f"resolved_device={trainer.device}")
     print(f"num_nodes={trainer.data.num_nodes} num_events={trainer.data.num_events} K={trainer.K}")
     print(f"P_E shape={stats['P_shape']} nnz={stats['P_nnz']} avg_outdegree={stats['P_avg_outdegree']:.4f}")
@@ -160,6 +184,40 @@ def main(args):
     print(f"cluster_init_mode={args.cluster_init_mode}")
     print(f"prototype_init_executed={trainer.model_init_info.get('prototype_init_executed')}")
     print("F1_type=macro")
+    if int(getattr(args, "direct_kmeans_eval", 0)):
+        metrics = trainer.run_direct_kmeans_eval()
+        runtime_seconds = time.time() - start_time
+        trainer.write_result_json(
+            best_epoch=0,
+            best_metrics=metrics,
+            final_metrics=metrics,
+            runtime_seconds=runtime_seconds,
+        )
+        print("\nFinal Results:")
+        print("best_epoch=0")
+        for key in ["ACC", "NMI", "ARI", "Macro_F1"]:
+            print(f"{key}={metrics.get(key, 0.0):.4f}")
+        print(f"runtime_seconds={runtime_seconds:.2f}")
+        print("peak_gpu_memory_mb=0.00")
+        print("status=success")
+        return
+    if int(getattr(args, "init_only", 0)):
+        metrics = trainer.run_init_only_eval()
+        runtime_seconds = time.time() - start_time
+        trainer.write_result_json(
+            best_epoch=0,
+            best_metrics=metrics,
+            final_metrics=metrics,
+            runtime_seconds=runtime_seconds,
+        )
+        print("\nFinal Results:")
+        print("best_epoch=0")
+        for key in ["ACC", "NMI", "ARI", "Macro_F1"]:
+            print(f"{key}={metrics.get(key, 0.0):.4f}")
+        print(f"runtime_seconds={runtime_seconds:.2f}")
+        print("peak_gpu_memory_mb=0.00")
+        print("status=success")
+        return
     if trainer.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(trainer.device)
     best_epoch, metrics = trainer.train()
