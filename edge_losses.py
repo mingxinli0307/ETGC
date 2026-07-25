@@ -85,6 +85,7 @@ def edge_trace_mincut_loss_global(
     lambda_orth: float = 1.0,
     eps: float = 1e-12,
     row_block_size: int = 65536,
+    orth_type: str = "orth",
 ) -> tuple:
     """Global trace mincut over all temporal edge events.
 
@@ -138,17 +139,20 @@ def edge_trace_mincut_loss_global(
         raise FloatingPointError(f"trace_mincut denominator is not positive: {details}")
 
     cut_loss = -numerator / (denominator + float(eps))
-    QtQ = Q_all.t().mm(Q_all)
-    QtQ_norm = torch.linalg.norm(QtQ, ord="fro").clamp_min(float(eps))
-    QtQ_normalized = QtQ / QtQ_norm
-    target = torch.eye(int(K), dtype=Q_all.dtype, device=Q_all.device) / (float(K) ** 0.5)
-    orth_loss = torch.linalg.norm(QtQ_normalized - target, ord="fro")
+    selected_orth_type = str(orth_type).lower()
+    if selected_orth_type == "orth":
+        orth_loss = trace_mincut_orthogonality_loss(Q_all, int(K), eps=float(eps))
+    elif selected_orth_type == "orthqa":
+        orth_loss = edge_orthqa_penalty_global(Q_all, degree_t, eps=float(eps))
+    else:
+        raise ValueError(f"Unsupported orth_type: {orth_type}")
     total_cluster_loss = cut_loss + float(lambda_orth) * orth_loss
 
     stats.update(
         {
             "cut_loss": float(cut_loss.detach().cpu()),
             "orth_loss": float(orth_loss.detach().cpu()),
+            "orth_type": selected_orth_type,
             "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
         }
     )
@@ -156,6 +160,53 @@ def edge_trace_mincut_loss_global(
     _check_scalar_finite("trace_mincut orth_loss", orth_loss, stats)
     _check_scalar_finite("trace_mincut total_cluster_loss", total_cluster_loss, stats)
     return total_cluster_loss, cut_loss, orth_loss
+
+
+def trace_mincut_orthogonality_loss(Q_all: torch.Tensor, K: int, eps: float = 1e-12) -> torch.Tensor:
+    QtQ = Q_all.t().mm(Q_all)
+    QtQ_norm = torch.linalg.norm(QtQ, ord="fro").clamp_min(float(eps))
+    QtQ_normalized = QtQ / QtQ_norm
+    target = torch.eye(int(K), dtype=Q_all.dtype, device=Q_all.device) / (float(K) ** 0.5)
+    return torch.linalg.norm(QtQ_normalized - target, ord="fro")
+
+
+def edge_orthqa_penalty_global(Q_all: torch.Tensor, degree, eps: float = 1e-12) -> torch.Tensor:
+    if Q_all.dim() != 2:
+        raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
+    K = int(Q_all.size(1))
+    if K <= 1:
+        raise ValueError(f"edge_orthqa_penalty_global requires K > 1, got K={K}")
+    degree_t = _as_degree_tensor(degree, Q_all)
+    if int(degree_t.numel()) != int(Q_all.size(0)):
+        raise ValueError(f"degree length={degree_t.numel()} does not match Q_all rows={Q_all.size(0)}")
+    total_volume = degree_t.sum()
+    stats = {
+        "M": int(Q_all.size(0)),
+        "K": K,
+        "total_volume": float(total_volume.detach().cpu()),
+        "degree_min": float(degree_t.detach().min().cpu()) if degree_t.numel() else 0.0,
+        "degree_max": float(degree_t.detach().max().cpu()) if degree_t.numel() else 0.0,
+        "Q_min": float(Q_all.detach().min().cpu()) if Q_all.numel() else 0.0,
+        "Q_max": float(Q_all.detach().max().cpu()) if Q_all.numel() else 0.0,
+    }
+    _check_scalar_finite("orthqa total_volume", total_volume, stats)
+    if float(total_volume.detach().cpu()) <= 0.0:
+        details = ", ".join(f"{key}={value}" for key, value in stats.items())
+        raise FloatingPointError(f"orthqa total_volume must be positive: {details}")
+    weighted_square = degree_t.unsqueeze(1) * Q_all.square()
+    cluster_volume_sqrt = torch.sqrt(weighted_square.sum(dim=0) + float(eps))
+    normalized_sum = cluster_volume_sqrt.sum() / torch.sqrt(total_volume + float(eps))
+    sqrt_k = float(K) ** 0.5
+    orthqa_loss = (sqrt_k - normalized_sum) / (sqrt_k - 1.0)
+    stats.update(
+        {
+            "normalized_sum": float(normalized_sum.detach().cpu()),
+            "orthqa_loss": float(orthqa_loss.detach().cpu()),
+        }
+    )
+    _check_scalar_finite("orthqa normalized_sum", normalized_sum, stats)
+    _check_scalar_finite("orthqa loss", orthqa_loss, stats)
+    return orthqa_loss
 
 
 def edge_ppr_proximity_loss(

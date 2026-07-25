@@ -7,6 +7,8 @@ from typing import Iterable, Optional
 import torch
 
 from edge_losses import project_edge_assignments_to_nodes_global
+from edge_metrics import evaluate_node_clustering
+from edge_model import feature_common_variation_statistics
 
 
 EPS = 1e-12
@@ -107,12 +109,16 @@ def logits_statistics(logits: torch.Tensor) -> dict:
             "logits_row_std_max": 0.0,
             "logits_cluster_mean_std": 0.0,
             "logits_cluster_std_mean": 0.0,
+            "logits_within_cluster_event_std": 0.0,
+            "logits_bias_to_event_variation_ratio": 0.0,
             "logits_abs_max": 0.0,
             "logits_mean": 0.0,
         }
     row_std = logits.std(dim=1, unbiased=LOGITS_STD_UNBIASED)
     cluster_mean = logits.mean(dim=0)
     cluster_std = logits.std(dim=0, unbiased=LOGITS_STD_UNBIASED)
+    mean_std = _float(cluster_mean.std(unbiased=LOGITS_STD_UNBIASED))
+    within_std = _float(cluster_std.mean()) if cluster_std.numel() else 0.0
     return {
         "logits_std_unbiased": LOGITS_STD_UNBIASED,
         "logits_global_std": _float(logits.std(unbiased=LOGITS_STD_UNBIASED)),
@@ -120,8 +126,10 @@ def logits_statistics(logits: torch.Tensor) -> dict:
         "logits_row_std_median": _float(torch.median(row_std)) if row_std.numel() else 0.0,
         "logits_row_std_min": _float(row_std.min()) if row_std.numel() else 0.0,
         "logits_row_std_max": _float(row_std.max()) if row_std.numel() else 0.0,
-        "logits_cluster_mean_std": _float(cluster_mean.std(unbiased=LOGITS_STD_UNBIASED)),
-        "logits_cluster_std_mean": _float(cluster_std.mean()) if cluster_std.numel() else 0.0,
+        "logits_cluster_mean_std": mean_std,
+        "logits_cluster_std_mean": within_std,
+        "logits_within_cluster_event_std": within_std,
+        "logits_bias_to_event_variation_ratio": mean_std / (within_std + EPS),
         "logits_abs_max": _float(logits.abs().max()),
         "logits_mean": _float(logits.mean()),
     }
@@ -149,6 +157,58 @@ def q_uniform_distance_statistics(Q: torch.Tensor, eps: float = EPS) -> dict:
         "q_entropy_max": entropy_max,
         "q_entropy_gap": entropy_max - entropy_mean,
     }
+
+
+def q_rank_statistics(Q: torch.Tensor, eps: float = EPS) -> dict:
+    Q_detached = Q.detach().to(dtype=torch.float64)
+    K = int(Q_detached.size(1)) if Q_detached.dim() == 2 else 0
+    if Q_detached.numel() == 0 or K == 0:
+        return {
+            "q_rank1_energy_ratio": 0.0,
+            "q_second_energy_ratio": 0.0,
+            "q_effective_rank": 0.0,
+            "q_numerical_rank": 0,
+            "q_centered_energy": 0.0,
+            "q_centered_effective_rank": 0.0,
+            "q_centered_numerical_rank": 0,
+        }
+    eigvals = torch.linalg.eigvalsh(Q_detached.t().mm(Q_detached)).clamp_min(0.0)
+    eigvals = torch.flip(eigvals, dims=[0])
+    total = eigvals.sum().clamp_min(float(eps))
+    probs = eigvals / total
+    effective_rank = torch.exp(-(probs * torch.log(probs.clamp_min(float(eps)))).sum())
+    second = eigvals[1] / total if K > 1 else eigvals.new_zeros(())
+    numerical_rank = int((eigvals > (1e-6 * eigvals[0].clamp_min(float(eps)))).sum().item())
+
+    centered = Q_detached - Q_detached.mean(dim=0, keepdim=True)
+    centered_eig = torch.linalg.eigvalsh(centered.t().mm(centered)).clamp_min(0.0)
+    centered_eig = torch.flip(centered_eig, dims=[0])
+    centered_energy = centered_eig.sum()
+    if float(centered_energy.cpu()) <= eps:
+        centered_effective_rank = 0.0
+        centered_numerical_rank = 0
+    else:
+        centered_probs = centered_eig / centered_energy.clamp_min(float(eps))
+        centered_effective_rank = _float(
+            torch.exp(-(centered_probs * torch.log(centered_probs.clamp_min(float(eps)))).sum())
+        )
+        centered_numerical_rank = int(
+            (centered_eig > (1e-6 * centered_eig[0].clamp_min(float(eps)))).sum().item()
+        )
+    return {
+        "q_rank1_energy_ratio": _float(eigvals[0] / total),
+        "q_second_energy_ratio": _float(second),
+        "q_effective_rank": _float(effective_rank),
+        "q_numerical_rank": numerical_rank,
+        "q_centered_energy": _float(centered_energy),
+        "q_centered_effective_rank": centered_effective_rank,
+        "q_centered_numerical_rank": centered_numerical_rank,
+    }
+
+
+def prefixed_feature_statistics(features: torch.Tensor, suffix: str) -> dict:
+    stats = feature_common_variation_statistics(features)
+    return {f"{key}_{suffix}": value for key, value in stats.items()}
 
 
 def cluster_head_param_l2(cluster_params: Iterable[torch.nn.Parameter]) -> float:
@@ -234,9 +294,13 @@ def compute_uniform_collapse_stage(
     dst_all: torch.Tensor,
     num_nodes: int,
     K: int,
+    edge_repr_all: Optional[torch.Tensor] = None,
+    cluster_input_all: Optional[torch.Tensor] = None,
+    labels: Optional[torch.Tensor] = None,
     cut_loss: Optional[torch.Tensor] = None,
     orth_loss: Optional[torch.Tensor] = None,
     grad_stats: Optional[dict] = None,
+    extra_stats: Optional[dict] = None,
 ) -> dict:
     with torch.no_grad():
         Q_detached = Q_all.detach()
@@ -254,12 +318,21 @@ def compute_uniform_collapse_stage(
         stats.update(q_margin_statistics(Q_detached))
         stats.update(logits_statistics(logits_detached))
         stats.update(q_uniform_distance_statistics(Q_detached))
+        stats.update(q_rank_statistics(Q_detached))
+        if edge_repr_all is not None:
+            stats.update(prefixed_feature_statistics(edge_repr_all.detach(), "before_norm"))
+        if cluster_input_all is not None:
+            stats.update(prefixed_feature_statistics(cluster_input_all.detach(), "after_norm"))
+        if labels is not None:
+            stats.update(evaluate_node_clustering(labels.detach().cpu().numpy(), node_labels.detach().cpu().numpy()))
         if cut_loss is not None:
             stats["cut_loss"] = _float(cut_loss)
         if orth_loss is not None:
             stats["orth_loss"] = _float(orth_loss)
         if grad_stats:
             stats.update(grad_stats)
+        if extra_stats:
+            stats.update(extra_stats)
         return stats
 
 
@@ -271,6 +344,8 @@ def uniform_delta(initial: dict, after: dict) -> dict:
         "q_entropy_gap",
         "logits_global_std",
         "q_margin_mean",
+        "q_rank1_energy_ratio",
+        "q_centered_energy",
         "num_active_edge_clusters",
         "num_active_node_clusters",
     ]
@@ -285,6 +360,10 @@ SUMMARY_FIELDNAMES = [
     "dataset",
     "seed",
     "stage",
+    "orth_type",
+    "cluster_output_bias_mode",
+    "cluster_input_norm",
+    "cluster_init_mode",
     "M",
     "N",
     "K",
@@ -306,12 +385,42 @@ SUMMARY_FIELDNAMES = [
     "logits_global_std",
     "logits_row_std_mean",
     "logits_cluster_mean_std",
+    "logits_within_cluster_event_std",
+    "logits_bias_to_event_variation_ratio",
     "q_uniform_l2_mean",
     "q_uniform_l1_mean",
     "q_uniform_max_abs",
     "q_uniform_kl_mean",
     "q_entropy_mean",
     "q_entropy_gap",
+    "q_rank1_energy_ratio",
+    "q_second_energy_ratio",
+    "q_effective_rank",
+    "q_numerical_rank",
+    "q_centered_energy",
+    "q_centered_effective_rank",
+    "q_centered_numerical_rank",
+    "feature_common_to_variation_ratio_before_norm",
+    "feature_common_to_variation_ratio_after_norm",
+    "feature_global_mean_abs_before_norm",
+    "feature_global_std_before_norm",
+    "feature_event_mean_norm_before_norm",
+    "feature_centered_event_rms_before_norm",
+    "feature_global_mean_abs_after_norm",
+    "feature_global_std_after_norm",
+    "feature_event_mean_norm_after_norm",
+    "feature_centered_event_rms_after_norm",
+    "output_bias_l2",
+    "cluster_output_weight_l2",
+    "prototype_pairwise_cosine_mean",
+    "prototype_pairwise_cosine_min",
+    "prototype_pairwise_cosine_max",
+    "prototype_min_euclidean_distance",
+    "prototype_max_euclidean_distance",
+    "ACC",
+    "NMI",
+    "ARI",
+    "Macro_F1",
     "cut_loss",
     "orth_loss",
     "cut_cluster_head_grad_l2",
@@ -335,9 +444,12 @@ def write_diagnostic_outputs(
     os.makedirs(output_dir, exist_ok=True)
     payload = {
         "config": config,
+        "after_model_initialization": stages.get("after_model_initialization"),
+        "after_prototype_initialization": stages.get("after_prototype_initialization"),
         "initial_before_training": stages.get("initial_before_training"),
         "before_first_global_update": stages.get("before_first_global_update"),
         "after_first_global_update": stages.get("after_first_global_update"),
+        "final_epoch": stages.get("final_epoch"),
         "delta_initial_to_after_first_global": delta or {},
     }
     with open(os.path.join(output_dir, "diagnostic.json"), "w", encoding="utf-8") as writer:
@@ -346,9 +458,12 @@ def write_diagnostic_outputs(
         csv_writer = csv.DictWriter(writer, fieldnames=SUMMARY_FIELDNAMES)
         csv_writer.writeheader()
         for stage_name in [
+            "after_model_initialization",
+            "after_prototype_initialization",
             "initial_before_training",
             "before_first_global_update",
             "after_first_global_update",
+            "final_epoch",
         ]:
             stage = stages.get(stage_name)
             if not stage:
@@ -358,6 +473,10 @@ def write_diagnostic_outputs(
             row["dataset"] = dataset
             row["seed"] = int(seed)
             row["stage"] = stage_name
+            row["orth_type"] = config.get("orth_type", "")
+            row["cluster_output_bias_mode"] = config.get("cluster_output_bias_mode", "")
+            row["cluster_input_norm"] = config.get("cluster_input_norm", "")
+            row["cluster_init_mode"] = config.get("cluster_init_mode", "")
             csv_writer.writerow(row)
 
 
@@ -380,6 +499,8 @@ def print_stage_summary(stage_name: str, stats: dict, delta: Optional[dict] = No
         f"q_margin_p99={stats.get('q_margin_p99', 0.0):.6g} "
         f"logits_global_std={stats.get('logits_global_std', 0.0):.6g} "
         f"logits_row_std_mean={stats.get('logits_row_std_mean', 0.0):.6g} "
+        f"rank1={stats.get('q_rank1_energy_ratio', 0.0):.6g} "
+        f"centered_energy={stats.get('q_centered_energy', 0.0):.6g} "
         f"uniform_l2={stats.get('q_uniform_l2_mean', 0.0):.6g} "
         f"entropy_gap={stats.get('q_entropy_gap', 0.0):.6g}"
     )
