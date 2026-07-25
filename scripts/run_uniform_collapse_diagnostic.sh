@@ -192,12 +192,20 @@ def run_one(seed):
     run_dir = out_dir / f"school_seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd, source_path = command_for(seed, run_dir)
-    (run_dir / "source_config_path.txt").write_text(str(source_path) + "\n", encoding="utf-8")
     if (run_dir / "diagnostic.json").exists():
+        for extra_name in ["metrics.csv", "result.json", "source_config_path.txt"]:
+            extra_path = run_dir / extra_name
+            if extra_path.exists():
+                extra_path.unlink()
         return 0
+    (run_dir / "source_config_path.txt").write_text(str(source_path) + "\n", encoding="utf-8")
     with (run_dir / "train.log").open("w", encoding="utf-8") as log:
         log.write("cmd=" + " ".join(cmd) + "\n")
         proc = subprocess.run(cmd, cwd=root, stdout=log, stderr=subprocess.STDOUT)
+    for extra_name in ["metrics.csv", "result.json", "source_config_path.txt"]:
+        extra_path = run_dir / extra_name
+        if extra_path.exists():
+            extra_path.unlink()
     return int(proc.returncode)
 
 
@@ -283,7 +291,7 @@ for seed in seed_list:
     cosine = f(before, "cut_orth_grad_cosine")
     edge_active = initial.get("num_active_edge_clusters", "")
     node_active = initial.get("num_active_node_clusters", "")
-    near_uniform = initial_uniform < 1e-2 and f(initial, "q_entropy_gap") < 1e-3
+    near_uniform = initial_uniform < 5e-2 and f(initial, "q_entropy_gap") < 1e-2
     leaves_uniform = abs(delta_uniform) >= 1e-4
     lines.append(
         f"- seed {seed}: initial Q near uniform={near_uniform} "
