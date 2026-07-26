@@ -30,6 +30,8 @@ def build_parser():
     parser.add_argument("--time_dim", type=int, default=32)
     parser.add_argument("--edge_hidden_dim", type=int, default=128)
     parser.add_argument("--cluster_hidden_dim", type=int, default=64)
+    parser.add_argument("--edge_encoder_mode", choices=["mlp", "direct_node_time"], default="mlp")
+    parser.add_argument("--require_pretrained_node2vec", type=int, choices=[0, 1], default=0)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--T", type=int, default=4)
     parser.add_argument("--beta", type=float, default=5.0)
@@ -117,6 +119,8 @@ def print_config(args, K=None):
     )
     print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
     print(f"node_emb_mode={args.node_emb_mode}, node_emb_lr={args.node_emb_lr}")
+    print(f"edge_encoder_mode={args.edge_encoder_mode}")
+    print(f"require_pretrained_node2vec={args.require_pretrained_node2vec}")
     print(f"cluster_output_bias_mode={args.cluster_output_bias_mode}")
     print(f"cluster_input_norm={args.cluster_input_norm}")
     print(f"cluster_init_mode={args.cluster_init_mode}")
@@ -177,6 +181,24 @@ def main(args):
     print(f"node_emb_mode_effective={trainer.node_emb_optimizer_info['node_emb_mode']}")
     print(f"node_emb_lr_effective={trainer.node_emb_optimizer_info['node_emb_lr']}")
     print(f"other_lr_effective={trainer.node_emb_optimizer_info['other_lr']}")
+    print("[model]")
+    print(f"edge_encoder_mode={trainer.edge_encoder_mode}")
+    print(f"node_emb_mode={args.node_emb_mode}")
+    print(f"node_embedding_source={trainer.node_embedding_source}")
+    print(f"node2vec_path={trainer.node_embedding_path}")
+    print(f"node_dim={trainer.node_dim}")
+    print(f"time_dim={args.time_dim}")
+    print(f"event_repr_dim={trainer.event_repr_dim}")
+    print(f"cluster_input_dim={trainer.cluster_input_dim}")
+    print(f"edge_mlp_trainable_params={trainer.model_init_info.get('edge_mlp_trainable_parameter_count')}")
+    print(f"node_emb_trainable={trainer.model.node_emb.requires_grad}")
+    print(f"node_emb_lr={trainer.node_emb_optimizer_info['node_emb_lr']}")
+    for group in trainer.node_emb_optimizer_info.get("optimizer_groups", []):
+        print(
+            f"optimizer_group_name={group.get('optimizer_group_name')} "
+            f"parameter_count={group.get('parameter_count')} "
+            f"learning_rate={group.get('learning_rate')}"
+        )
     print(f"cluster_output_bias_mode={args.cluster_output_bias_mode}")
     print(f"cluster_output_bias_l2_initial={trainer.model_init_info.get('cluster_output_bias_l2_initial')}")
     print(f"cluster_output_weight_l2_initial={trainer.model_init_info.get('cluster_output_weight_l2_initial')}")

@@ -246,6 +246,54 @@ def cluster_volume_statistics(Q: torch.Tensor, degree: torch.Tensor, eps: float 
     }
 
 
+def node_embedding_drift_statistics(current: torch.Tensor, initial: torch.Tensor, eps: float = EPS) -> dict:
+    cur = current.detach()
+    init = initial.detach().to(device=cur.device, dtype=cur.dtype)
+    if cur.shape != init.shape:
+        raise ValueError(f"node embedding shape mismatch: current={tuple(cur.shape)} initial={tuple(init.shape)}")
+    norms = torch.linalg.norm(cur, dim=1)
+    drift = cur - init
+    drift_fro = torch.linalg.norm(drift, ord="fro")
+    init_fro = torch.linalg.norm(init, ord="fro").clamp_min(float(eps))
+    cosine = torch.nn.functional.cosine_similarity(cur, init, dim=1, eps=float(eps))
+    return {
+        "node_embedding_norm_mean": _float(norms.mean()) if norms.numel() else 0.0,
+        "node_embedding_norm_std": _float(norms.std(unbiased=False)) if norms.numel() else 0.0,
+        "node_embedding_drift_fro_normalized": _float(drift_fro / (max(1, int(cur.size(0))) ** 0.5)),
+        "node_embedding_relative_drift": _float(drift_fro / init_fro),
+        "node_embedding_cosine_to_initial_mean": _float(cosine.mean()) if cosine.numel() else 0.0,
+    }
+
+
+def edge_repr_block_norm_statistics(
+    edge_repr: torch.Tensor,
+    node_dim: int,
+    time_dim: int,
+    edge_encoder_mode: str,
+) -> dict:
+    if str(edge_encoder_mode).lower() != "direct_node_time":
+        return {
+            "source_block_norm_mean": "",
+            "destination_block_norm_mean": "",
+            "time_block_norm_mean": "",
+        }
+    node_dim = int(node_dim)
+    time_dim = int(time_dim)
+    expected = 2 * node_dim + time_dim
+    if edge_repr.dim() != 2 or int(edge_repr.size(1)) != expected:
+        raise ValueError(
+            f"direct_node_time edge representation must have dim={expected}, got shape={tuple(edge_repr.shape)}"
+        )
+    src_block = edge_repr[:, :node_dim]
+    dst_block = edge_repr[:, node_dim : 2 * node_dim]
+    time_block = edge_repr[:, 2 * node_dim :]
+    return {
+        "source_block_norm_mean": _float(torch.linalg.norm(src_block, dim=1).mean()) if src_block.numel() else 0.0,
+        "destination_block_norm_mean": _float(torch.linalg.norm(dst_block, dim=1).mean()) if dst_block.numel() else 0.0,
+        "time_block_norm_mean": _float(torch.linalg.norm(time_block, dim=1).mean()) if time_block.numel() else 0.0,
+    }
+
+
 def cluster_head_param_l2(cluster_params: Iterable[torch.nn.Parameter]) -> float:
     total = 0.0
     for param in cluster_params:
@@ -456,6 +504,23 @@ SUMMARY_FIELDNAMES = [
     "feature_global_std_after_norm",
     "feature_event_mean_norm_after_norm",
     "feature_centered_event_rms_after_norm",
+    "edge_encoder_mode",
+    "event_repr_dim",
+    "cluster_input_dim",
+    "edge_mlp_trainable_parameter_count",
+    "node_embedding_parameter_count",
+    "cluster_head_parameter_count",
+    "trainable_parameter_count",
+    "node_embedding_norm_mean",
+    "node_embedding_norm_std",
+    "node_embedding_drift_fro_normalized",
+    "node_embedding_relative_drift",
+    "node_embedding_cosine_to_initial_mean",
+    "edge_repr_norm_mean",
+    "edge_repr_norm_std",
+    "source_block_norm_mean",
+    "destination_block_norm_mean",
+    "time_block_norm_mean",
     "output_bias_l2",
     "cluster_output_weight_l2",
     "prototype_pairwise_cosine_mean",
@@ -477,6 +542,14 @@ SUMMARY_FIELDNAMES = [
     "cut_cluster_head_grad_l2",
     "orth_cluster_head_grad_l2",
     "orthqa_cluster_head_grad_l2",
+    "node_grad_l2_from_prox",
+    "node_grad_max_from_prox",
+    "node_grad_l2_from_cut",
+    "node_grad_max_from_cut",
+    "node_grad_l2_from_penalty",
+    "node_grad_max_from_penalty",
+    "cluster_grad_l2_from_cut",
+    "cluster_grad_l2_from_penalty",
     "cut_grad_to_param_ratio",
     "orth_grad_to_param_ratio",
     "cut_orth_grad_cosine",

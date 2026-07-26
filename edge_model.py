@@ -12,15 +12,23 @@ def tensor_checksum(tensor: torch.Tensor) -> str:
     return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
-def load_pretrained_node_features(path: str, num_nodes: int, fallback_dim: int, seed: int) -> np.ndarray:
+def load_pretrained_node_features(
+    path: str,
+    num_nodes: int,
+    fallback_dim: int,
+    seed: int,
+    require_existing: bool = False,
+) -> np.ndarray:
     if not os.path.exists(path):
+        if require_existing:
+            raise FileNotFoundError(f"Missing required Node2Vec embedding file: {path}")
         print(f"Warning: pretrain embedding file not found: {path}; using random initialization.")
         rng = np.random.RandomState(seed)
         return rng.normal(0.0, 0.02, size=(num_nodes, fallback_dim)).astype(np.float32)
 
     rows = {}
     with open(path, "r", encoding="utf-8") as reader:
-        first = reader.readline().strip().split()
+        first = reader.readline().lstrip("\ufeff").strip().split()
         has_header = len(first) == 2 and all(tok.lstrip("-").isdigit() for tok in first)
         if first and not has_header:
             arr = np.asarray(first, dtype=np.float32)
@@ -36,6 +44,14 @@ def load_pretrained_node_features(path: str, num_nodes: int, fallback_dim: int, 
     if not rows:
         raise ValueError(f"No embeddings could be parsed from {path}")
     dim = len(next(iter(rows.values())))
+    if require_existing:
+        missing = [nid for nid in range(int(num_nodes)) if nid not in rows or len(rows[nid]) != dim]
+        if missing:
+            preview = ",".join(str(x) for x in missing[:10])
+            raise ValueError(
+                f"Node2Vec embedding file is incomplete for contiguous ETGC node ids: "
+                f"path={path}, missing_or_bad_count={len(missing)}, first_missing={preview}"
+            )
     rng = np.random.RandomState(seed)
     features = rng.normal(0.0, 0.02, size=(num_nodes, dim)).astype(np.float32)
     for nid, vec in rows.items():
@@ -56,30 +72,43 @@ class EdgeHiNoSModel(nn.Module):
         directed: bool,
         cluster_output_bias_mode: str = "default",
         cluster_input_norm: str = "none",
+        edge_encoder_mode: str = "mlp",
     ):
         super().__init__()
         self.node_emb = nn.Parameter(torch.from_numpy(initial_node_features.astype(np.float32)))
         self.directed = bool(directed)
+        self.edge_encoder_mode = str(edge_encoder_mode).lower()
         self.cluster_output_bias_mode = str(cluster_output_bias_mode).lower()
         self.cluster_input_norm_mode = str(cluster_input_norm).lower()
+        if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
+            raise ValueError(f"Unsupported edge_encoder_mode: {edge_encoder_mode}")
         if self.cluster_output_bias_mode not in {"default", "zero", "none"}:
             raise ValueError(f"Unsupported cluster_output_bias_mode: {cluster_output_bias_mode}")
         if self.cluster_input_norm_mode not in {"none", "layernorm"}:
             raise ValueError(f"Unsupported cluster_input_norm: {cluster_input_norm}")
         node_dim = int(initial_node_features.shape[1])
-        pair_dim = 2 * node_dim if self.directed else 3 * node_dim
-        in_dim = pair_dim + int(time_dim)
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(in_dim, edge_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(edge_hidden_dim, edge_dim),
-            nn.ReLU(),
-        )
+        self.node_dim = node_dim
+        self.time_dim = int(time_dim)
+        if self.edge_encoder_mode == "mlp":
+            pair_dim = 2 * node_dim if self.directed else 3 * node_dim
+            in_dim = pair_dim + self.time_dim
+            self.edge_mlp = nn.Sequential(
+                nn.Linear(in_dim, edge_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(edge_hidden_dim, edge_dim),
+                nn.ReLU(),
+            )
+            cluster_input_dim = int(edge_dim)
+        else:
+            self.edge_mlp = None
+            cluster_input_dim = 2 * node_dim + self.time_dim
+        self.event_repr_dim = int(cluster_input_dim)
+        self.cluster_input_dim = int(cluster_input_dim)
         if self.cluster_input_norm_mode == "layernorm":
-            self.cluster_input_norm = nn.LayerNorm(edge_dim, elementwise_affine=False)
+            self.cluster_input_norm = nn.LayerNorm(self.cluster_input_dim, elementwise_affine=False)
         else:
             self.cluster_input_norm = nn.Identity()
-        self.cluster_hidden = nn.Linear(edge_dim, cluster_hidden_dim)
+        self.cluster_hidden = nn.Linear(self.cluster_input_dim, cluster_hidden_dim)
         self.cluster_activation = nn.ReLU()
         self.cluster_output = nn.Linear(
             cluster_hidden_dim,
@@ -94,6 +123,35 @@ class EdgeHiNoSModel(nn.Module):
             self.cluster_activation,
             self.cluster_output,
         )
+
+    def build_direct_node_time_event_repr(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        time_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        h_src = self.node_emb.index_select(0, src.long())
+        h_dst = self.node_emb.index_select(0, dst.long())
+        return torch.cat([h_src, h_dst, time_feat], dim=-1)
+
+    def encode_edge_events(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        time_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        h_u = self.node_emb.index_select(0, src.long())
+        h_v = self.node_emb.index_select(0, dst.long())
+        if self.edge_encoder_mode == "mlp":
+            if self.directed:
+                pair_feat = torch.cat([h_u, h_v], dim=-1)
+            else:
+                pair_feat = torch.cat([h_u + h_v, torch.abs(h_u - h_v), h_u * h_v], dim=-1)
+            x_e = torch.cat([pair_feat, time_feat], dim=-1)
+            return self.edge_mlp(x_e)
+        if self.edge_encoder_mode == "direct_node_time":
+            return torch.cat([h_u, h_v, time_feat], dim=-1)
+        raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
 
     def cluster_hidden_from_edge_repr(self, edge_repr: torch.Tensor):
         cluster_input = self.cluster_input_norm(edge_repr)
@@ -110,15 +168,9 @@ class EdgeHiNoSModel(nn.Module):
         time_feat: torch.Tensor,
         return_logits: bool = False,
         return_cluster_hidden: bool = False,
+        return_edge_repr: bool = False,
     ):
-        h_u = self.node_emb.index_select(0, src.long())
-        h_v = self.node_emb.index_select(0, dst.long())
-        if self.directed:
-            pair_feat = torch.cat([h_u, h_v], dim=-1)
-        else:
-            pair_feat = torch.cat([h_u + h_v, torch.abs(h_u - h_v), h_u * h_v], dim=-1)
-        x_e = torch.cat([pair_feat, time_feat], dim=-1)
-        r_e = self.edge_mlp(x_e)
+        r_e = self.encode_edge_events(src, dst, time_feat)
         _cluster_input, cluster_hidden = self.cluster_hidden_from_edge_repr(r_e)
         logits = self.cluster_logits_from_hidden(cluster_hidden)
         q_e = F.softmax(logits, dim=-1)

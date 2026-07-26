@@ -39,6 +39,8 @@ from edge_uniform_diagnostic import (
     cluster_head_gradient_diagnostics,
     cluster_volume_statistics,
     compute_uniform_collapse_stage,
+    edge_repr_block_norm_statistics,
+    node_embedding_drift_statistics,
     print_stage_summary,
     uniform_delta,
     write_diagnostic_outputs,
@@ -57,6 +59,34 @@ def edge_hard_labels_to_node_predictions(edge_labels: np.ndarray, src: np.ndarra
     return S.argmax(axis=1).astype(np.int64)
 
 
+def _parameter_count(params) -> int:
+    return int(sum(int(p.numel()) for p in params))
+
+
+def _optimizer_group_summary(optimizer) -> list:
+    result = []
+    seen = set()
+    duplicate_count = 0
+    for index, group in enumerate(optimizer.param_groups):
+        params = list(group.get("params", []))
+        ids = [id(p) for p in params]
+        duplicate_count += len(ids) - len(set(ids))
+        for pid in ids:
+            if pid in seen:
+                duplicate_count += 1
+            seen.add(pid)
+        result.append(
+            {
+                "optimizer_group_name": group.get("name", f"group_{index}"),
+                "parameter_count": _parameter_count(params),
+                "learning_rate": float(group.get("lr", 0.0)),
+            }
+        )
+    if duplicate_count:
+        raise ValueError(f"Optimizer parameter groups contain duplicated parameters: duplicate_count={duplicate_count}")
+    return result
+
+
 def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb_mode: str, node_emb_lr: float):
     mode = str(node_emb_mode).lower()
     if mode not in {"frozen", "small_lr", "full"}:
@@ -70,24 +100,25 @@ def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb
         params = [p for p in model.parameters() if p.requires_grad]
         if not params:
             raise ValueError("No trainable parameters remain after freezing node_emb.")
-        optimizer = Adam(params, lr=lr)
+        optimizer = Adam([{"params": params, "lr": lr, "name": "non_node_parameters"}])
         info = {
             "node_emb_mode": mode,
             "node_emb_trainable": False,
             "node_emb_lr": 0.0,
             "other_lr": lr,
             "param_group_lrs": [lr],
+            "optimizer_groups": _optimizer_group_summary(optimizer),
         }
         return optimizer, info
 
     node_param.requires_grad_(True)
+    node_id = id(node_param)
+    other_params = [p for p in model.parameters() if id(p) != node_id and p.requires_grad]
     if mode == "small_lr":
-        node_id = id(node_param)
-        other_params = [p for p in model.parameters() if id(p) != node_id and p.requires_grad]
         optimizer = Adam(
             [
-                {"params": other_params, "lr": lr},
-                {"params": [node_param], "lr": node_emb_lr},
+                {"params": [node_param], "lr": node_emb_lr, "name": "node_emb"},
+                {"params": other_params, "lr": lr, "name": "non_node_parameters"},
             ]
         )
         info = {
@@ -96,16 +127,19 @@ def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb
             "node_emb_lr": node_emb_lr,
             "other_lr": lr,
             "param_group_lrs": [lr, node_emb_lr],
+            "optimizer_groups": _optimizer_group_summary(optimizer),
         }
         return optimizer, info
 
-    optimizer = Adam(model.parameters(), lr=lr)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = Adam([{"params": params, "lr": lr, "name": "all_trainable_parameters"}])
     info = {
         "node_emb_mode": mode,
         "node_emb_trainable": True,
         "node_emb_lr": lr,
         "other_lr": lr,
         "param_group_lrs": [lr],
+        "optimizer_groups": _optimizer_group_summary(optimizer),
     }
     return optimizer, info
 
@@ -167,10 +201,21 @@ class EdgeHiNoSTrainer:
                     f"fallback=row_block_sparse_mm reason={type(exc).__name__}: {str(exc).splitlines()[0]}"
                 )
 
+        self.edge_encoder_mode = str(getattr(args, "edge_encoder_mode", "mlp")).lower()
+        if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
+            raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
+        self.require_pretrained_node2vec = bool(int(getattr(args, "require_pretrained_node2vec", 0)))
         feature_path = self._resolve_feature_path()
+        self.node_embedding_path = feature_path
         node_features = load_pretrained_node_features(
-            feature_path, self.data.num_nodes, int(args.edge_dim), self.model_seed
+            feature_path,
+            self.data.num_nodes,
+            int(args.edge_dim),
+            self.model_seed,
+            require_existing=self.require_pretrained_node2vec,
         )
+        self.node_embedding_source = "node2vec" if os.path.exists(feature_path) else "random_fallback"
+        self.node_dim = int(node_features.shape[1])
         self.model = EdgeHiNoSModel(
             initial_node_features=node_features,
             time_dim=int(args.time_dim),
@@ -181,7 +226,10 @@ class EdgeHiNoSTrainer:
             directed=bool(args.directed),
             cluster_output_bias_mode=getattr(args, "cluster_output_bias_mode", "default"),
             cluster_input_norm=getattr(args, "cluster_input_norm", "none"),
+            edge_encoder_mode=self.edge_encoder_mode,
         ).to(self.device)
+        self.event_repr_dim = int(self.model.event_repr_dim)
+        self.cluster_input_dim = int(self.model.cluster_input_dim)
 
         self.src_t = torch.from_numpy(self.data.src).long().to(self.device)
         self.dst_t = torch.from_numpy(self.data.dst).long().to(self.device)
@@ -201,10 +249,22 @@ class EdgeHiNoSTrainer:
         self.init_reference = None
         self.init_reference_weight = None
         self.init_reference_metrics = None
+        self.node_emb_initial_cpu = None
+        if (
+            self.edge_encoder_mode == "direct_node_time"
+            and str(getattr(args, "node_emb_mode", "full")).lower() != "frozen"
+        ) or self.uniform_collapse_diagnostic or self.overnight_diagnostic:
+            self.node_emb_initial_cpu = self.model.node_emb.detach().cpu().clone()
+        self._apply_node_embedding_requires_grad_state()
         self.model_init_info = self._current_cluster_output_stats()
+        self.model_init_info.update(self._model_parameter_info())
+        self.model_init_info["node_embedding_source"] = self.node_embedding_source
+        self.model_init_info["node2vec_path"] = self.node_embedding_path
+        self.model_init_info["node2vec_shape"] = [int(x) for x in node_features.shape]
         self.model_init_info["cluster_output_bias_mode"] = str(getattr(args, "cluster_output_bias_mode", "default"))
         self.model_init_info["cluster_input_norm"] = str(getattr(args, "cluster_input_norm", "none"))
         self.model_init_info["cluster_init_mode"] = str(getattr(args, "cluster_init_mode", "random"))
+        self.model_init_info["edge_encoder_mode"] = self.edge_encoder_mode
         self.model_init_info["cluster_output_bias_l2_initial"] = self.model_init_info["output_bias_l2"]
         self.model_init_info["cluster_output_weight_l2_initial"] = self.model_init_info["cluster_output_weight_l2"]
         self.model_init_info["prototype_init_executed"] = False
@@ -231,6 +291,7 @@ class EdgeHiNoSTrainer:
                 node_emb_mode=getattr(args, "node_emb_mode", "full"),
                 node_emb_lr=float(getattr(args, "node_emb_lr", 1e-5)),
             )
+        self.model_init_info.update(self._model_parameter_info())
 
     @staticmethod
     def _parse_diagnostic_epochs(value) -> set:
@@ -253,6 +314,39 @@ class EdgeHiNoSTrainer:
             os.path.join(self.args.emb_root, self.args.dataset, f"{self.args.dataset}_feature.emb"),
         ]
         return next((path for path in candidates if os.path.exists(path)), candidates[0])
+
+    def _apply_node_embedding_requires_grad_state(self) -> None:
+        mode = str(getattr(self.args, "node_emb_mode", "full")).lower()
+        if mode == "frozen":
+            self.model.node_emb.requires_grad_(False)
+        elif mode in {"small_lr", "full"}:
+            self.model.node_emb.requires_grad_(True)
+        else:
+            raise ValueError(f"Unsupported node_emb_mode: {mode}")
+
+    def _edge_mlp_parameters(self) -> list:
+        if getattr(self.model, "edge_mlp", None) is None:
+            return []
+        return list(self.model.edge_mlp.parameters())
+
+    def _model_parameter_info(self) -> dict:
+        edge_mlp_params = self._edge_mlp_parameters()
+        cluster_params = list(self.model.cluster_head.parameters())
+        all_params = list(self.model.parameters())
+        trainable_params = [p for p in all_params if p.requires_grad]
+        return {
+            "edge_encoder_mode": self.edge_encoder_mode,
+            "node_dim": int(self.node_dim),
+            "time_dim": int(getattr(self.args, "time_dim", 0)),
+            "event_repr_dim": int(self.event_repr_dim),
+            "cluster_input_dim": int(self.cluster_input_dim),
+            "edge_mlp_parameter_count": _parameter_count(edge_mlp_params),
+            "edge_mlp_trainable_parameter_count": _parameter_count([p for p in edge_mlp_params if p.requires_grad]),
+            "node_embedding_parameter_count": int(self.model.node_emb.numel()),
+            "cluster_head_parameter_count": _parameter_count(cluster_params),
+            "trainable_parameter_count": _parameter_count(trainable_params),
+            "node_emb_trainable": bool(self.model.node_emb.requires_grad),
+        }
 
     def _batch_union_ids(self, batch_ids: np.ndarray) -> np.ndarray:
         ids = set(int(i) for i in batch_ids.tolist())
@@ -496,15 +590,53 @@ class EdgeHiNoSTrainer:
                 "K": int(self.K),
                 "diagnostic_dir": self.uniform_diag_dir,
                 "logits_std_unbiased": False,
+                "edge_encoder_mode": self.edge_encoder_mode,
+                "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
+                "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
+                "node_dim": int(self.node_dim),
+                "time_dim": int(getattr(self.args, "time_dim", 0)),
+                "event_repr_dim": int(self.event_repr_dim),
+                "cluster_input_dim": int(self.cluster_input_dim),
+                "node_embedding_source": self.node_embedding_source,
+                "node2vec_path": self.node_embedding_path,
+                "model_parameter_info": self._model_parameter_info(),
                 "projection": "S=RowNorm(BQ) using index_add over src/dst events",
                 "model_init_info": self.model_init_info,
             }
         )
         return cfg
 
-    def _overnight_stage_extra_stats(self, q_all: torch.Tensor) -> dict:
+    def _overnight_stage_extra_stats(self, q_all: torch.Tensor, edge_repr_all: torch.Tensor = None) -> dict:
         degree_t = torch.from_numpy(self.W_E_degree_np).to(device=q_all.device, dtype=q_all.dtype)
         extra = self._current_cluster_output_stats()
+        extra.update(self._model_parameter_info())
+        if self.node_emb_initial_cpu is not None:
+            extra.update(
+                node_embedding_drift_statistics(
+                    self.model.node_emb.detach(),
+                    self.node_emb_initial_cpu.to(device=self.model.node_emb.device, dtype=self.model.node_emb.dtype),
+                )
+            )
+        if edge_repr_all is not None:
+            edge_detached = edge_repr_all.detach()
+            if edge_detached.numel():
+                edge_norm = torch.linalg.norm(edge_detached, dim=1)
+                extra.update(
+                    {
+                        "edge_repr_norm_mean": float(edge_norm.mean().cpu()),
+                        "edge_repr_norm_std": float(edge_norm.std(unbiased=False).cpu()),
+                    }
+                )
+            else:
+                extra.update({"edge_repr_norm_mean": 0.0, "edge_repr_norm_std": 0.0})
+            extra.update(
+                edge_repr_block_norm_statistics(
+                    edge_detached,
+                    node_dim=self.node_dim,
+                    time_dim=int(getattr(self.args, "time_dim", 0)),
+                    edge_encoder_mode=self.edge_encoder_mode,
+                )
+            )
         extra.update(cluster_volume_statistics(q_all, degree_t))
         selected = str(getattr(self.args, "orth_type", "orth")).lower()
         penalty_weight = float(getattr(self.args, "lambda_orth", 1.0))
@@ -529,6 +661,148 @@ class EdgeHiNoSTrainer:
         )
         extra["orth_loss"] = extra["selected_penalty_loss"]
         return extra
+
+    @staticmethod
+    def _grad_l2_max(grads) -> tuple:
+        total_sq = 0.0
+        max_abs = 0.0
+        any_grad = False
+        for grad in grads:
+            if grad is None:
+                continue
+            grad_detached = grad.detach()
+            if not torch.isfinite(grad_detached).all():
+                raise FloatingPointError("Gradient diagnostic encountered NaN or Inf")
+            total_sq += float(grad_detached.square().sum().cpu())
+            max_abs = max(max_abs, float(grad_detached.abs().max().cpu()) if grad_detached.numel() else 0.0)
+            any_grad = True
+        if not any_grad:
+            return None, None
+        return total_sq ** 0.5, max_abs
+
+    @staticmethod
+    def _flat_grad_vector(grads, params) -> torch.Tensor:
+        pieces = []
+        for grad, param in zip(grads, params):
+            if grad is None:
+                pieces.append(torch.zeros_like(param, memory_format=torch.preserve_format).reshape(-1))
+            else:
+                pieces.append(grad.detach().reshape(-1))
+        if not pieces:
+            return None
+        return torch.cat(pieces)
+
+    def _independent_gradient_diagnostics(self, stage_name: str) -> dict:
+        if not self.overnight_diagnostic:
+            return {}
+        if int(self.model_seed) != 42:
+            return {}
+        allowed = {
+            "after_cluster_initialization",
+            "before_first_global_update",
+            "before_global_epoch_1",
+            "epoch_1",
+            "final_epoch",
+        }
+        if stage_name not in allowed:
+            return {}
+
+        was_training = self.model.training
+        self.model.train()
+        result = {}
+        node_params = [self.model.node_emb] if self.model.node_emb.requires_grad else []
+        cluster_params = [p for p in self.model.cluster_head.parameters() if p.requires_grad]
+
+        if node_params and float(getattr(self.args, "lambda_prox", 0.0)) > 0.0:
+            batch_ids = np.arange(min(int(self.args.batch_size), self.data.num_events), dtype=np.int64)
+            union_ids = self._batch_union_ids(batch_ids)
+            local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
+            r_union, _ = self._forward_ids(union_ids)
+            diag_rng = np.random.RandomState(int(self.model_seed) + 104729)
+            prox_loss = edge_ppr_proximity_loss(
+                r_union, local_index, batch_ids, self.Pi_E, self.data.num_events, diag_rng, self.device
+            )
+            prox_grads = torch.autograd.grad(
+                prox_loss,
+                node_params,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            prox_l2, prox_max = self._grad_l2_max(prox_grads)
+            result["node_grad_l2_from_prox"] = prox_l2
+            result["node_grad_max_from_prox"] = prox_max
+        else:
+            result["node_grad_l2_from_prox"] = None
+            result["node_grad_max_from_prox"] = None
+
+        q_all = self._forward_all_q_with_grad(int(self.args.global_q_chunk_size))
+        _, cut_loss, penalty_loss = edge_trace_mincut_loss_global(
+            q_all,
+            self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+            self.W_E_degree_np,
+            self.K,
+            lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
+            row_block_size=int(self.args.global_ncut_row_block_size),
+            orth_type=str(getattr(self.args, "orth_type", "orth")),
+        )
+        if node_params:
+            cut_node_grads = torch.autograd.grad(
+                cut_loss,
+                node_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+            penalty_node_grads = torch.autograd.grad(
+                penalty_loss,
+                node_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+            cut_node_l2, cut_node_max = self._grad_l2_max(cut_node_grads)
+            penalty_node_l2, penalty_node_max = self._grad_l2_max(penalty_node_grads)
+            result["node_grad_l2_from_cut"] = cut_node_l2
+            result["node_grad_max_from_cut"] = cut_node_max
+            result["node_grad_l2_from_penalty"] = penalty_node_l2
+            result["node_grad_max_from_penalty"] = penalty_node_max
+        else:
+            result["node_grad_l2_from_cut"] = None
+            result["node_grad_max_from_cut"] = None
+            result["node_grad_l2_from_penalty"] = None
+            result["node_grad_max_from_penalty"] = None
+
+        cut_cluster_grads = torch.autograd.grad(
+            cut_loss,
+            cluster_params,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        penalty_cluster_grads = torch.autograd.grad(
+            penalty_loss,
+            cluster_params,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        cut_cluster_l2, _ = self._grad_l2_max(cut_cluster_grads)
+        penalty_cluster_l2, _ = self._grad_l2_max(penalty_cluster_grads)
+        result["cluster_grad_l2_from_cut"] = cut_cluster_l2
+        result["cluster_grad_l2_from_penalty"] = penalty_cluster_l2
+        cut_vec = self._flat_grad_vector(cut_cluster_grads, cluster_params)
+        penalty_vec = self._flat_grad_vector(penalty_cluster_grads, cluster_params)
+        cosine = None
+        if cut_vec is not None and penalty_vec is not None:
+            cut_norm = torch.linalg.norm(cut_vec)
+            penalty_norm = torch.linalg.norm(penalty_vec)
+            if float(cut_norm.detach().cpu()) > 1e-12 and float(penalty_norm.detach().cpu()) > 1e-12:
+                cosine = float(torch.dot(cut_vec, penalty_vec).detach().cpu() / (cut_norm * penalty_norm).clamp_min(1e-12))
+        result["cut_penalty_gradient_cosine"] = cosine
+        if not was_training:
+            self.model.eval()
+        return result
 
     def _write_uniform_diagnostics(self) -> None:
         if not self.uniform_collapse_diagnostic or not self.uniform_diag_dir:
@@ -559,8 +833,9 @@ class EdgeHiNoSTrainer:
             edge_repr_all=edge_repr_all,
             cluster_input_all=cluster_input_all,
             labels=torch.from_numpy(self.data.labels).long().to(self.device),
-            extra_stats=self._overnight_stage_extra_stats(q_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
         )
+        stats.update(self._independent_gradient_diagnostics(stage_name))
         self.uniform_diag_stages[stage_name] = stats
         if "initial_before_training" not in self.uniform_diag_stages:
             self.uniform_diag_stages["initial_before_training"] = stats
@@ -601,8 +876,9 @@ class EdgeHiNoSTrainer:
             cut_loss=cut_loss,
             orth_loss=orth_loss,
             grad_stats=grad_stats,
-            extra_stats=self._overnight_stage_extra_stats(q_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
         )
+        stats.update(self._independent_gradient_diagnostics(stage_name))
         self.uniform_diag_stages[stage_name] = stats
         self._write_uniform_diagnostics()
         print_stage_summary("before_global" if stage_name == "before_first_global_update" else stage_name, stats)
@@ -624,8 +900,9 @@ class EdgeHiNoSTrainer:
             edge_repr_all=edge_repr_all,
             cluster_input_all=cluster_input_all,
             labels=torch.from_numpy(self.data.labels).long().to(self.device),
-            extra_stats=self._overnight_stage_extra_stats(q_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
         )
+        stats.update(self._independent_gradient_diagnostics("after_first_global_update"))
         self.uniform_diag_stages["after_first_global_update"] = stats
         initial = self.uniform_diag_stages.get("after_model_initialization", self.uniform_diag_stages.get("initial_before_training", {}))
         self.uniform_diag_delta = uniform_delta(initial, stats) if initial else {}
@@ -724,6 +1001,13 @@ class EdgeHiNoSTrainer:
         }
         if cut_init is not None and cut_final is not None:
             result["cut_delta_final_init"] = float(cut_final) - float(cut_init)
+        if self.node_emb_initial_cpu is not None:
+            result.update(
+                node_embedding_drift_statistics(
+                    self.model.node_emb.detach(),
+                    self.node_emb_initial_cpu.to(device=self.model.node_emb.device, dtype=self.model.node_emb.dtype),
+                )
+            )
         return result
 
     def run_init_only_eval(self) -> dict:
@@ -839,6 +1123,28 @@ class EdgeHiNoSTrainer:
             "cluster_volume_coefficient_of_variation",
             "hard_cluster_volume_cv",
             "logits_bias_to_event_variation_ratio",
+            "edge_encoder_mode",
+            "node_embedding_norm_mean",
+            "node_embedding_norm_std",
+            "node_embedding_drift_fro_normalized",
+            "node_embedding_relative_drift",
+            "node_embedding_cosine_to_initial_mean",
+            "edge_repr_norm_mean",
+            "edge_repr_norm_std",
+            "feature_common_to_variation_ratio_before_norm",
+            "feature_common_to_variation_ratio_after_norm",
+            "source_block_norm_mean",
+            "destination_block_norm_mean",
+            "time_block_norm_mean",
+            "node_grad_l2_from_prox",
+            "node_grad_max_from_prox",
+            "node_grad_l2_from_cut",
+            "node_grad_max_from_cut",
+            "node_grad_l2_from_penalty",
+            "node_grad_max_from_penalty",
+            "cluster_grad_l2_from_cut",
+            "cluster_grad_l2_from_penalty",
+            "cut_penalty_gradient_cosine",
             "cluster_forward_seconds",
             "cluster_backward_seconds",
             "epoch_seconds",
@@ -889,6 +1195,15 @@ class EdgeHiNoSTrainer:
                 "M": int(self.data.num_events),
                 "N": int(self.data.num_nodes),
                 "K": int(self.K),
+                "edge_encoder_mode": self.edge_encoder_mode,
+                "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
+                "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
+                "node_dim": int(self.node_dim),
+                "time_dim": int(getattr(self.args, "time_dim", 0)),
+                "event_repr_dim": int(self.event_repr_dim),
+                "cluster_input_dim": int(self.cluster_input_dim),
+                "node_embedding_source": self.node_embedding_source,
+                "node2vec_path": self.node_embedding_path,
                 "model_seed": self.model_seed,
                 "prototype_seed": self.prototype_seed,
                 "forest_seed": self.forest_seed,
@@ -899,6 +1214,7 @@ class EdgeHiNoSTrainer:
                 "legacy_balance_disabled": self.cluster_loss_type == "trace_mincut",
                 "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
                 "node_emb_optimizer_info": self.node_emb_optimizer_info,
+                "model_parameter_info": self._model_parameter_info(),
                 "model_init_info": self.model_init_info,
                 "prox_stats": self.prox_stats,
             }
@@ -923,11 +1239,21 @@ class EdgeHiNoSTrainer:
             "M": int(self.data.num_events),
             "N": int(self.data.num_nodes),
             "K": int(self.K),
+            "edge_encoder_mode": self.edge_encoder_mode,
+            "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
+            "node_dim": int(self.node_dim),
+            "time_dim": int(getattr(self.args, "time_dim", 0)),
+            "event_repr_dim": int(self.event_repr_dim),
+            "cluster_input_dim": int(self.cluster_input_dim),
+            "node_embedding_source": self.node_embedding_source,
+            "node2vec_path": self.node_embedding_path,
             "Pi_E_nnz": int(self.Pi_E.nnz),
             "W_E_nnz": int(self.W_E.nnz),
             "W_E_avg_nnz_per_row": float(self.W_E.nnz / max(1, self.W_E.shape[0])),
             "W_E_sparse_mode": self.W_E_sparse_mode,
             "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
+            "node_emb_optimizer_info": self.node_emb_optimizer_info,
+            "model_parameter_info": self._model_parameter_info(),
             "model_init_info": self.model_init_info,
             "training_change_metrics": getattr(self, "training_change_metrics", {}),
         }
@@ -980,8 +1306,9 @@ class EdgeHiNoSTrainer:
                         )
                         loss = lambda_prox * l_prox
                         self.optimizer.zero_grad()
-                        loss.backward()
-                        self.optimizer.step()
+                        if loss.requires_grad:
+                            loss.backward()
+                            self.optimizer.step()
                         prox_total += scalar_value(l_prox)
                         prox_steps += 1
             else:
@@ -1015,8 +1342,9 @@ class EdgeHiNoSTrainer:
                         l_ncut = edge_ncut_loss(q_union, union_ids, self.W_E, self.K)
                         loss = loss + lambda_edge_ncut * l_ncut
                     self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
+                    if loss.requires_grad:
+                        loss.backward()
+                        self.optimizer.step()
                     prox_total += scalar_value(l_prox)
                     prox_steps += 1
 
@@ -1188,6 +1516,28 @@ class EdgeHiNoSTrainer:
                 "cluster_volume_coefficient_of_variation": stage_stats_for_epoch.get("cluster_volume_coefficient_of_variation", ""),
                 "hard_cluster_volume_cv": stage_stats_for_epoch.get("hard_cluster_volume_cv", ""),
                 "logits_bias_to_event_variation_ratio": stage_stats_for_epoch.get("logits_bias_to_event_variation_ratio", ""),
+                "edge_encoder_mode": self.edge_encoder_mode,
+                "node_embedding_norm_mean": stage_stats_for_epoch.get("node_embedding_norm_mean", ""),
+                "node_embedding_norm_std": stage_stats_for_epoch.get("node_embedding_norm_std", ""),
+                "node_embedding_drift_fro_normalized": stage_stats_for_epoch.get("node_embedding_drift_fro_normalized", ""),
+                "node_embedding_relative_drift": stage_stats_for_epoch.get("node_embedding_relative_drift", ""),
+                "node_embedding_cosine_to_initial_mean": stage_stats_for_epoch.get("node_embedding_cosine_to_initial_mean", ""),
+                "edge_repr_norm_mean": stage_stats_for_epoch.get("edge_repr_norm_mean", ""),
+                "edge_repr_norm_std": stage_stats_for_epoch.get("edge_repr_norm_std", ""),
+                "feature_common_to_variation_ratio_before_norm": stage_stats_for_epoch.get("feature_common_to_variation_ratio_before_norm", ""),
+                "feature_common_to_variation_ratio_after_norm": stage_stats_for_epoch.get("feature_common_to_variation_ratio_after_norm", ""),
+                "source_block_norm_mean": stage_stats_for_epoch.get("source_block_norm_mean", ""),
+                "destination_block_norm_mean": stage_stats_for_epoch.get("destination_block_norm_mean", ""),
+                "time_block_norm_mean": stage_stats_for_epoch.get("time_block_norm_mean", ""),
+                "node_grad_l2_from_prox": stage_stats_for_epoch.get("node_grad_l2_from_prox", ""),
+                "node_grad_max_from_prox": stage_stats_for_epoch.get("node_grad_max_from_prox", ""),
+                "node_grad_l2_from_cut": stage_stats_for_epoch.get("node_grad_l2_from_cut", ""),
+                "node_grad_max_from_cut": stage_stats_for_epoch.get("node_grad_max_from_cut", ""),
+                "node_grad_l2_from_penalty": stage_stats_for_epoch.get("node_grad_l2_from_penalty", ""),
+                "node_grad_max_from_penalty": stage_stats_for_epoch.get("node_grad_max_from_penalty", ""),
+                "cluster_grad_l2_from_cut": stage_stats_for_epoch.get("cluster_grad_l2_from_cut", ""),
+                "cluster_grad_l2_from_penalty": stage_stats_for_epoch.get("cluster_grad_l2_from_penalty", ""),
+                "cut_penalty_gradient_cosine": stage_stats_for_epoch.get("cut_penalty_gradient_cosine", ""),
                 "cluster_forward_seconds": cluster_forward_seconds,
                 "cluster_backward_seconds": cluster_backward_seconds,
                 "epoch_seconds": epoch_seconds,
