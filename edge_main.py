@@ -31,6 +31,7 @@ def build_parser():
     parser.add_argument("--edge_hidden_dim", type=int, default=128)
     parser.add_argument("--cluster_hidden_dim", type=int, default=64)
     parser.add_argument("--edge_encoder_mode", choices=["mlp", "direct_node_time"], default="mlp")
+    parser.add_argument("--direct_time_scale", type=float, default=1.0)
     parser.add_argument("--require_pretrained_node2vec", type=int, choices=[0, 1], default=0)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--T", type=int, default=4)
@@ -60,8 +61,16 @@ def build_parser():
     parser.add_argument("--lambda_orth", type=float, default=1.0)
     parser.add_argument("--lambda_proj", type=float, default=0.2)
     parser.add_argument("--lambda_bal", type=float, default=50.0)
+    parser.add_argument("--lambda_node_anchor", type=float, default=0.0)
     parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="full")
     parser.add_argument("--node_emb_lr", type=float, default=1e-5)
+    parser.add_argument("--prox_similarity_mode", choices=["event_dot", "role_aware"], default="event_dot")
+    parser.add_argument("--prox_role_ss_weight", type=float, default=0.25)
+    parser.add_argument("--prox_role_dd_weight", type=float, default=0.25)
+    parser.add_argument("--prox_role_ds_weight", type=float, default=1.0)
+    parser.add_argument("--prox_role_sd_weight", type=float, default=0.0)
+    parser.add_argument("--prox_role_time_weight", type=float, default=0.25)
+    parser.add_argument("--prox_temperature", type=float, default=0.2)
     parser.add_argument("--cluster_output_bias_mode", choices=["default", "zero", "none"], default="default")
     parser.add_argument("--cluster_input_norm", choices=["none", "layernorm"], default="none")
     parser.add_argument(
@@ -119,8 +128,14 @@ def print_config(args, K=None):
     )
     print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
     print(f"node_emb_mode={args.node_emb_mode}, node_emb_lr={args.node_emb_lr}")
-    print(f"edge_encoder_mode={args.edge_encoder_mode}")
+    print(f"edge_encoder_mode={args.edge_encoder_mode}, direct_time_scale={args.direct_time_scale}")
     print(f"require_pretrained_node2vec={args.require_pretrained_node2vec}")
+    print(
+        f"prox_similarity_mode={args.prox_similarity_mode}, prox_temperature={args.prox_temperature}, "
+        f"prox_role_weights=ss:{args.prox_role_ss_weight},dd:{args.prox_role_dd_weight},"
+        f"ds:{args.prox_role_ds_weight},sd:{args.prox_role_sd_weight},time:{args.prox_role_time_weight}"
+    )
+    print(f"lambda_node_anchor={args.lambda_node_anchor}")
     print(f"cluster_output_bias_mode={args.cluster_output_bias_mode}")
     print(f"cluster_input_norm={args.cluster_input_norm}")
     print(f"cluster_init_mode={args.cluster_init_mode}")
@@ -183,6 +198,7 @@ def main(args):
     print(f"other_lr_effective={trainer.node_emb_optimizer_info['other_lr']}")
     print("[model]")
     print(f"edge_encoder_mode={trainer.edge_encoder_mode}")
+    print(f"direct_time_scale={args.direct_time_scale}")
     print(f"node_emb_mode={args.node_emb_mode}")
     print(f"node_embedding_source={trainer.node_embedding_source}")
     print(f"node2vec_path={trainer.node_embedding_path}")
@@ -193,6 +209,11 @@ def main(args):
     print(f"edge_mlp_trainable_params={trainer.model_init_info.get('edge_mlp_trainable_parameter_count')}")
     print(f"node_emb_trainable={trainer.model.node_emb.requires_grad}")
     print(f"node_emb_lr={trainer.node_emb_optimizer_info['node_emb_lr']}")
+    print(f"main_learning_rate={trainer.node_emb_optimizer_info.get('main_learning_rate')}")
+    print(f"node_embedding_learning_rate={trainer.node_emb_optimizer_info.get('node_embedding_learning_rate')}")
+    print(f"node_lr_ratio={trainer.node_emb_optimizer_info.get('node_lr_ratio')}")
+    print(f"prox_similarity_mode={args.prox_similarity_mode}")
+    print(f"lambda_node_anchor={args.lambda_node_anchor}")
     for group in trainer.node_emb_optimizer_info.get("optimizer_groups", []):
         print(
             f"optimizer_group_name={group.get('optimizer_group_name')} "

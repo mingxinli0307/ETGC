@@ -270,12 +270,17 @@ def edge_repr_block_norm_statistics(
     node_dim: int,
     time_dim: int,
     edge_encoder_mode: str,
+    raw_time_feat: Optional[torch.Tensor] = None,
+    direct_time_scale: float = 1.0,
 ) -> dict:
     if str(edge_encoder_mode).lower() != "direct_node_time":
         return {
             "source_block_norm_mean": "",
             "destination_block_norm_mean": "",
             "time_block_norm_mean": "",
+            "raw_time_block_norm_mean": "",
+            "scaled_time_block_norm_mean": "",
+            "scaled_time_to_node_ratio": "",
         }
     node_dim = int(node_dim)
     time_dim = int(time_dim)
@@ -287,10 +292,92 @@ def edge_repr_block_norm_statistics(
     src_block = edge_repr[:, :node_dim]
     dst_block = edge_repr[:, node_dim : 2 * node_dim]
     time_block = edge_repr[:, 2 * node_dim :]
+    source_norm = torch.linalg.norm(src_block, dim=1).mean() if src_block.numel() else edge_repr.new_zeros(())
+    destination_norm = torch.linalg.norm(dst_block, dim=1).mean() if dst_block.numel() else edge_repr.new_zeros(())
+    scaled_time_norm = torch.linalg.norm(time_block, dim=1).mean() if time_block.numel() else edge_repr.new_zeros(())
+    if raw_time_feat is not None:
+        raw_time = raw_time_feat.detach().to(device=edge_repr.device, dtype=edge_repr.dtype)
+        if raw_time.shape[0] != edge_repr.shape[0]:
+            raise ValueError(
+                f"raw_time_feat rows={raw_time.shape[0]} do not match edge_repr rows={edge_repr.shape[0]}"
+            )
+        raw_time_norm = torch.linalg.norm(raw_time, dim=1).mean() if raw_time.numel() else edge_repr.new_zeros(())
+    else:
+        scale = float(direct_time_scale)
+        raw_time_norm = scaled_time_norm / scale if abs(scale) > EPS else edge_repr.new_zeros(())
+    node_norm = 0.5 * (source_norm + destination_norm)
     return {
-        "source_block_norm_mean": _float(torch.linalg.norm(src_block, dim=1).mean()) if src_block.numel() else 0.0,
-        "destination_block_norm_mean": _float(torch.linalg.norm(dst_block, dim=1).mean()) if dst_block.numel() else 0.0,
-        "time_block_norm_mean": _float(torch.linalg.norm(time_block, dim=1).mean()) if time_block.numel() else 0.0,
+        "source_block_norm_mean": _float(source_norm),
+        "destination_block_norm_mean": _float(destination_norm),
+        "time_block_norm_mean": _float(scaled_time_norm),
+        "raw_time_block_norm_mean": _float(raw_time_norm),
+        "scaled_time_block_norm_mean": _float(scaled_time_norm),
+        "scaled_time_to_node_ratio": _float(scaled_time_norm / node_norm.clamp_min(float(EPS))),
+    }
+
+
+def node_event_degree_drift_statistics(
+    src,
+    dst,
+    num_nodes: int,
+    current: torch.Tensor,
+    initial: torch.Tensor,
+    eps: float = EPS,
+) -> dict:
+    cur = current.detach().cpu()
+    init = initial.detach().cpu().to(dtype=cur.dtype)
+    if cur.shape != init.shape:
+        raise ValueError(f"node embedding shape mismatch: current={tuple(cur.shape)} initial={tuple(init.shape)}")
+    src_t = torch.as_tensor(src, dtype=torch.long)
+    dst_t = torch.as_tensor(dst, dtype=torch.long)
+    degree = torch.zeros((int(num_nodes),), dtype=torch.float64)
+    one_src = torch.ones_like(src_t, dtype=torch.float64)
+    one_dst = torch.ones_like(dst_t, dtype=torch.float64)
+    degree.index_add_(0, src_t, one_src)
+    degree.index_add_(0, dst_t, one_dst)
+    drift = torch.linalg.norm(cur - init, dim=1).to(dtype=torch.float64)
+
+    def _median(x: torch.Tensor) -> float:
+        return _float(torch.median(x)) if x.numel() else 0.0
+
+    def _rankdata(x: torch.Tensor) -> torch.Tensor:
+        order = torch.argsort(x)
+        ranks = torch.empty_like(x, dtype=torch.float64)
+        n = int(x.numel())
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and x[order[j]] == x[order[i]]:
+                j += 1
+            rank = 0.5 * float(i + j - 1)
+            ranks[order[i:j]] = rank
+            i = j
+        return ranks
+
+    if int(degree.numel()) > 1 and float(degree.std(unbiased=False)) > eps and float(drift.std(unbiased=False)) > eps:
+        rd = _rankdata(degree)
+        rr = _rankdata(drift)
+        rd = rd - rd.mean()
+        rr = rr - rr.mean()
+        spearman = _float((rd * rr).sum() / (torch.linalg.norm(rd) * torch.linalg.norm(rr)).clamp_min(float(eps)))
+    else:
+        spearman = None
+
+    k = max(1, int(math.ceil(0.10 * max(1, int(num_nodes)))))
+    order = torch.argsort(degree)
+    bottom = drift.index_select(0, order[:k]).mean()
+    top = drift.index_select(0, order[-k:]).mean()
+    return {
+        "event_degree_mean": _float(degree.mean()) if degree.numel() else 0.0,
+        "event_degree_median": _median(degree),
+        "event_degree_max": _float(degree.max()) if degree.numel() else 0.0,
+        "node_drift_mean": _float(drift.mean()) if drift.numel() else 0.0,
+        "node_drift_median": _median(drift),
+        "node_drift_max": _float(drift.max()) if drift.numel() else 0.0,
+        "event_degree_node_drift_spearman": spearman,
+        "top10_degree_node_drift_mean": _float(top),
+        "bottom10_degree_node_drift_mean": _float(bottom),
+        "top_bottom_drift_ratio": _float(top / bottom.clamp_min(float(eps))),
     }
 
 
@@ -521,6 +608,10 @@ SUMMARY_FIELDNAMES = [
     "source_block_norm_mean",
     "destination_block_norm_mean",
     "time_block_norm_mean",
+    "raw_time_block_norm_mean",
+    "scaled_time_block_norm_mean",
+    "scaled_time_to_node_ratio",
+    "direct_time_scale",
     "output_bias_l2",
     "cluster_output_weight_l2",
     "prototype_pairwise_cosine_mean",
@@ -554,6 +645,24 @@ SUMMARY_FIELDNAMES = [
     "orth_grad_to_param_ratio",
     "cut_orth_grad_cosine",
     "cut_penalty_grad_cosine",
+    "unweighted_proximity_loss",
+    "weighted_proximity_loss",
+    "node_anchor_loss",
+    "weighted_node_anchor_loss",
+    "node_update_from_prox",
+    "node_update_from_global",
+    "node_update_prox_global_ratio",
+    "cluster_update_from_global",
+    "event_degree_mean",
+    "event_degree_median",
+    "event_degree_max",
+    "node_drift_mean",
+    "node_drift_median",
+    "node_drift_max",
+    "event_degree_node_drift_spearman",
+    "top10_degree_node_drift_mean",
+    "bottom10_degree_node_drift_mean",
+    "top_bottom_drift_ratio",
 ]
 
 

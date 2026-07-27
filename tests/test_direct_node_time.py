@@ -19,8 +19,10 @@ from edge_losses import (
     edge_orthqa_penalty_global,
     edge_ppr_proximity_loss,
     edge_trace_mincut_loss_global,
+    node_embedding_anchor_loss,
     project_edge_assignments_to_nodes_global,
     projection_loss_global,
+    role_aware_event_scores,
 )
 from edge_model import EdgeHiNoSModel, load_pretrained_node_features
 from edge_train import build_optimizer_for_node_emb_mode
@@ -31,6 +33,13 @@ from summarize_direct_node_time_all_datasets import (
     make_plan,
     make_run_config,
     stable_config_checksum,
+)
+from summarize_direct_node_time_stabilization import (
+    CONFIGS as STABILIZATION_CONFIGS,
+    COMMON_CONFIG as STABILIZATION_COMMON_CONFIG,
+    make_plan as make_stabilization_plan,
+    make_run_config as make_stabilization_run_config,
+    stable_config_checksum as stable_stabilization_checksum,
 )
 
 
@@ -50,6 +59,24 @@ def _direct_model(node_mode="full", K=3):
         cluster_output_bias_mode="none",
         cluster_input_norm="layernorm",
         edge_encoder_mode="direct_node_time",
+    )
+    opt, info = build_optimizer_for_node_emb_mode(model, 1e-2, node_mode, 1e-4)
+    return model, opt, info
+
+
+def _direct_model_scaled(scale, node_mode="full", K=3):
+    model = EdgeHiNoSModel(
+        _node_features(),
+        time_dim=2,
+        edge_dim=6,
+        edge_hidden_dim=7,
+        cluster_hidden_dim=5,
+        K=K,
+        directed=False,
+        cluster_output_bias_mode="none",
+        cluster_input_norm="layernorm",
+        edge_encoder_mode="direct_node_time",
+        direct_time_scale=scale,
     )
     opt, info = build_optimizer_for_node_emb_mode(model, 1e-2, node_mode, 1e-4)
     return model, opt, info
@@ -102,6 +129,19 @@ def test_direct_node_time_is_ordered_raw_concat_and_time_sensitive():
     assert not torch.allclose(got[:1], changed_time)
 
 
+def test_direct_time_scale_only_scales_time_block():
+    src, dst, time_feat = _toy_inputs()
+    model_one, _, _ = _direct_model_scaled(1.0)
+    model_scaled, _, _ = _direct_model_scaled(0.25)
+    with torch.no_grad():
+        model_scaled.node_emb.copy_(model_one.node_emb)
+    repr_one = model_one.build_direct_node_time_event_repr(src, dst, time_feat)
+    repr_scaled = model_scaled.build_direct_node_time_event_repr(src, dst, time_feat)
+    node_dim = model_one.node_dim
+    assert torch.allclose(repr_one[:, : 2 * node_dim], repr_scaled[:, : 2 * node_dim])
+    assert torch.allclose(repr_scaled[:, 2 * node_dim :], 0.25 * repr_one[:, 2 * node_dim :])
+
+
 def test_direct_mode_has_no_edge_mlp_parameters_or_optimizer_membership():
     model, opt, info = _direct_model("full")
     opt_ids = {id(p) for group in opt.param_groups for p in group["params"]}
@@ -136,6 +176,205 @@ def test_proximity_backward_updates_node_path_not_cluster_output():
     assert torch.isfinite(model.node_emb.grad).all()
     assert float(model.node_emb.grad.abs().sum()) > 0.0
     assert model.cluster_output.weight.grad is None or float(model.cluster_output.weight.grad.abs().sum()) == 0.0
+
+
+def test_event_dot_similarity_mode_matches_default():
+    model, _, _ = _direct_model("full")
+    src, dst, time_feat = _toy_inputs()
+    r, _ = model(src, dst, time_feat)
+    pi = sp.csr_matrix((np.ones(4, dtype=np.float32), (np.arange(4), np.roll(np.arange(4), -1))), shape=(4, 4))
+    args = (
+        r,
+        {0: 0, 1: 1, 2: 2, 3: 3},
+        np.array([0, 1, 2, 3], dtype=np.int64),
+        pi,
+        4,
+    )
+    default = edge_ppr_proximity_loss(*args, np.random.RandomState(11), torch.device("cpu"))
+    explicit = edge_ppr_proximity_loss(
+        *args,
+        np.random.RandomState(11),
+        torch.device("cpu"),
+        similarity_mode="event_dot",
+    )
+    assert torch.allclose(default, explicit)
+
+
+def test_role_aware_destination_source_and_directionality():
+    node_emb = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+        ]
+    )
+    src_union = torch.tensor([0, 1], dtype=torch.long)
+    dst_union = torch.tensor([1, 2], dtype=torch.long)
+    time_feat = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    forward = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_feat,
+        prox_role_ss_weight=0.0,
+        prox_role_dd_weight=0.0,
+        prox_role_ds_weight=1.0,
+        prox_role_sd_weight=0.0,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    backward = role_aware_event_scores(
+        torch.tensor([1]),
+        torch.tensor([0]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_feat,
+        prox_role_ss_weight=0.0,
+        prox_role_dd_weight=0.0,
+        prox_role_ds_weight=1.0,
+        prox_role_sd_weight=0.0,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    assert torch.allclose(forward, torch.ones_like(forward), atol=1e-6)
+    assert not torch.allclose(forward, backward)
+
+
+def test_role_aware_weight_normalization_and_time_weight_zero():
+    node_emb = torch.ones((3, 2), dtype=torch.float32)
+    src_union = torch.tensor([0, 1], dtype=torch.long)
+    dst_union = torch.tensor([1, 2], dtype=torch.long)
+    time_a = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    time_b = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    small = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_b,
+        prox_role_ss_weight=1.0,
+        prox_role_dd_weight=1.0,
+        prox_role_ds_weight=1.0,
+        prox_role_sd_weight=1.0,
+        prox_role_time_weight=1.0,
+        prox_temperature=1.0,
+    )
+    large = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_b,
+        prox_role_ss_weight=10.0,
+        prox_role_dd_weight=10.0,
+        prox_role_ds_weight=10.0,
+        prox_role_sd_weight=10.0,
+        prox_role_time_weight=10.0,
+        prox_temperature=1.0,
+    )
+    no_time_a = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_a,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    no_time_b = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_b,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    assert torch.allclose(small, large, atol=1e-6)
+    assert torch.allclose(no_time_a, no_time_b, atol=1e-6)
+
+
+def test_role_aware_proximity_uses_same_score_for_negative_branch():
+    node_emb = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
+    src_union = torch.tensor([0, 1], dtype=torch.long)
+    dst_union = torch.tensor([1, 0], dtype=torch.long)
+    time_feat = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    r_union = torch.zeros((2, 6), requires_grad=True)
+    pi = sp.csr_matrix((np.array([1.0], dtype=np.float32), ([0], [1])), shape=(2, 2))
+    loss = edge_ppr_proximity_loss(
+        r_union,
+        {0: 0, 1: 1},
+        np.array([0], dtype=np.int64),
+        pi,
+        1,
+        np.random.RandomState(1),
+        torch.device("cpu"),
+        similarity_mode="role_aware",
+        node_emb=node_emb,
+        src_union=src_union,
+        dst_union=dst_union,
+        time_feat_union=time_feat,
+        prox_role_ss_weight=0.0,
+        prox_role_dd_weight=0.0,
+        prox_role_ds_weight=1.0,
+        prox_role_sd_weight=0.0,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    pos = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_feat,
+        prox_role_ss_weight=0.0,
+        prox_role_dd_weight=0.0,
+        prox_role_ds_weight=1.0,
+        prox_role_sd_weight=0.0,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    neg = role_aware_event_scores(
+        torch.tensor([0]),
+        torch.tensor([0]),
+        node_emb,
+        src_union,
+        dst_union,
+        time_feat,
+        prox_role_ss_weight=0.0,
+        prox_role_dd_weight=0.0,
+        prox_role_ds_weight=1.0,
+        prox_role_sd_weight=0.0,
+        prox_role_time_weight=0.0,
+        prox_temperature=1.0,
+    )
+    expected = torch.nn.functional.softplus(-pos).mean() + torch.nn.functional.softplus(neg).mean()
+    assert torch.allclose(loss, expected)
+    loss.backward()
+    assert node_emb.grad is not None
+    assert torch.isfinite(node_emb.grad).all()
+
+
+def test_node_anchor_loss_only_updates_node_embedding():
+    model, _, _ = _direct_model("full")
+    initial = model.node_emb_initial.detach().clone()
+    assert torch.allclose(node_embedding_anchor_loss(model.node_emb, initial), torch.tensor(0.0))
+    with torch.no_grad():
+        model.node_emb[0, 0] += 1.0
+    loss = node_embedding_anchor_loss(model.node_emb, initial)
+    assert float(loss.detach()) > 0.0
+    loss.backward()
+    assert model.node_emb.grad is not None
+    assert float(model.node_emb.grad.abs().sum()) > 0.0
+    assert model.cluster_output.weight.grad is None
 
 
 def test_cut_orth_orthqa_and_projection_backpropagate_to_node_embedding():
@@ -283,3 +522,22 @@ def test_inventory_marks_missing_node2vec_unusable(tmp_path):
     inventory = discover_datasets(tmp_path, COMMON_CONFIG)
     assert inventory[0]["usable"] is False
     assert "Node2Vec" in inventory[0]["failure_reason"]
+
+
+def test_stabilization_plan_and_checksum_cover_new_controls(tmp_path):
+    _write_toy_dataset(tmp_path)
+    inventory = discover_datasets(tmp_path, STABILIZATION_COMMON_CONFIG)
+    plan = make_stabilization_plan(inventory, "", "", None, tmp_path, "all")
+    assert len(plan) == len(STABILIZATION_CONFIGS) * 3
+    assert {cfg["config"] for cfg in plan} == set(STABILIZATION_CONFIGS)
+    n0 = make_stabilization_run_config("toy", "N0", 42, tmp_path)
+    n2 = make_stabilization_run_config("toy", "N2", 42, tmp_path)
+    n8 = make_stabilization_run_config("toy", "N8", 42, tmp_path)
+    n9 = make_stabilization_run_config("toy", "N9", 42, tmp_path)
+    assert n0["direct_time_scale"] == 1.0
+    assert n2["direct_time_scale"] == 0.25
+    assert n8["prox_similarity_mode"] == "role_aware"
+    assert n8["lambda_node_anchor"] == 0.01
+    assert n9["lambda_prox"] == 0.1
+    assert stable_stabilization_checksum(n0) != stable_stabilization_checksum(n2)
+    assert stable_stabilization_checksum(n8) != stable_stabilization_checksum(n9)

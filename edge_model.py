@@ -73,11 +73,15 @@ class EdgeHiNoSModel(nn.Module):
         cluster_output_bias_mode: str = "default",
         cluster_input_norm: str = "none",
         edge_encoder_mode: str = "mlp",
+        direct_time_scale: float = 1.0,
     ):
         super().__init__()
-        self.node_emb = nn.Parameter(torch.from_numpy(initial_node_features.astype(np.float32)))
+        initial_node_features = initial_node_features.astype(np.float32, copy=True)
+        self.node_emb = nn.Parameter(torch.from_numpy(initial_node_features))
+        self.register_buffer("node_emb_initial", torch.from_numpy(initial_node_features.copy()))
         self.directed = bool(directed)
         self.edge_encoder_mode = str(edge_encoder_mode).lower()
+        self.direct_time_scale = float(direct_time_scale)
         self.cluster_output_bias_mode = str(cluster_output_bias_mode).lower()
         self.cluster_input_norm_mode = str(cluster_input_norm).lower()
         if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
@@ -132,7 +136,7 @@ class EdgeHiNoSModel(nn.Module):
     ) -> torch.Tensor:
         h_src = self.node_emb.index_select(0, src.long())
         h_dst = self.node_emb.index_select(0, dst.long())
-        return torch.cat([h_src, h_dst, time_feat], dim=-1)
+        return torch.cat([h_src, h_dst, float(self.direct_time_scale) * time_feat], dim=-1)
 
     def encode_edge_events(
         self,
@@ -150,7 +154,7 @@ class EdgeHiNoSModel(nn.Module):
             x_e = torch.cat([pair_feat, time_feat], dim=-1)
             return self.edge_mlp(x_e)
         if self.edge_encoder_mode == "direct_node_time":
-            return torch.cat([h_u, h_v, time_feat], dim=-1)
+            return self.build_direct_node_time_event_repr(src, dst, time_feat)
         raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
 
     def cluster_hidden_from_edge_repr(self, edge_repr: torch.Tensor):

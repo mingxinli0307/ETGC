@@ -18,6 +18,7 @@ from edge_losses import (
     edge_ncut_loss_global,
     edge_ppr_proximity_loss,
     edge_trace_mincut_loss_global,
+    node_embedding_anchor_loss,
     projection_loss,
     projection_loss_global,
     scipy_csr_to_torch_sparse_coo,
@@ -40,6 +41,7 @@ from edge_uniform_diagnostic import (
     cluster_volume_statistics,
     compute_uniform_collapse_stage,
     edge_repr_block_norm_statistics,
+    node_event_degree_drift_statistics,
     node_embedding_drift_statistics,
     print_stage_summary,
     uniform_delta,
@@ -106,6 +108,9 @@ def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb
             "node_emb_trainable": False,
             "node_emb_lr": 0.0,
             "other_lr": lr,
+            "main_learning_rate": lr,
+            "node_embedding_learning_rate": 0.0,
+            "node_lr_ratio": 0.0,
             "param_group_lrs": [lr],
             "optimizer_groups": _optimizer_group_summary(optimizer),
         }
@@ -126,6 +131,9 @@ def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb
             "node_emb_trainable": True,
             "node_emb_lr": node_emb_lr,
             "other_lr": lr,
+            "main_learning_rate": lr,
+            "node_embedding_learning_rate": node_emb_lr,
+            "node_lr_ratio": node_emb_lr / lr if lr != 0.0 else 0.0,
             "param_group_lrs": [lr, node_emb_lr],
             "optimizer_groups": _optimizer_group_summary(optimizer),
         }
@@ -138,6 +146,9 @@ def build_optimizer_for_node_emb_mode(model: EdgeHiNoSModel, lr: float, node_emb
         "node_emb_trainable": True,
         "node_emb_lr": lr,
         "other_lr": lr,
+        "main_learning_rate": lr,
+        "node_embedding_learning_rate": lr,
+        "node_lr_ratio": 1.0 if lr != 0.0 else 0.0,
         "param_group_lrs": [lr],
         "optimizer_groups": _optimizer_group_summary(optimizer),
     }
@@ -204,6 +215,12 @@ class EdgeHiNoSTrainer:
         self.edge_encoder_mode = str(getattr(args, "edge_encoder_mode", "mlp")).lower()
         if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
             raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
+        self.prox_similarity_mode = str(getattr(args, "prox_similarity_mode", "event_dot")).lower()
+        if self.prox_similarity_mode not in {"event_dot", "role_aware"}:
+            raise ValueError(f"Unsupported prox_similarity_mode: {self.prox_similarity_mode}")
+        if self.prox_similarity_mode == "role_aware" and self.edge_encoder_mode != "direct_node_time":
+            raise ValueError("prox_similarity_mode=role_aware requires edge_encoder_mode=direct_node_time")
+        self.direct_time_scale = float(getattr(args, "direct_time_scale", 1.0))
         self.require_pretrained_node2vec = bool(int(getattr(args, "require_pretrained_node2vec", 0)))
         feature_path = self._resolve_feature_path()
         self.node_embedding_path = feature_path
@@ -227,6 +244,7 @@ class EdgeHiNoSTrainer:
             cluster_output_bias_mode=getattr(args, "cluster_output_bias_mode", "default"),
             cluster_input_norm=getattr(args, "cluster_input_norm", "none"),
             edge_encoder_mode=self.edge_encoder_mode,
+            direct_time_scale=self.direct_time_scale,
         ).to(self.device)
         self.event_repr_dim = int(self.model.event_repr_dim)
         self.cluster_input_dim = int(self.model.cluster_input_dim)
@@ -253,7 +271,7 @@ class EdgeHiNoSTrainer:
         if (
             self.edge_encoder_mode == "direct_node_time"
             and str(getattr(args, "node_emb_mode", "full")).lower() != "frozen"
-        ) or self.uniform_collapse_diagnostic or self.overnight_diagnostic:
+        ) or self.uniform_collapse_diagnostic or self.overnight_diagnostic or float(getattr(args, "lambda_node_anchor", 0.0)) > 0.0:
             self.node_emb_initial_cpu = self.model.node_emb.detach().cpu().clone()
         self._apply_node_embedding_requires_grad_state()
         self.model_init_info = self._current_cluster_output_stats()
@@ -383,6 +401,64 @@ class EdgeHiNoSTrainer:
         )
         cluster_input = self.model.cluster_input_norm(r)
         return r, q, logits, cluster_input
+
+    def _proximity_loss_for_union(
+        self,
+        r_union: torch.Tensor,
+        union_ids: np.ndarray,
+        local_index: dict,
+        batch_ids: np.ndarray,
+        rng: np.random.RandomState,
+    ) -> torch.Tensor:
+        ids_t = torch.from_numpy(union_ids).long().to(self.device)
+        return edge_ppr_proximity_loss(
+            r_union,
+            local_index,
+            batch_ids,
+            self.Pi_E,
+            self.data.num_events,
+            rng,
+            self.device,
+            similarity_mode=self.prox_similarity_mode,
+            node_emb=self.model.node_emb,
+            src_union=self.src_t.index_select(0, ids_t),
+            dst_union=self.dst_t.index_select(0, ids_t),
+            time_feat_union=self.time_feat_t.index_select(0, ids_t),
+            prox_role_ss_weight=float(getattr(self.args, "prox_role_ss_weight", 0.25)),
+            prox_role_dd_weight=float(getattr(self.args, "prox_role_dd_weight", 0.25)),
+            prox_role_ds_weight=float(getattr(self.args, "prox_role_ds_weight", 1.0)),
+            prox_role_sd_weight=float(getattr(self.args, "prox_role_sd_weight", 0.0)),
+            prox_role_time_weight=float(getattr(self.args, "prox_role_time_weight", 0.25)),
+            prox_temperature=float(getattr(self.args, "prox_temperature", 0.2)),
+        )
+
+    def _node_emb_snapshot_cpu(self):
+        return self.model.node_emb.detach().cpu().clone()
+
+    def _node_update_from_snapshot(self, snapshot_cpu) -> float:
+        if snapshot_cpu is None:
+            return 0.0
+        current = self.model.node_emb.detach().cpu()
+        diff = current - snapshot_cpu.to(dtype=current.dtype)
+        return float(torch.linalg.norm(diff, ord="fro").item() / (max(1, int(current.size(0))) ** 0.5))
+
+    def _cluster_head_snapshot_cpu(self) -> list:
+        return [p.detach().cpu().clone() for p in self.model.cluster_head.parameters()]
+
+    def _cluster_update_from_snapshot(self, snapshot_cpu: list) -> float:
+        if not snapshot_cpu:
+            return 0.0
+        total_sq = 0.0
+        for param, before in zip(self.model.cluster_head.parameters(), snapshot_cpu):
+            diff = param.detach().cpu() - before.to(dtype=param.detach().cpu().dtype)
+            total_sq += float(diff.square().sum().item())
+        return total_sq ** 0.5
+
+    def _node_anchor_loss(self) -> torch.Tensor:
+        initial = getattr(self.model, "node_emb_initial", None)
+        if initial is None:
+            return self._zero_scalar()
+        return node_embedding_anchor_loss(self.model.node_emb, initial)
 
     def _forward_all_q_with_grad(self, chunk_size: int) -> torch.Tensor:
         chunks = []
@@ -591,6 +667,9 @@ class EdgeHiNoSTrainer:
                 "diagnostic_dir": self.uniform_diag_dir,
                 "logits_std_unbiased": False,
                 "edge_encoder_mode": self.edge_encoder_mode,
+                "direct_time_scale": float(self.direct_time_scale),
+                "prox_similarity_mode": self.prox_similarity_mode,
+                "lambda_node_anchor": float(getattr(self.args, "lambda_node_anchor", 0.0)),
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
                 "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
                 "node_dim": int(self.node_dim),
@@ -635,6 +714,8 @@ class EdgeHiNoSTrainer:
                     node_dim=self.node_dim,
                     time_dim=int(getattr(self.args, "time_dim", 0)),
                     edge_encoder_mode=self.edge_encoder_mode,
+                    raw_time_feat=self.time_feat_t.detach(),
+                    direct_time_scale=float(self.direct_time_scale),
                 )
             )
         extra.update(cluster_volume_statistics(q_all, degree_t))
@@ -642,6 +723,9 @@ class EdgeHiNoSTrainer:
         penalty_weight = float(getattr(self.args, "lambda_orth", 1.0))
         extra["penalty_type"] = selected
         extra["penalty_weight"] = penalty_weight
+        extra["direct_time_scale"] = float(self.direct_time_scale)
+        extra["prox_similarity_mode"] = self.prox_similarity_mode
+        extra["lambda_node_anchor"] = float(getattr(self.args, "lambda_node_anchor", 0.0))
         with torch.no_grad():
             _, cut_loss, orth_original = edge_trace_mincut_loss_global(
                 q_all,
@@ -719,9 +803,7 @@ class EdgeHiNoSTrainer:
             local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
             r_union, _ = self._forward_ids(union_ids)
             diag_rng = np.random.RandomState(int(self.model_seed) + 104729)
-            prox_loss = edge_ppr_proximity_loss(
-                r_union, local_index, batch_ids, self.Pi_E, self.data.num_events, diag_rng, self.device
-            )
+            prox_loss = self._proximity_loss_for_union(r_union, union_ids, local_index, batch_ids, diag_rng)
             prox_grads = torch.autograd.grad(
                 prox_loss,
                 node_params,
@@ -1008,6 +1090,15 @@ class EdgeHiNoSTrainer:
                     self.node_emb_initial_cpu.to(device=self.model.node_emb.device, dtype=self.model.node_emb.dtype),
                 )
             )
+            result.update(
+                node_event_degree_drift_statistics(
+                    self.data.src,
+                    self.data.dst,
+                    self.data.num_nodes,
+                    self.model.node_emb.detach(),
+                    self.node_emb_initial_cpu,
+                )
+            )
         return result
 
     def run_init_only_eval(self) -> dict:
@@ -1106,6 +1197,14 @@ class EdgeHiNoSTrainer:
             "projection_loss",
             "global_total_loss",
             "prox_loss",
+            "unweighted_proximity_loss",
+            "weighted_proximity_loss",
+            "node_anchor_loss",
+            "weighted_node_anchor_loss",
+            "node_update_from_prox",
+            "node_update_from_global",
+            "node_update_prox_global_ratio",
+            "cluster_update_from_global",
             "Q_mean_entropy",
             "max_cluster_ratio",
             "min_cluster_ratio",
@@ -1124,6 +1223,8 @@ class EdgeHiNoSTrainer:
             "hard_cluster_volume_cv",
             "logits_bias_to_event_variation_ratio",
             "edge_encoder_mode",
+            "direct_time_scale",
+            "prox_similarity_mode",
             "node_embedding_norm_mean",
             "node_embedding_norm_std",
             "node_embedding_drift_fro_normalized",
@@ -1136,6 +1237,9 @@ class EdgeHiNoSTrainer:
             "source_block_norm_mean",
             "destination_block_norm_mean",
             "time_block_norm_mean",
+            "raw_time_block_norm_mean",
+            "scaled_time_block_norm_mean",
+            "scaled_time_to_node_ratio",
             "node_grad_l2_from_prox",
             "node_grad_max_from_prox",
             "node_grad_l2_from_cut",
@@ -1145,6 +1249,16 @@ class EdgeHiNoSTrainer:
             "cluster_grad_l2_from_cut",
             "cluster_grad_l2_from_penalty",
             "cut_penalty_gradient_cosine",
+            "event_degree_mean",
+            "event_degree_median",
+            "event_degree_max",
+            "node_drift_mean",
+            "node_drift_median",
+            "node_drift_max",
+            "event_degree_node_drift_spearman",
+            "top10_degree_node_drift_mean",
+            "bottom10_degree_node_drift_mean",
+            "top_bottom_drift_ratio",
             "cluster_forward_seconds",
             "cluster_backward_seconds",
             "epoch_seconds",
@@ -1196,6 +1310,15 @@ class EdgeHiNoSTrainer:
                 "N": int(self.data.num_nodes),
                 "K": int(self.K),
                 "edge_encoder_mode": self.edge_encoder_mode,
+                "direct_time_scale": float(self.direct_time_scale),
+                "prox_similarity_mode": self.prox_similarity_mode,
+                "prox_role_ss_weight": float(getattr(self.args, "prox_role_ss_weight", 0.25)),
+                "prox_role_dd_weight": float(getattr(self.args, "prox_role_dd_weight", 0.25)),
+                "prox_role_ds_weight": float(getattr(self.args, "prox_role_ds_weight", 1.0)),
+                "prox_role_sd_weight": float(getattr(self.args, "prox_role_sd_weight", 0.0)),
+                "prox_role_time_weight": float(getattr(self.args, "prox_role_time_weight", 0.25)),
+                "prox_temperature": float(getattr(self.args, "prox_temperature", 0.2)),
+                "lambda_node_anchor": float(getattr(self.args, "lambda_node_anchor", 0.0)),
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
                 "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
                 "node_dim": int(self.node_dim),
@@ -1214,6 +1337,9 @@ class EdgeHiNoSTrainer:
                 "legacy_balance_disabled": self.cluster_loss_type == "trace_mincut",
                 "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
                 "node_emb_optimizer_info": self.node_emb_optimizer_info,
+                "main_learning_rate": float(self.node_emb_optimizer_info.get("main_learning_rate", 0.0)),
+                "node_embedding_learning_rate": float(self.node_emb_optimizer_info.get("node_embedding_learning_rate", 0.0)),
+                "node_lr_ratio": float(self.node_emb_optimizer_info.get("node_lr_ratio", 0.0)),
                 "model_parameter_info": self._model_parameter_info(),
                 "model_init_info": self.model_init_info,
                 "prox_stats": self.prox_stats,
@@ -1240,6 +1366,15 @@ class EdgeHiNoSTrainer:
             "N": int(self.data.num_nodes),
             "K": int(self.K),
             "edge_encoder_mode": self.edge_encoder_mode,
+            "direct_time_scale": float(self.direct_time_scale),
+            "prox_similarity_mode": self.prox_similarity_mode,
+            "prox_role_ss_weight": float(getattr(self.args, "prox_role_ss_weight", 0.25)),
+            "prox_role_dd_weight": float(getattr(self.args, "prox_role_dd_weight", 0.25)),
+            "prox_role_ds_weight": float(getattr(self.args, "prox_role_ds_weight", 1.0)),
+            "prox_role_sd_weight": float(getattr(self.args, "prox_role_sd_weight", 0.0)),
+            "prox_role_time_weight": float(getattr(self.args, "prox_role_time_weight", 0.25)),
+            "prox_temperature": float(getattr(self.args, "prox_temperature", 0.2)),
+            "lambda_node_anchor": float(getattr(self.args, "lambda_node_anchor", 0.0)),
             "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
             "node_dim": int(self.node_dim),
             "time_dim": int(getattr(self.args, "time_dim", 0)),
@@ -1253,6 +1388,9 @@ class EdgeHiNoSTrainer:
             "W_E_sparse_mode": self.W_E_sparse_mode,
             "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
             "node_emb_optimizer_info": self.node_emb_optimizer_info,
+            "main_learning_rate": float(self.node_emb_optimizer_info.get("main_learning_rate", 0.0)),
+            "node_embedding_learning_rate": float(self.node_emb_optimizer_info.get("node_embedding_learning_rate", 0.0)),
+            "node_lr_ratio": float(self.node_emb_optimizer_info.get("node_lr_ratio", 0.0)),
             "model_parameter_info": self._model_parameter_info(),
             "model_init_info": self.model_init_info,
             "training_change_metrics": getattr(self, "training_change_metrics", {}),
@@ -1274,6 +1412,7 @@ class EdgeHiNoSTrainer:
         lambda_edge_ncut = float(self.args.lambda_edge_ncut)
         lambda_proj = float(self.args.lambda_proj)
         lambda_bal = float(self.args.lambda_bal)
+        lambda_node_anchor = float(getattr(self.args, "lambda_node_anchor", 0.0))
         total_start = time.time()
         self._init_metrics_csv()
 
@@ -1291,7 +1430,9 @@ class EdgeHiNoSTrainer:
             before_metrics = self._evaluate_stage() if diagnostic else {}
             self.model.train()
             prox_total = 0.0
+            weighted_prox_total = 0.0
             prox_steps = 0
+            h_before_prox = self._node_emb_snapshot_cpu()
             if self.ncut_scope == "global":
                 if lambda_prox > 0.0:
                     order = self.rng.permutation(m)
@@ -1301,15 +1442,14 @@ class EdgeHiNoSTrainer:
                         union_ids = self._batch_union_ids(batch_ids)
                         local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
                         r_union, _ = self._forward_ids(union_ids)
-                        l_prox = edge_ppr_proximity_loss(
-                            r_union, local_index, batch_ids, self.Pi_E, m, self.rng, self.device
-                        )
+                        l_prox = self._proximity_loss_for_union(r_union, union_ids, local_index, batch_ids, self.rng)
                         loss = lambda_prox * l_prox
                         self.optimizer.zero_grad()
                         if loss.requires_grad:
                             loss.backward()
                             self.optimizer.step()
                         prox_total += scalar_value(l_prox)
+                        weighted_prox_total += scalar_value(loss)
                         prox_steps += 1
             else:
                 order = self.rng.permutation(m)
@@ -1327,9 +1467,7 @@ class EdgeHiNoSTrainer:
                     q_batch = q_union.index_select(0, batch_local)
                     batch_t = torch.from_numpy(batch_ids).long().to(self.device)
 
-                    l_prox = edge_ppr_proximity_loss(
-                        r_union, local_index, batch_ids, self.Pi_E, m, self.rng, self.device
-                    )
+                    l_prox = self._proximity_loss_for_union(r_union, union_ids, local_index, batch_ids, self.rng)
                     l_proj = projection_loss(
                         q_batch,
                         self.src_t.index_select(0, batch_t),
@@ -1346,7 +1484,10 @@ class EdgeHiNoSTrainer:
                         loss.backward()
                         self.optimizer.step()
                     prox_total += scalar_value(l_prox)
+                    weighted_prox_total += scalar_value(lambda_prox * l_prox)
                     prox_steps += 1
+            node_update_from_prox = self._node_update_from_snapshot(h_before_prox)
+            del h_before_prox
 
             after_prox_metrics = self._evaluate_stage() if diagnostic else {}
 
@@ -1356,12 +1497,18 @@ class EdgeHiNoSTrainer:
             orthqa_loss_value = float("nan")
             cluster_loss_value = float("nan")
             projection_loss_value = 0.0
+            node_anchor_loss_value = 0.0
+            weighted_node_anchor_loss_value = 0.0
             global_total_loss_value = 0.0
+            node_update_from_global = 0.0
+            cluster_update_from_global = 0.0
             cluster_forward_seconds = 0.0
             cluster_backward_seconds = 0.0
             global_q_forwards = 0
             if self.ncut_scope == "global" and epoch > warmup_epochs:
                 self.model.train()
+                h_before_global = self._node_emb_snapshot_cpu()
+                cluster_before_global = self._cluster_head_snapshot_cpu()
                 self.optimizer.zero_grad(set_to_none=True)
                 should_uniform_diag = (
                     self.uniform_collapse_diagnostic
@@ -1418,11 +1565,26 @@ class EdgeHiNoSTrainer:
                     proj_loss = self._zero_scalar()
                 if not torch.isfinite(proj_loss).all():
                     raise FloatingPointError(f"projection_loss_global is not finite: value={scalar_value(proj_loss)}")
+                if lambda_node_anchor > 0.0:
+                    anchor_loss = self._node_anchor_loss()
+                else:
+                    anchor_loss = self._zero_scalar()
+                if not torch.isfinite(anchor_loss).all():
+                    raise FloatingPointError(f"node_anchor_loss is not finite: value={scalar_value(anchor_loss)}")
 
                 if self.cluster_loss_type == "trace_mincut":
-                    global_loss = lambda_edge_ncut * cluster_loss + lambda_proj * proj_loss
+                    global_loss = (
+                        lambda_edge_ncut * cluster_loss
+                        + lambda_proj * proj_loss
+                        + lambda_node_anchor * anchor_loss
+                    )
                 else:
-                    global_loss = lambda_edge_ncut * cluster_loss + lambda_proj * proj_loss + lambda_bal * orth_loss
+                    global_loss = (
+                        lambda_edge_ncut * cluster_loss
+                        + lambda_proj * proj_loss
+                        + lambda_bal * orth_loss
+                        + lambda_node_anchor * anchor_loss
+                    )
 
                 cut_loss_value = scalar_value(cut_loss)
                 orth_loss_value = scalar_value(orth_loss)
@@ -1432,6 +1594,8 @@ class EdgeHiNoSTrainer:
                     orthqa_loss_value = orth_loss_value
                 cluster_loss_value = scalar_value(cluster_loss)
                 projection_loss_value = scalar_value(proj_loss)
+                node_anchor_loss_value = scalar_value(anchor_loss)
+                weighted_node_anchor_loss_value = scalar_value(lambda_node_anchor * anchor_loss)
                 global_total_loss_value = scalar_value(global_loss)
 
                 if should_uniform_diag:
@@ -1450,7 +1614,10 @@ class EdgeHiNoSTrainer:
                     )
 
                 if global_loss.requires_grad and (
-                    lambda_edge_ncut != 0.0 or lambda_proj != 0.0 or (self.cluster_loss_type == "legacy_ncut" and lambda_bal != 0.0)
+                    lambda_edge_ncut != 0.0
+                    or lambda_proj != 0.0
+                    or lambda_node_anchor != 0.0
+                    or (self.cluster_loss_type == "legacy_ncut" and lambda_bal != 0.0)
                 ):
                     sync_cuda()
                     backward_start = time.time()
@@ -1458,9 +1625,16 @@ class EdgeHiNoSTrainer:
                     sync_cuda()
                     cluster_backward_seconds = time.time() - backward_start
                     self.optimizer.step()
+                    node_update_from_global = self._node_update_from_snapshot(h_before_global)
+                    cluster_update_from_global = self._cluster_update_from_snapshot(cluster_before_global)
                     if should_uniform_diag:
                         self._record_uniform_after_global()
                         self.uniform_diag_after_first_done = True
+                else:
+                    node_update_from_global = self._node_update_from_snapshot(h_before_global)
+                    cluster_update_from_global = self._cluster_update_from_snapshot(cluster_before_global)
+                del h_before_global
+                del cluster_before_global
 
             after_global_metrics = self._evaluate_stage()
             metrics = after_global_metrics
@@ -1499,6 +1673,14 @@ class EdgeHiNoSTrainer:
                 "projection_loss": projection_loss_value,
                 "global_total_loss": global_total_loss_value,
                 "prox_loss": prox_total / max(1, prox_steps),
+                "unweighted_proximity_loss": prox_total / max(1, prox_steps),
+                "weighted_proximity_loss": weighted_prox_total / max(1, prox_steps),
+                "node_anchor_loss": node_anchor_loss_value,
+                "weighted_node_anchor_loss": weighted_node_anchor_loss_value,
+                "node_update_from_prox": node_update_from_prox,
+                "node_update_from_global": node_update_from_global,
+                "node_update_prox_global_ratio": node_update_from_prox / (node_update_from_global + 1e-12),
+                "cluster_update_from_global": cluster_update_from_global,
                 "Q_mean_entropy": metrics.get("Q_mean_entropy", 0.0),
                 "max_cluster_ratio": metrics.get("max_cluster_ratio", 0.0),
                 "min_cluster_ratio": metrics.get("min_cluster_ratio", 0.0),
@@ -1517,6 +1699,8 @@ class EdgeHiNoSTrainer:
                 "hard_cluster_volume_cv": stage_stats_for_epoch.get("hard_cluster_volume_cv", ""),
                 "logits_bias_to_event_variation_ratio": stage_stats_for_epoch.get("logits_bias_to_event_variation_ratio", ""),
                 "edge_encoder_mode": self.edge_encoder_mode,
+                "direct_time_scale": float(self.direct_time_scale),
+                "prox_similarity_mode": self.prox_similarity_mode,
                 "node_embedding_norm_mean": stage_stats_for_epoch.get("node_embedding_norm_mean", ""),
                 "node_embedding_norm_std": stage_stats_for_epoch.get("node_embedding_norm_std", ""),
                 "node_embedding_drift_fro_normalized": stage_stats_for_epoch.get("node_embedding_drift_fro_normalized", ""),
@@ -1529,6 +1713,9 @@ class EdgeHiNoSTrainer:
                 "source_block_norm_mean": stage_stats_for_epoch.get("source_block_norm_mean", ""),
                 "destination_block_norm_mean": stage_stats_for_epoch.get("destination_block_norm_mean", ""),
                 "time_block_norm_mean": stage_stats_for_epoch.get("time_block_norm_mean", ""),
+                "raw_time_block_norm_mean": stage_stats_for_epoch.get("raw_time_block_norm_mean", ""),
+                "scaled_time_block_norm_mean": stage_stats_for_epoch.get("scaled_time_block_norm_mean", ""),
+                "scaled_time_to_node_ratio": stage_stats_for_epoch.get("scaled_time_to_node_ratio", ""),
                 "node_grad_l2_from_prox": stage_stats_for_epoch.get("node_grad_l2_from_prox", ""),
                 "node_grad_max_from_prox": stage_stats_for_epoch.get("node_grad_max_from_prox", ""),
                 "node_grad_l2_from_cut": stage_stats_for_epoch.get("node_grad_l2_from_cut", ""),
@@ -1570,6 +1757,8 @@ class EdgeHiNoSTrainer:
                     f"cut={cut_loss_value:.4f} orth={orth_loss_value:.4f} "
                     f"proj={projection_loss_value:.4f} cluster={cluster_loss_value:.4f} "
                     f"global={global_total_loss_value:.4f} prox={record['prox_loss']:.4f} "
+                    f"wprox={record['weighted_proximity_loss']:.4f} anchor={node_anchor_loss_value:.6g} "
+                    f"node_up_prox={node_update_from_prox:.6g} node_up_global={node_update_from_global:.6g} "
                     f"entropy={record['Q_mean_entropy']:.4f} max_ratio={record['max_cluster_ratio']:.4f} "
                     f"min_ratio={record['min_cluster_ratio']:.4f} empty={int(record['empty_cluster_count'])} "
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
@@ -1585,6 +1774,8 @@ class EdgeHiNoSTrainer:
                     f"penalty_type={str(getattr(self.args, 'orth_type', 'orth')).lower()} "
                     f"proj={projection_loss_value:.4f} cluster={cluster_loss_value:.4f} "
                     f"global={global_total_loss_value:.4f} prox={record['prox_loss']:.4f} "
+                    f"wprox={record['weighted_proximity_loss']:.4f} anchor={node_anchor_loss_value:.6g} "
+                    f"node_up_prox={node_update_from_prox:.6g} node_up_global={node_update_from_global:.6g} "
                     f"entropy={record['Q_mean_entropy']:.4f} max_ratio={record['max_cluster_ratio']:.4f} "
                     f"min_ratio={record['min_cluster_ratio']:.4f} empty={int(record['empty_cluster_count'])} "
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "

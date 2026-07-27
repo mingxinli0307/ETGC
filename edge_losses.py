@@ -217,6 +217,18 @@ def edge_ppr_proximity_loss(
     num_events: int,
     rng: np.random.RandomState,
     device: torch.device,
+    similarity_mode: str = "event_dot",
+    node_emb: torch.Tensor = None,
+    src_union: torch.Tensor = None,
+    dst_union: torch.Tensor = None,
+    time_feat_union: torch.Tensor = None,
+    prox_role_ss_weight: float = 0.25,
+    prox_role_dd_weight: float = 0.25,
+    prox_role_ds_weight: float = 1.0,
+    prox_role_sd_weight: float = 0.0,
+    prox_role_time_weight: float = 0.25,
+    prox_temperature: float = 0.2,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     anchors, positives, weights = [], [], []
     for eid in batch_ids.tolist():
@@ -237,9 +249,102 @@ def edge_ppr_proximity_loss(
     neg = torch.as_tensor([local_index.get(int(e), int(rng.randint(0, len(local_index)))) for e in neg_global],
                           dtype=torch.long, device=device)
 
-    pos_score = (r_union[a] * r_union[p]).sum(dim=-1)
-    neg_score = (r_union[a] * r_union[neg]).sum(dim=-1)
+    mode = str(similarity_mode).lower()
+    if mode == "event_dot":
+        pos_score = (r_union[a] * r_union[p]).sum(dim=-1)
+        neg_score = (r_union[a] * r_union[neg]).sum(dim=-1)
+    elif mode == "role_aware":
+        pos_score = role_aware_event_scores(
+            a,
+            p,
+            node_emb=node_emb,
+            src_union=src_union,
+            dst_union=dst_union,
+            time_feat_union=time_feat_union,
+            prox_role_ss_weight=prox_role_ss_weight,
+            prox_role_dd_weight=prox_role_dd_weight,
+            prox_role_ds_weight=prox_role_ds_weight,
+            prox_role_sd_weight=prox_role_sd_weight,
+            prox_role_time_weight=prox_role_time_weight,
+            prox_temperature=prox_temperature,
+            eps=eps,
+        )
+        neg_score = role_aware_event_scores(
+            a,
+            neg,
+            node_emb=node_emb,
+            src_union=src_union,
+            dst_union=dst_union,
+            time_feat_union=time_feat_union,
+            prox_role_ss_weight=prox_role_ss_weight,
+            prox_role_dd_weight=prox_role_dd_weight,
+            prox_role_ds_weight=prox_role_ds_weight,
+            prox_role_sd_weight=prox_role_sd_weight,
+            prox_role_time_weight=prox_role_time_weight,
+            prox_temperature=prox_temperature,
+            eps=eps,
+        )
+    else:
+        raise ValueError(f"Unsupported prox_similarity_mode: {similarity_mode}")
     return (w * F.softplus(-pos_score)).mean() + F.softplus(neg_score).mean()
+
+
+def _cosine_pair(x: torch.Tensor, y: torch.Tensor, eps: float) -> torch.Tensor:
+    return (x * y).sum(dim=-1) / (
+        torch.linalg.norm(x, dim=-1) * torch.linalg.norm(y, dim=-1) + float(eps)
+    )
+
+
+def role_aware_event_scores(
+    anchor_local: torch.Tensor,
+    other_local: torch.Tensor,
+    node_emb: torch.Tensor,
+    src_union: torch.Tensor,
+    dst_union: torch.Tensor,
+    time_feat_union: torch.Tensor,
+    prox_role_ss_weight: float = 0.25,
+    prox_role_dd_weight: float = 0.25,
+    prox_role_ds_weight: float = 1.0,
+    prox_role_sd_weight: float = 0.0,
+    prox_role_time_weight: float = 0.25,
+    prox_temperature: float = 0.2,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if node_emb is None or src_union is None or dst_union is None or time_feat_union is None:
+        raise ValueError("role_aware proximity requires node_emb, src_union, dst_union, and time_feat_union")
+    if float(prox_temperature) <= 0.0:
+        raise ValueError(f"prox_temperature must be positive, got {prox_temperature}")
+
+    anchor_local = anchor_local.long()
+    other_local = other_local.long()
+    src_union = src_union.long()
+    dst_union = dst_union.long()
+
+    s_i = node_emb.index_select(0, src_union.index_select(0, anchor_local))
+    d_i = node_emb.index_select(0, dst_union.index_select(0, anchor_local))
+    s_j = node_emb.index_select(0, src_union.index_select(0, other_local))
+    d_j = node_emb.index_select(0, dst_union.index_select(0, other_local))
+    t_i = time_feat_union.index_select(0, anchor_local)
+    t_j = time_feat_union.index_select(0, other_local)
+
+    w_ss = float(prox_role_ss_weight)
+    w_dd = float(prox_role_dd_weight)
+    w_ds = float(prox_role_ds_weight)
+    w_sd = float(prox_role_sd_weight)
+    w_t = float(prox_role_time_weight)
+    weight_sum = max(w_ss + w_dd + w_ds + w_sd + w_t, float(eps))
+    score_raw = (
+        w_ss * _cosine_pair(s_i, s_j, eps)
+        + w_dd * _cosine_pair(d_i, d_j, eps)
+        + w_ds * _cosine_pair(d_i, s_j, eps)
+        + w_sd * _cosine_pair(s_i, d_j, eps)
+        + w_t * _cosine_pair(t_i, t_j, eps)
+    )
+    return (score_raw / weight_sum) / float(prox_temperature)
+
+
+def node_embedding_anchor_loss(node_emb: torch.Tensor, node_emb_initial: torch.Tensor) -> torch.Tensor:
+    return F.mse_loss(node_emb, node_emb_initial.to(device=node_emb.device, dtype=node_emb.dtype))
 
 
 def edge_ncut_loss(Q_union: torch.Tensor, union_ids: np.ndarray, W_E: sp.csr_matrix, K: int) -> torch.Tensor:
