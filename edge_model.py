@@ -74,6 +74,8 @@ class EdgeHiNoSModel(nn.Module):
         cluster_input_norm: str = "none",
         edge_encoder_mode: str = "mlp",
         direct_time_scale: float = 1.0,
+        cluster_head_type: str = "legacy_mlp",
+        prototype_temperature: float = 0.2,
     ):
         super().__init__()
         initial_node_features = initial_node_features.astype(np.float32, copy=True)
@@ -82,10 +84,16 @@ class EdgeHiNoSModel(nn.Module):
         self.directed = bool(directed)
         self.edge_encoder_mode = str(edge_encoder_mode).lower()
         self.direct_time_scale = float(direct_time_scale)
+        self.cluster_head_type = str(cluster_head_type).lower()
+        self.prototype_temperature = float(prototype_temperature)
         self.cluster_output_bias_mode = str(cluster_output_bias_mode).lower()
         self.cluster_input_norm_mode = str(cluster_input_norm).lower()
         if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
             raise ValueError(f"Unsupported edge_encoder_mode: {edge_encoder_mode}")
+        if self.cluster_head_type not in {"legacy_mlp", "cosine_prototype"}:
+            raise ValueError(f"Unsupported cluster_head_type: {cluster_head_type}")
+        if self.prototype_temperature <= 0.0:
+            raise ValueError(f"prototype_temperature must be positive, got {prototype_temperature}")
         if self.cluster_output_bias_mode not in {"default", "zero", "none"}:
             raise ValueError(f"Unsupported cluster_output_bias_mode: {cluster_output_bias_mode}")
         if self.cluster_input_norm_mode not in {"none", "layernorm"}:
@@ -108,25 +116,35 @@ class EdgeHiNoSModel(nn.Module):
             cluster_input_dim = 2 * node_dim + self.time_dim
         self.event_repr_dim = int(cluster_input_dim)
         self.cluster_input_dim = int(cluster_input_dim)
-        if self.cluster_input_norm_mode == "layernorm":
+        if self.cluster_head_type == "legacy_mlp" and self.cluster_input_norm_mode == "layernorm":
             self.cluster_input_norm = nn.LayerNorm(self.cluster_input_dim, elementwise_affine=False)
         else:
             self.cluster_input_norm = nn.Identity()
-        self.cluster_hidden = nn.Linear(self.cluster_input_dim, cluster_hidden_dim)
-        self.cluster_activation = nn.ReLU()
-        self.cluster_output = nn.Linear(
-            cluster_hidden_dim,
-            K,
-            bias=self.cluster_output_bias_mode != "none",
-        )
-        if self.cluster_output_bias_mode == "zero" and self.cluster_output.bias is not None:
-            nn.init.zeros_(self.cluster_output.bias)
-        self.cluster_head = nn.Sequential(
-            self.cluster_input_norm,
-            self.cluster_hidden,
-            self.cluster_activation,
-            self.cluster_output,
-        )
+        if self.cluster_head_type == "legacy_mlp":
+            self.cluster_hidden = nn.Linear(self.cluster_input_dim, cluster_hidden_dim)
+            self.cluster_activation = nn.ReLU()
+            self.cluster_output = nn.Linear(
+                cluster_hidden_dim,
+                K,
+                bias=self.cluster_output_bias_mode != "none",
+            )
+            if self.cluster_output_bias_mode == "zero" and self.cluster_output.bias is not None:
+                nn.init.zeros_(self.cluster_output.bias)
+            self.cluster_head = nn.Sequential(
+                self.cluster_input_norm,
+                self.cluster_hidden,
+                self.cluster_activation,
+                self.cluster_output,
+            )
+        else:
+            self.cluster_hidden = None
+            self.cluster_activation = None
+            self.cluster_output = CosinePrototypeOutput(
+                K=K,
+                dim=self.cluster_input_dim,
+                temperature=self.prototype_temperature,
+            )
+            self.cluster_head = self.cluster_output
 
     def build_direct_node_time_event_repr(
         self,
@@ -158,6 +176,8 @@ class EdgeHiNoSModel(nn.Module):
         raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
 
     def cluster_hidden_from_edge_repr(self, edge_repr: torch.Tensor):
+        if self.cluster_head_type == "cosine_prototype":
+            return edge_repr, edge_repr
         cluster_input = self.cluster_input_norm(edge_repr)
         cluster_hidden = self.cluster_activation(self.cluster_hidden(cluster_input))
         return cluster_input, cluster_hidden
@@ -185,6 +205,21 @@ class EdgeHiNoSModel(nn.Module):
         if return_cluster_hidden:
             return r_e, q_e, cluster_hidden
         return r_e, q_e
+
+
+class CosinePrototypeOutput(nn.Module):
+    def __init__(self, K: int, dim: int, temperature: float = 0.2, eps: float = 1e-12):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(int(K), int(dim)))
+        self.bias = None
+        self.temperature = float(temperature)
+        self.eps = float(eps)
+        nn.init.normal_(self.weight, mean=0.0, std=0.02)
+
+    def forward(self, edge_repr: torch.Tensor) -> torch.Tensor:
+        r_hat = edge_repr / torch.linalg.norm(edge_repr, dim=1, keepdim=True).clamp_min(self.eps)
+        c_hat = self.weight / torch.linalg.norm(self.weight, dim=1, keepdim=True).clamp_min(self.eps)
+        return (r_hat @ c_hat.t()) / self.temperature
 
 
 def feature_common_variation_statistics(features: torch.Tensor, eps: float = 1e-12) -> dict:

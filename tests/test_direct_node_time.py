@@ -178,7 +178,7 @@ def test_proximity_backward_updates_node_path_not_cluster_output():
     assert model.cluster_output.weight.grad is None or float(model.cluster_output.weight.grad.abs().sum()) == 0.0
 
 
-def test_event_dot_similarity_mode_matches_default():
+def test_cosine_similarity_mode_is_default_and_event_dot_remains_explicit():
     model, _, _ = _direct_model("full")
     src, dst, time_feat = _toy_inputs()
     r, _ = model(src, dst, time_feat)
@@ -190,14 +190,21 @@ def test_event_dot_similarity_mode_matches_default():
         pi,
         4,
     )
-    default = edge_ppr_proximity_loss(*args, np.random.RandomState(11), torch.device("cpu"))
-    explicit = edge_ppr_proximity_loss(
+    default_cosine = edge_ppr_proximity_loss(*args, np.random.RandomState(11), torch.device("cpu"))
+    explicit_cosine = edge_ppr_proximity_loss(
+        *args,
+        np.random.RandomState(11),
+        torch.device("cpu"),
+        similarity_mode="cosine",
+    )
+    explicit_event_dot = edge_ppr_proximity_loss(
         *args,
         np.random.RandomState(11),
         torch.device("cpu"),
         similarity_mode="event_dot",
     )
-    assert torch.allclose(default, explicit)
+    assert torch.allclose(default_cosine, explicit_cosine)
+    assert not torch.allclose(default_cosine, explicit_event_dot)
 
 
 def test_role_aware_destination_source_and_directionality():

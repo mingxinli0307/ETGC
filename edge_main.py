@@ -30,8 +30,11 @@ def build_parser():
     parser.add_argument("--time_dim", type=int, default=32)
     parser.add_argument("--edge_hidden_dim", type=int, default=128)
     parser.add_argument("--cluster_hidden_dim", type=int, default=64)
-    parser.add_argument("--edge_encoder_mode", choices=["mlp", "direct_node_time"], default="mlp")
+    parser.add_argument("--time_feature_mode", choices=["current", "history"], default="current")
+    parser.add_argument("--edge_encoder_mode", choices=["mlp", "direct_node_time"], default="direct_node_time")
     parser.add_argument("--direct_time_scale", type=float, default=1.0)
+    parser.add_argument("--cluster_head_type", choices=["legacy_mlp", "cosine_prototype"], default="cosine_prototype")
+    parser.add_argument("--prototype_temperature", type=float, default=0.2)
     parser.add_argument("--require_pretrained_node2vec", type=int, choices=[0, 1], default=0)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--T", type=int, default=4)
@@ -44,27 +47,37 @@ def build_parser():
     )
     parser.add_argument("--edge_ppr_topk", type=int, default=20)
     parser.add_argument(
+        "--affinity_sparsify",
+        choices=["row_topk", "symmetric_union_knn", "none"],
+        default="symmetric_union_knn",
+    )
+    parser.add_argument(
         "--edge_ppr_method",
         choices=["temporal_state_forest", "forest", "legacy_temporal_forest", "truncated"],
         default="temporal_state_forest",
     )
     parser.add_argument("--forest_samples", type=int, default=5)
     parser.add_argument("--ncut_scope", choices=["batch", "global"], default="global")
-    parser.add_argument("--cluster_loss_type", choices=["trace_mincut", "legacy_ncut"], default="trace_mincut")
-    parser.add_argument("--orth_type", choices=["orth", "orthqa"], default="orth")
+    parser.add_argument(
+        "--cluster_loss_type",
+        choices=["matrix_ncut", "legacy_trace_ratio", "trace_mincut", "legacy_ncut"],
+        default="matrix_ncut",
+    )
+    parser.add_argument("--orth_type", choices=["orth", "orthqa"], default="orthqa")
     parser.add_argument("--global_q_chunk_size", type=int, default=8192)
     parser.add_argument("--global_ncut_row_block_size", type=int, default=65536)
     parser.add_argument("--global_warmup_epochs", type=int, default=0)
+    parser.add_argument("--prox_warmup_epochs", type=int, default=5)
     parser.add_argument("--quiet", type=int, default=0)
     parser.add_argument("--lambda_prox", type=float, default=1.0)
     parser.add_argument("--lambda_edge_ncut", type=float, default=0.5)
     parser.add_argument("--lambda_orth", type=float, default=1.0)
-    parser.add_argument("--lambda_proj", type=float, default=0.2)
+    parser.add_argument("--lambda_proj", type=float, default=0.0)
     parser.add_argument("--lambda_bal", type=float, default=50.0)
     parser.add_argument("--lambda_node_anchor", type=float, default=0.0)
-    parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="full")
+    parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="small_lr")
     parser.add_argument("--node_emb_lr", type=float, default=1e-5)
-    parser.add_argument("--prox_similarity_mode", choices=["event_dot", "role_aware"], default="event_dot")
+    parser.add_argument("--prox_similarity_mode", choices=["event_dot", "cosine", "role_aware"], default="cosine")
     parser.add_argument("--prox_role_ss_weight", type=float, default=0.25)
     parser.add_argument("--prox_role_dd_weight", type=float, default=0.25)
     parser.add_argument("--prox_role_ds_weight", type=float, default=1.0)
@@ -78,6 +91,7 @@ def build_parser():
         choices=["random", "random_orthogonal", "random_event", "kmeans_plus_plus", "prototype"],
         default="random",
     )
+    parser.add_argument("--prototype_init_mode", choices=["random", "random_orthogonal", "kmeans_plus_plus"], default="kmeans_plus_plus")
     parser.add_argument("--prototype_sample_size", type=int, default=20000)
     parser.add_argument("--prototype_lloyd_iters", type=int, default=10)
     parser.add_argument("--direct_kmeans_eval", type=int, choices=[0, 1], default=0)
@@ -107,28 +121,38 @@ def print_config(args, K=None):
     print(f"edge_ppr_method={args.edge_ppr_method}")
     print("default_proximity=state-expanded temporal subdivision forest")
     print(f"successor_limit={args.edge_neighbor_k}, with <=0 meaning all successors")
-    print("time_usage=raw_normalized_float_timestamp")
+    print(f"time_feature_mode={args.time_feature_mode}")
+    print("time_usage=current_timestamp_only" if args.time_feature_mode == "current" else "time_usage=history_compatibility")
     print(f"K_edge=K_node={K if K is not None else 'from node2label unique labels'}")
     print("projection=S=RowNorm(B_T Q)")
-    print("cluster_objective=global trace mincut" if args.cluster_loss_type == "trace_mincut" else "cluster_objective=legacy ncut")
-    print("trace_mincut_complexity=O(nnz(W_E) K + M K^2)")
+    if args.cluster_loss_type == "matrix_ncut":
+        print("cluster_objective=global matrix Ncut")
+        print("matrix_ncut_complexity=O(nnz(W_E) K + M K^2 + K^3)")
+    elif args.cluster_loss_type in {"legacy_trace_ratio", "trace_mincut"}:
+        print("cluster_objective=legacy scalar trace ratio")
+        print("legacy_trace_ratio_complexity=O(nnz(W_E) K + M K^2)")
+    else:
+        print("cluster_objective=legacy ncut")
     print(
         f"alpha={args.alpha}, T={args.T}, beta={args.beta}, edge_neighbor_k={args.edge_neighbor_k}, "
-        f"edge_ppr_topk={args.edge_ppr_topk}, forest_samples={args.forest_samples}"
+        f"edge_ppr_topk={args.edge_ppr_topk}, affinity_sparsify={args.affinity_sparsify}, "
+        f"forest_samples={args.forest_samples}"
     )
     print(
         f"ncut_scope={args.ncut_scope}, global_q_chunk_size={args.global_q_chunk_size}, "
         f"global_ncut_row_block_size={args.global_ncut_row_block_size}, "
-        f"global_warmup_epochs={args.global_warmup_epochs}, F1_type=macro"
+        f"global_warmup_epochs={args.global_warmup_epochs}, prox_warmup_epochs={args.prox_warmup_epochs}, "
+        f"F1_type=macro"
     )
     print(f"cluster_loss_type={args.cluster_loss_type}, orth_type={args.orth_type}, lambda_orth={args.lambda_orth}")
     print(
         f"lambda_prox={args.lambda_prox}, lambda_edge_ncut={args.lambda_edge_ncut}, "
         f"lambda_proj={args.lambda_proj}, lambda_bal={args.lambda_bal}"
     )
-    print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
+    print(f"legacy_balance_disabled={str(args.cluster_loss_type != 'legacy_ncut').lower()}")
     print(f"node_emb_mode={args.node_emb_mode}, node_emb_lr={args.node_emb_lr}")
     print(f"edge_encoder_mode={args.edge_encoder_mode}, direct_time_scale={args.direct_time_scale}")
+    print(f"cluster_head_type={args.cluster_head_type}, prototype_temperature={args.prototype_temperature}")
     print(f"require_pretrained_node2vec={args.require_pretrained_node2vec}")
     print(
         f"prox_similarity_mode={args.prox_similarity_mode}, prox_temperature={args.prox_temperature}, "
@@ -139,6 +163,7 @@ def print_config(args, K=None):
     print(f"cluster_output_bias_mode={args.cluster_output_bias_mode}")
     print(f"cluster_input_norm={args.cluster_input_norm}")
     print(f"cluster_init_mode={args.cluster_init_mode}")
+    print(f"prototype_init_mode={args.prototype_init_mode}")
     print(f"prototype_sample_size={args.prototype_sample_size}, prototype_lloyd_iters={args.prototype_lloyd_iters}")
     print(f"direct_kmeans_eval={args.direct_kmeans_eval}, init_only={args.init_only}")
     print(f"overnight_diagnostic={args.overnight_diagnostic}, diagnostic_epochs={args.diagnostic_epochs}")
@@ -187,18 +212,28 @@ def main(args):
     print(f"Pi_E nnz={stats['Pi_nnz']}")
     print(f"W_E nnz={stats['W_nnz']}")
     print(f"W_E average nnz per row={stats['W_avg_row_nnz']:.4f}")
+    print(f"W_E symmetry error={stats.get('W_symmetry_error', 0.0):.8g}")
+    print(f"W_E isolated event count={stats.get('W_isolated_event_count', 0)}")
+    print(f"W_E degree min={stats.get('W_degree_min', 0.0):.8g}")
+    print(f"W_E degree max={stats.get('W_degree_max', 0.0):.8g}")
+    print(f"W_E degree mean={stats.get('W_degree_mean', 0.0):.8g}")
+    print(f"affinity_sparsify={args.affinity_sparsify}")
+    print(f"affinity_sparsify_effective={stats.get('affinity_sparsify_effective', '')}")
     print(f"ncut_scope={args.ncut_scope}")
     print(f"cluster_loss_type={args.cluster_loss_type}")
     print(f"orth_type={args.orth_type}")
     print(f"lambda_orth={args.lambda_orth}")
-    print(f"legacy_balance_disabled={str(args.cluster_loss_type == 'trace_mincut').lower()}")
+    print(f"legacy_balance_disabled={str(args.cluster_loss_type != 'legacy_ncut').lower()}")
     print(f"W_E_sparse_mode={trainer.W_E_sparse_mode}")
     print(f"node_emb_mode_effective={trainer.node_emb_optimizer_info['node_emb_mode']}")
     print(f"node_emb_lr_effective={trainer.node_emb_optimizer_info['node_emb_lr']}")
     print(f"other_lr_effective={trainer.node_emb_optimizer_info['other_lr']}")
     print("[model]")
+    print(f"time_feature_mode={args.time_feature_mode}")
     print(f"edge_encoder_mode={trainer.edge_encoder_mode}")
     print(f"direct_time_scale={args.direct_time_scale}")
+    print(f"cluster_head_type={args.cluster_head_type}")
+    print(f"prototype_temperature={args.prototype_temperature}")
     print(f"node_emb_mode={args.node_emb_mode}")
     print(f"node_embedding_source={trainer.node_embedding_source}")
     print(f"node2vec_path={trainer.node_embedding_path}")
@@ -225,6 +260,7 @@ def main(args):
     print(f"cluster_output_weight_l2_initial={trainer.model_init_info.get('cluster_output_weight_l2_initial')}")
     print(f"cluster_input_norm={args.cluster_input_norm}")
     print(f"cluster_init_mode={args.cluster_init_mode}")
+    print(f"prototype_init_mode={args.prototype_init_mode}")
     print(f"prototype_init_executed={trainer.model_init_info.get('prototype_init_executed')}")
     print("F1_type=macro")
     if int(getattr(args, "direct_kmeans_eval", 0)):

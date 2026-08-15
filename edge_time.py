@@ -16,14 +16,40 @@ class TimeEncoder(nn.Module):
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         x = values.unsqueeze(-1) * self.freqs.view(*([1] * values.dim()), -1)
         encoded = torch.cat([torch.sin(2.0 * torch.pi * x), torch.cos(2.0 * torch.pi * x)], dim=-1)
-        encoded = encoded.flatten(start_dim=-2)
+        if values.dim() >= 2:
+            encoded = encoded.flatten(start_dim=-2)
         if encoded.size(-1) >= self.time_dim:
             return encoded[..., : self.time_dim]
         pad = torch.zeros(*encoded.shape[:-1], self.time_dim - encoded.size(-1), device=encoded.device)
         return torch.cat([encoded, pad], dim=-1)
 
 
-def build_edge_time_features(src: np.ndarray, dst: np.ndarray, times: np.ndarray, time_dim: int) -> np.ndarray:
+def build_current_timestamp_features(times: np.ndarray, time_dim: int) -> np.ndarray:
+    times = np.asarray(times, dtype=np.float32)
+    time_dim = int(time_dim)
+    if time_dim <= 0:
+        return np.zeros((len(times), 0), dtype=np.float32)
+    raw_t = times.reshape(-1, 1).astype(np.float32, copy=False)
+    if time_dim == 1:
+        return raw_t
+    encoder = TimeEncoder(time_dim - 1)
+    with torch.no_grad():
+        fourier = encoder(torch.from_numpy(times)).reshape(len(times), -1)
+    return torch.cat([torch.from_numpy(raw_t), fourier], dim=1).numpy().astype(np.float32, copy=False)
+
+
+def build_edge_time_features(
+    src: np.ndarray,
+    dst: np.ndarray,
+    times: np.ndarray,
+    time_dim: int,
+    mode: str = "current",
+) -> np.ndarray:
+    mode = str(mode).lower()
+    if mode == "current":
+        return build_current_timestamp_features(times, time_dim)
+    if mode != "history":
+        raise ValueError(f"Unsupported time_feature_mode: {mode}")
     order = sorted(range(len(times)), key=lambda i: (float(times[i]), int(i)))
     raw = np.zeros((len(times), 4), dtype=np.float32)
     last_node_time: Dict[int, float] = {}

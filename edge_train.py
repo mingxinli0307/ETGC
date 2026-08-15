@@ -17,6 +17,7 @@ from edge_losses import (
     edge_ncut_loss,
     edge_ncut_loss_global,
     edge_ppr_proximity_loss,
+    edge_matrix_ncut_loss_global,
     edge_trace_mincut_loss_global,
     node_embedding_anchor_loss,
     projection_loss,
@@ -166,16 +167,24 @@ class EdgeHiNoSTrainer:
         self.ncut_scope = str(getattr(args, "ncut_scope", "batch")).lower()
         if self.ncut_scope not in {"batch", "global"}:
             raise ValueError(f"Unsupported ncut_scope: {self.ncut_scope}")
-        self.cluster_loss_type = str(getattr(args, "cluster_loss_type", "trace_mincut")).lower()
-        if self.cluster_loss_type not in {"trace_mincut", "legacy_ncut"}:
+        self.cluster_loss_type = str(getattr(args, "cluster_loss_type", "matrix_ncut")).lower()
+        if self.cluster_loss_type == "trace_mincut":
+            self.cluster_loss_type = "legacy_trace_ratio"
+        if self.cluster_loss_type not in {"matrix_ncut", "legacy_trace_ratio", "legacy_ncut"}:
             raise ValueError(f"Unsupported cluster_loss_type: {self.cluster_loss_type}")
-        if self.cluster_loss_type == "trace_mincut" and self.ncut_scope != "global":
-            raise ValueError("cluster_loss_type=trace_mincut requires ncut_scope=global because Q_all and W_E are global.")
+        if self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"} and self.ncut_scope != "global":
+            raise ValueError(
+                f"cluster_loss_type={self.cluster_loss_type} requires ncut_scope=global because Q_all and W_E are global."
+            )
 
         self.data = load_edge_event_data(args.data_root, args.dataset)
         self.K = int(self.data.K)
         self.time_feat_np = build_edge_time_features(
-            self.data.src, self.data.dst, self.data.times, int(args.time_dim)
+            self.data.src,
+            self.data.dst,
+            self.data.times,
+            int(args.time_dim),
+            mode=str(getattr(args, "time_feature_mode", "current")),
         )
 
         self.P_E, self.Pi_E, self.W_E, self.prox_stats = compute_edge_ppr_cached(
@@ -193,6 +202,7 @@ class EdgeHiNoSTrainer:
             edge_ppr_topk=args.edge_ppr_topk,
             beta=args.beta,
             seed=self.forest_seed,
+            affinity_sparsify=str(getattr(args, "affinity_sparsify", "symmetric_union_knn")),
             quiet=bool(int(getattr(args, "quiet", 0))),
         )
         self.Pi_E.sort_indices()
@@ -200,7 +210,7 @@ class EdgeHiNoSTrainer:
         self.W_E_degree_np = np.asarray(self.W_E.sum(axis=1)).ravel().astype(np.float32)
         self.W_E_sparse_torch = None
         self.W_E_sparse_mode = "scipy_row_block"
-        if self.ncut_scope == "global" and self.cluster_loss_type == "trace_mincut" and self.W_E.nnz > 0:
+        if self.ncut_scope == "global" and self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"} and self.W_E.nnz > 0:
             try:
                 self.W_E_sparse_torch = scipy_csr_to_torch_sparse_coo(self.W_E, self.device, torch.float32)
                 self.W_E_sparse_mode = "torch_sparse_coo"
@@ -215,8 +225,9 @@ class EdgeHiNoSTrainer:
         self.edge_encoder_mode = str(getattr(args, "edge_encoder_mode", "mlp")).lower()
         if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
             raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
+        self.cluster_head_type = str(getattr(args, "cluster_head_type", "legacy_mlp")).lower()
         self.prox_similarity_mode = str(getattr(args, "prox_similarity_mode", "event_dot")).lower()
-        if self.prox_similarity_mode not in {"event_dot", "role_aware"}:
+        if self.prox_similarity_mode not in {"event_dot", "cosine", "role_aware"}:
             raise ValueError(f"Unsupported prox_similarity_mode: {self.prox_similarity_mode}")
         if self.prox_similarity_mode == "role_aware" and self.edge_encoder_mode != "direct_node_time":
             raise ValueError("prox_similarity_mode=role_aware requires edge_encoder_mode=direct_node_time")
@@ -245,6 +256,8 @@ class EdgeHiNoSTrainer:
             cluster_input_norm=getattr(args, "cluster_input_norm", "none"),
             edge_encoder_mode=self.edge_encoder_mode,
             direct_time_scale=self.direct_time_scale,
+            cluster_head_type=getattr(args, "cluster_head_type", "legacy_mlp"),
+            prototype_temperature=float(getattr(args, "prototype_temperature", 0.2)),
         ).to(self.device)
         self.event_repr_dim = int(self.model.event_repr_dim)
         self.cluster_input_dim = int(self.model.cluster_input_dim)
@@ -281,13 +294,21 @@ class EdgeHiNoSTrainer:
         self.model_init_info["node2vec_shape"] = [int(x) for x in node_features.shape]
         self.model_init_info["cluster_output_bias_mode"] = str(getattr(args, "cluster_output_bias_mode", "default"))
         self.model_init_info["cluster_input_norm"] = str(getattr(args, "cluster_input_norm", "none"))
+        self.model_init_info["cluster_head_type"] = str(getattr(args, "cluster_head_type", "legacy_mlp"))
+        self.model_init_info["prototype_temperature"] = float(getattr(args, "prototype_temperature", 0.2))
         self.model_init_info["cluster_init_mode"] = str(getattr(args, "cluster_init_mode", "random"))
+        self.model_init_info["prototype_init_mode"] = str(getattr(args, "prototype_init_mode", "kmeans_plus_plus"))
         self.model_init_info["edge_encoder_mode"] = self.edge_encoder_mode
         self.model_init_info["cluster_output_bias_l2_initial"] = self.model_init_info["output_bias_l2"]
         self.model_init_info["cluster_output_weight_l2_initial"] = self.model_init_info["cluster_output_weight_l2"]
         self.model_init_info["prototype_init_executed"] = False
         self._record_uniform_stage_no_grad("after_model_initialization")
-        self._apply_cluster_initialization()
+        self.prototype_initialization_pending = False
+        if self._should_defer_prototype_initialization():
+            self.prototype_initialization_pending = True
+            self.model_init_info["cluster_init_mode_effective"] = "deferred_until_after_prox_warmup"
+        else:
+            self._apply_cluster_initialization()
         self.model_init_info["cluster_output_bias_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["output_bias_l2"]
         self.model_init_info["cluster_output_weight_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["cluster_output_weight_l2"]
         self._record_uniform_stage_no_grad("after_cluster_initialization")
@@ -354,6 +375,7 @@ class EdgeHiNoSTrainer:
         trainable_params = [p for p in all_params if p.requires_grad]
         return {
             "edge_encoder_mode": self.edge_encoder_mode,
+            "cluster_head_type": self.cluster_head_type,
             "node_dim": int(self.node_dim),
             "time_dim": int(getattr(self.args, "time_dim", 0)),
             "event_repr_dim": int(self.event_repr_dim),
@@ -373,9 +395,25 @@ class EdgeHiNoSTrainer:
             ids.update(int(x) for x in self.Pi_E.indices[start:end].tolist())
         return np.asarray(sorted(ids), dtype=np.int64)
 
+    def _forward_event_tensors(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        time_feat: torch.Tensor,
+        return_logits: bool = False,
+        return_cluster_hidden: bool = False,
+    ):
+        return self.model(
+            src,
+            dst,
+            time_feat,
+            return_logits=return_logits,
+            return_cluster_hidden=return_cluster_hidden,
+        )
+
     def _forward_ids(self, ids: np.ndarray):
         ids_t = torch.from_numpy(ids).long().to(self.device)
-        return self.model(
+        return self._forward_event_tensors(
             self.src_t.index_select(0, ids_t),
             self.dst_t.index_select(0, ids_t),
             self.time_feat_t.index_select(0, ids_t),
@@ -383,7 +421,7 @@ class EdgeHiNoSTrainer:
 
     def _forward_ids_with_logits(self, ids: np.ndarray):
         ids_t = torch.from_numpy(ids).long().to(self.device)
-        return self.model(
+        return self._forward_event_tensors(
             self.src_t.index_select(0, ids_t),
             self.dst_t.index_select(0, ids_t),
             self.time_feat_t.index_select(0, ids_t),
@@ -392,10 +430,28 @@ class EdgeHiNoSTrainer:
 
     def _forward_ids_diagnostic(self, ids: np.ndarray):
         ids_t = torch.from_numpy(ids).long().to(self.device)
-        r, q, logits, _cluster_hidden = self.model(
+        r, q, logits, _cluster_hidden = self._forward_event_tensors(
             self.src_t.index_select(0, ids_t),
             self.dst_t.index_select(0, ids_t),
             self.time_feat_t.index_select(0, ids_t),
+            return_logits=True,
+            return_cluster_hidden=True,
+        )
+        cluster_input = self.model.cluster_input_norm(r)
+        return r, q, logits, cluster_input
+
+    def _forward_range(self, start: int, end: int):
+        return self._forward_event_tensors(
+            self.src_t[start:end],
+            self.dst_t[start:end],
+            self.time_feat_t[start:end],
+        )
+
+    def _forward_range_diagnostic(self, start: int, end: int):
+        r, q, logits, _cluster_hidden = self._forward_event_tensors(
+            self.src_t[start:end],
+            self.dst_t[start:end],
+            self.time_feat_t[start:end],
             return_logits=True,
             return_cluster_hidden=True,
         )
@@ -462,10 +518,9 @@ class EdgeHiNoSTrainer:
 
     def _forward_all_q_with_grad(self, chunk_size: int) -> torch.Tensor:
         chunks = []
-        ids = np.arange(self.data.num_events, dtype=np.int64)
         chunk_size = max(1, int(chunk_size))
         for start in range(0, self.data.num_events, chunk_size):
-            _, q = self._forward_ids(ids[start : start + chunk_size])
+            _, q = self._forward_range(start, min(self.data.num_events, start + chunk_size))
             chunks.append(q)
         return torch.cat(chunks, dim=0)
 
@@ -474,10 +529,11 @@ class EdgeHiNoSTrainer:
         q_chunks = []
         logits_chunks = []
         cluster_input_chunks = []
-        ids = np.arange(self.data.num_events, dtype=np.int64)
         chunk_size = max(1, int(chunk_size))
         for start in range(0, self.data.num_events, chunk_size):
-            r, q, logits, cluster_input = self._forward_ids_diagnostic(ids[start : start + chunk_size])
+            r, q, logits, cluster_input = self._forward_range_diagnostic(
+                start, min(self.data.num_events, start + chunk_size)
+            )
             r_chunks.append(r)
             q_chunks.append(q)
             logits_chunks.append(logits)
@@ -496,10 +552,11 @@ class EdgeHiNoSTrainer:
         q_chunks = []
         logits_chunks = []
         cluster_input_chunks = []
-        ids = np.arange(self.data.num_events, dtype=np.int64)
         chunk_size = max(1, int(chunk_size))
         for start in range(0, self.data.num_events, chunk_size):
-            r, q, logits, cluster_input = self._forward_ids_diagnostic(ids[start : start + chunk_size])
+            r, q, logits, cluster_input = self._forward_range_diagnostic(
+                start, min(self.data.num_events, start + chunk_size)
+            )
             r_chunks.append(r.detach())
             q_chunks.append(q.detach())
             logits_chunks.append(logits.detach())
@@ -515,19 +572,26 @@ class EdgeHiNoSTrainer:
     def _forward_all_cluster_hidden_no_grad(self, chunk_size: int) -> torch.Tensor:
         self.model.eval()
         hidden_chunks = []
-        ids = np.arange(self.data.num_events, dtype=np.int64)
         chunk_size = max(1, int(chunk_size))
         for start in range(0, self.data.num_events, chunk_size):
-            _, _, cluster_hidden = self.model(
-                self.src_t.index_select(0, torch.from_numpy(ids[start : start + chunk_size]).long().to(self.device)),
-                self.dst_t.index_select(0, torch.from_numpy(ids[start : start + chunk_size]).long().to(self.device)),
-                self.time_feat_t.index_select(
-                    0, torch.from_numpy(ids[start : start + chunk_size]).long().to(self.device)
-                ),
+            _, _, cluster_hidden = self._forward_event_tensors(
+                self.src_t[start : start + chunk_size],
+                self.dst_t[start : start + chunk_size],
+                self.time_feat_t[start : start + chunk_size],
                 return_cluster_hidden=True,
             )
             hidden_chunks.append(cluster_hidden.detach())
         return torch.cat(hidden_chunks, dim=0)
+
+    @torch.no_grad()
+    def _forward_all_edge_repr_no_grad(self, chunk_size: int) -> torch.Tensor:
+        self.model.eval()
+        repr_chunks = []
+        chunk_size = max(1, int(chunk_size))
+        for start in range(0, self.data.num_events, chunk_size):
+            r, _ = self._forward_range(start, min(self.data.num_events, start + chunk_size))
+            repr_chunks.append(r.detach())
+        return torch.cat(repr_chunks, dim=0)
 
     def _zero_scalar(self) -> torch.Tensor:
         return next(self.model.parameters()).sum() * 0.0
@@ -539,8 +603,18 @@ class EdgeHiNoSTrainer:
             "cluster_output_weight_l2": float(torch.linalg.norm(self.model.cluster_output.weight.detach()).cpu()),
         }
 
+    def _should_defer_prototype_initialization(self) -> bool:
+        if str(getattr(self.args, "cluster_head_type", "legacy_mlp")).lower() != "cosine_prototype":
+            return False
+        if str(getattr(self.args, "prototype_init_mode", "kmeans_plus_plus")).lower() != "kmeans_plus_plus":
+            return False
+        return int(getattr(self.args, "prox_warmup_epochs", 0)) > 0
+
     def _apply_cluster_initialization(self) -> None:
-        mode = str(getattr(self.args, "cluster_init_mode", "random")).lower()
+        if self.cluster_head_type == "cosine_prototype":
+            mode = str(getattr(self.args, "prototype_init_mode", "kmeans_plus_plus")).lower()
+        else:
+            mode = str(getattr(self.args, "cluster_init_mode", "random")).lower()
         if mode == "random":
             self.model_init_info["cluster_init_mode_effective"] = "random"
             self.model_init_info["initial_cluster_weight_checksum"] = tensor_checksum(
@@ -552,8 +626,11 @@ class EdgeHiNoSTrainer:
                 initialize_cluster_output_random_orthogonal(self.model, self.K, seed=self.prototype_seed)
             )
             return
-        hidden = self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
-        self.model_init_info["cluster_hidden_checksum"] = tensor_checksum(hidden)
+        hidden = self._prototype_initialization_features()
+        self.model_init_info["prototype_feature_checksum"] = tensor_checksum(hidden)
+        self.model_init_info["prototype_feature_source"] = (
+            "normalized_edge_repr_R" if self.cluster_head_type == "cosine_prototype" else "legacy_cluster_hidden"
+        )
         if mode == "random_event":
             self.model_init_info.update(
                 initialize_cluster_output_random_event(
@@ -577,18 +654,20 @@ class EdgeHiNoSTrainer:
             )
             self.model_init_info["prototype_init_executed"] = True
             self.model_init_info["cluster_init_mode_effective"] = "kmeans_plus_plus"
+            self.prototype_initialization_pending = False
             self._record_uniform_stage_no_grad("after_prototype_initialization")
             return
         if mode == "prototype":
             self.model_init_info.update(self._initialize_cluster_output_prototypes(hidden=hidden))
             self.model_init_info["prototype_init_executed"] = True
+            self.prototype_initialization_pending = False
             self._record_uniform_stage_no_grad("after_prototype_initialization")
             return
         raise ValueError(f"Unsupported cluster_init_mode: {getattr(self.args, 'cluster_init_mode', None)}")
 
     def _initialize_cluster_output_prototypes(self, hidden=None) -> dict:
         if hidden is None:
-            hidden = self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
+            hidden = self._prototype_initialization_features()
         stats = initialize_cluster_output_from_prototypes(
             self.model,
             hidden,
@@ -598,6 +677,17 @@ class EdgeHiNoSTrainer:
             lloyd_iters=int(getattr(self.args, "prototype_lloyd_iters", 10)),
         )
         return stats
+
+    def _prototype_initialization_features(self) -> torch.Tensor:
+        if self.cluster_head_type == "cosine_prototype":
+            edge_repr = self._forward_all_edge_repr_no_grad(int(self.args.global_q_chunk_size))
+            return edge_repr / torch.linalg.norm(edge_repr, dim=1, keepdim=True).clamp_min(1e-12)
+        return self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
+
+    def _ensure_prototypes_initialized_after_warmup(self) -> None:
+        if not getattr(self, "prototype_initialization_pending", False):
+            return
+        self._apply_cluster_initialization()
 
     def _predict_nodes_from_edge_labels(self, edge_labels: np.ndarray) -> np.ndarray:
         return edge_hard_labels_to_node_predictions(edge_labels, self.data.src, self.data.dst, self.data.num_nodes, self.K)
@@ -667,7 +757,10 @@ class EdgeHiNoSTrainer:
                 "diagnostic_dir": self.uniform_diag_dir,
                 "logits_std_unbiased": False,
                 "edge_encoder_mode": self.edge_encoder_mode,
+                "time_feature_mode": str(getattr(self.args, "time_feature_mode", "current")),
                 "direct_time_scale": float(self.direct_time_scale),
+                "cluster_head_type": self.cluster_head_type,
+                "prototype_temperature": float(getattr(self.args, "prototype_temperature", 0.2)),
                 "prox_similarity_mode": self.prox_similarity_mode,
                 "lambda_node_anchor": float(getattr(self.args, "lambda_node_anchor", 0.0)),
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
@@ -678,6 +771,8 @@ class EdgeHiNoSTrainer:
                 "cluster_input_dim": int(self.cluster_input_dim),
                 "node_embedding_source": self.node_embedding_source,
                 "node2vec_path": self.node_embedding_path,
+                "affinity_sparsify": str(getattr(self.args, "affinity_sparsify", "symmetric_union_knn")),
+                "W_E_symmetry_error": float(self.prox_stats.get("W_symmetry_error", 0.0)),
                 "model_parameter_info": self._model_parameter_info(),
                 "projection": "S=RowNorm(BQ) using index_add over src/dst events",
                 "model_init_info": self.model_init_info,
@@ -727,15 +822,26 @@ class EdgeHiNoSTrainer:
         extra["prox_similarity_mode"] = self.prox_similarity_mode
         extra["lambda_node_anchor"] = float(getattr(self.args, "lambda_node_anchor", 0.0))
         with torch.no_grad():
-            _, cut_loss, orth_original = edge_trace_mincut_loss_global(
-                q_all,
-                self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                self.W_E_degree_np,
-                self.K,
-                lambda_orth=1.0,
-                row_block_size=int(self.args.global_ncut_row_block_size),
-                orth_type="orth",
-            )
+            if self.cluster_loss_type == "matrix_ncut":
+                _, cut_loss, orth_original = edge_matrix_ncut_loss_global(
+                    q_all,
+                    self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+                    self.W_E_degree_np,
+                    self.K,
+                    lambda_orth=1.0,
+                    row_block_size=int(self.args.global_ncut_row_block_size),
+                    orth_type="orth",
+                )
+            else:
+                _, cut_loss, orth_original = edge_trace_mincut_loss_global(
+                    q_all,
+                    self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+                    self.W_E_degree_np,
+                    self.K,
+                    lambda_orth=1.0,
+                    row_block_size=int(self.args.global_ncut_row_block_size),
+                    orth_type="orth",
+                )
             orthqa_loss = edge_orthqa_penalty_global(q_all, degree_t)
         extra["cut_loss"] = float(cut_loss.detach().cpu())
         extra["orth_original_loss"] = float(orth_original.detach().cpu())
@@ -819,15 +925,26 @@ class EdgeHiNoSTrainer:
             result["node_grad_max_from_prox"] = None
 
         q_all = self._forward_all_q_with_grad(int(self.args.global_q_chunk_size))
-        _, cut_loss, penalty_loss = edge_trace_mincut_loss_global(
-            q_all,
-            self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-            self.W_E_degree_np,
-            self.K,
-            lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
-            row_block_size=int(self.args.global_ncut_row_block_size),
-            orth_type=str(getattr(self.args, "orth_type", "orth")),
-        )
+        if self.cluster_loss_type == "matrix_ncut":
+            _, cut_loss, penalty_loss = edge_matrix_ncut_loss_global(
+                q_all,
+                self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+                self.W_E_degree_np,
+                self.K,
+                lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
+                row_block_size=int(self.args.global_ncut_row_block_size),
+                orth_type=str(getattr(self.args, "orth_type", "orthqa")),
+            )
+        else:
+            _, cut_loss, penalty_loss = edge_trace_mincut_loss_global(
+                q_all,
+                self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+                self.W_E_degree_np,
+                self.K,
+                lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
+                row_block_size=int(self.args.global_ncut_row_block_size),
+                orth_type=str(getattr(self.args, "orth_type", "orthqa")),
+            )
         if node_params:
             cut_node_grads = torch.autograd.grad(
                 cut_loss,
@@ -1023,6 +1140,17 @@ class EdgeHiNoSTrainer:
         pred_y = S.argmax(axis=1)
         metrics = evaluate_node_clustering(self.data.labels, pred_y)
         metrics.update(self._q_distribution_stats(Q))
+        edge_labels = Q.argmax(axis=1).astype(np.int64)
+        edge_counts = np.bincount(edge_labels, minlength=self.K)[: self.K]
+        node_counts = np.bincount(pred_y.astype(np.int64), minlength=self.K)[: self.K]
+        metrics.update(
+            {
+                "edge_hard_active_clusters": int(np.sum(edge_counts > 0)),
+                "edge_hard_largest_ratio": float(edge_counts.max() / max(1, int(edge_counts.sum()))),
+                "node_hard_active_clusters": int(np.sum(node_counts > 0)),
+                "node_hard_largest_ratio": float(node_counts.max() / max(1, int(node_counts.sum()))),
+            }
+        )
         return metrics, S
 
     def _capture_init_reference(self) -> None:
@@ -1310,7 +1438,10 @@ class EdgeHiNoSTrainer:
                 "N": int(self.data.num_nodes),
                 "K": int(self.K),
                 "edge_encoder_mode": self.edge_encoder_mode,
+                "time_feature_mode": str(getattr(self.args, "time_feature_mode", "current")),
                 "direct_time_scale": float(self.direct_time_scale),
+                "cluster_head_type": self.cluster_head_type,
+                "prototype_temperature": float(getattr(self.args, "prototype_temperature", 0.2)),
                 "prox_similarity_mode": self.prox_similarity_mode,
                 "prox_role_ss_weight": float(getattr(self.args, "prox_role_ss_weight", 0.25)),
                 "prox_role_dd_weight": float(getattr(self.args, "prox_role_dd_weight", 0.25)),
@@ -1333,15 +1464,24 @@ class EdgeHiNoSTrainer:
                 "Pi_E_nnz": int(self.Pi_E.nnz),
                 "W_E_nnz": int(self.W_E.nnz),
                 "W_E_avg_nnz_per_row": float(self.W_E.nnz / max(1, self.W_E.shape[0])),
+                "W_E_symmetry_error": float(self.prox_stats.get("W_symmetry_error", 0.0)),
+                "W_E_isolated_event_count": int(self.prox_stats.get("W_isolated_event_count", 0)),
+                "W_E_degree_min": float(self.prox_stats.get("W_degree_min", 0.0)),
+                "W_E_degree_max": float(self.prox_stats.get("W_degree_max", 0.0)),
+                "W_E_degree_mean": float(self.prox_stats.get("W_degree_mean", 0.0)),
                 "W_E_sparse_mode": self.W_E_sparse_mode,
-                "legacy_balance_disabled": self.cluster_loss_type == "trace_mincut",
-                "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
+                "affinity_sparsify": str(getattr(self.args, "affinity_sparsify", "symmetric_union_knn")),
+                "affinity_sparsify_effective": self.prox_stats.get("affinity_sparsify_effective", ""),
+                "legacy_balance_disabled": self.cluster_loss_type != "legacy_ncut",
+                "matrix_ncut_complexity": "O(nnz(W_E) K + M K^2 + K^3)",
+                "legacy_trace_ratio_complexity": "O(nnz(W_E) K + M K^2)",
                 "node_emb_optimizer_info": self.node_emb_optimizer_info,
                 "main_learning_rate": float(self.node_emb_optimizer_info.get("main_learning_rate", 0.0)),
                 "node_embedding_learning_rate": float(self.node_emb_optimizer_info.get("node_embedding_learning_rate", 0.0)),
                 "node_lr_ratio": float(self.node_emb_optimizer_info.get("node_lr_ratio", 0.0)),
                 "model_parameter_info": self._model_parameter_info(),
                 "model_init_info": self.model_init_info,
+                "prototype_init_mode": str(getattr(self.args, "prototype_init_mode", "kmeans_plus_plus")),
                 "prox_stats": self.prox_stats,
             }
         )
@@ -1366,7 +1506,10 @@ class EdgeHiNoSTrainer:
             "N": int(self.data.num_nodes),
             "K": int(self.K),
             "edge_encoder_mode": self.edge_encoder_mode,
+            "time_feature_mode": str(getattr(self.args, "time_feature_mode", "current")),
             "direct_time_scale": float(self.direct_time_scale),
+            "cluster_head_type": self.cluster_head_type,
+            "prototype_temperature": float(getattr(self.args, "prototype_temperature", 0.2)),
             "prox_similarity_mode": self.prox_similarity_mode,
             "prox_role_ss_weight": float(getattr(self.args, "prox_role_ss_weight", 0.25)),
             "prox_role_dd_weight": float(getattr(self.args, "prox_role_dd_weight", 0.25)),
@@ -1385,14 +1528,23 @@ class EdgeHiNoSTrainer:
             "Pi_E_nnz": int(self.Pi_E.nnz),
             "W_E_nnz": int(self.W_E.nnz),
             "W_E_avg_nnz_per_row": float(self.W_E.nnz / max(1, self.W_E.shape[0])),
+            "W_E_symmetry_error": float(self.prox_stats.get("W_symmetry_error", 0.0)),
+            "W_E_isolated_event_count": int(self.prox_stats.get("W_isolated_event_count", 0)),
+            "W_E_degree_min": float(self.prox_stats.get("W_degree_min", 0.0)),
+            "W_E_degree_max": float(self.prox_stats.get("W_degree_max", 0.0)),
+            "W_E_degree_mean": float(self.prox_stats.get("W_degree_mean", 0.0)),
             "W_E_sparse_mode": self.W_E_sparse_mode,
-            "trace_mincut_complexity": "O(nnz(W_E) K + M K^2)",
+            "affinity_sparsify": str(getattr(self.args, "affinity_sparsify", "symmetric_union_knn")),
+            "affinity_sparsify_effective": self.prox_stats.get("affinity_sparsify_effective", ""),
+            "matrix_ncut_complexity": "O(nnz(W_E) K + M K^2 + K^3)",
+            "legacy_trace_ratio_complexity": "O(nnz(W_E) K + M K^2)",
             "node_emb_optimizer_info": self.node_emb_optimizer_info,
             "main_learning_rate": float(self.node_emb_optimizer_info.get("main_learning_rate", 0.0)),
             "node_embedding_learning_rate": float(self.node_emb_optimizer_info.get("node_embedding_learning_rate", 0.0)),
             "node_lr_ratio": float(self.node_emb_optimizer_info.get("node_lr_ratio", 0.0)),
             "model_parameter_info": self._model_parameter_info(),
             "model_init_info": self.model_init_info,
+            "prototype_init_mode": str(getattr(self.args, "prototype_init_mode", "kmeans_plus_plus")),
             "training_change_metrics": getattr(self, "training_change_metrics", {}),
         }
         with open(os.path.join(self.output_dir, "result.json"), "w", encoding="utf-8") as writer:
@@ -1407,7 +1559,7 @@ class EdgeHiNoSTrainer:
         batch_size = int(self.args.batch_size)
         quiet = bool(int(getattr(self.args, "quiet", 0)))
         diagnostic = bool(int(getattr(self.args, "diagnostic_stages", 0)))
-        warmup_epochs = int(getattr(self.args, "global_warmup_epochs", 0))
+        warmup_epochs = int(getattr(self.args, "prox_warmup_epochs", getattr(self.args, "global_warmup_epochs", 0)))
         lambda_prox = float(self.args.lambda_prox)
         lambda_edge_ncut = float(self.args.lambda_edge_ncut)
         lambda_proj = float(self.args.lambda_proj)
@@ -1506,6 +1658,7 @@ class EdgeHiNoSTrainer:
             cluster_backward_seconds = 0.0
             global_q_forwards = 0
             if self.ncut_scope == "global" and epoch > warmup_epochs:
+                self._ensure_prototypes_initialized_after_warmup()
                 self.model.train()
                 h_before_global = self._node_emb_snapshot_cpu()
                 cluster_before_global = self._cluster_head_snapshot_cpu()
@@ -1532,7 +1685,17 @@ class EdgeHiNoSTrainer:
                 global_q_forwards = 1
                 sync_cuda()
                 cluster_start = time.time()
-                if self.cluster_loss_type == "trace_mincut":
+                if self.cluster_loss_type == "matrix_ncut":
+                    cluster_loss, cut_loss, orth_loss = edge_matrix_ncut_loss_global(
+                        q_all,
+                        self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
+                        self.W_E_degree_np,
+                        self.K,
+                        lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
+                        row_block_size=int(self.args.global_ncut_row_block_size),
+                        orth_type=str(getattr(self.args, "orth_type", "orthqa")),
+                    )
+                elif self.cluster_loss_type == "legacy_trace_ratio":
                     cluster_loss, cut_loss, orth_loss = edge_trace_mincut_loss_global(
                         q_all,
                         self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
@@ -1540,7 +1703,7 @@ class EdgeHiNoSTrainer:
                         self.K,
                         lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
                         row_block_size=int(self.args.global_ncut_row_block_size),
-                        orth_type=str(getattr(self.args, "orth_type", "orth")),
+                        orth_type=str(getattr(self.args, "orth_type", "orthqa")),
                     )
                 else:
                     cut_loss = edge_ncut_loss_global(
@@ -1572,7 +1735,7 @@ class EdgeHiNoSTrainer:
                 if not torch.isfinite(anchor_loss).all():
                     raise FloatingPointError(f"node_anchor_loss is not finite: value={scalar_value(anchor_loss)}")
 
-                if self.cluster_loss_type == "trace_mincut":
+                if self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"}:
                     global_loss = (
                         lambda_edge_ncut * cluster_loss
                         + lambda_proj * proj_loss
@@ -1685,10 +1848,10 @@ class EdgeHiNoSTrainer:
                 "max_cluster_ratio": metrics.get("max_cluster_ratio", 0.0),
                 "min_cluster_ratio": metrics.get("min_cluster_ratio", 0.0),
                 "empty_cluster_count": metrics.get("empty_cluster_count", 0),
-                "edge_hard_active_clusters": stage_stats_for_epoch.get("num_active_edge_clusters", ""),
-                "edge_hard_largest_ratio": stage_stats_for_epoch.get("largest_edge_cluster_ratio", ""),
-                "node_hard_active_clusters": stage_stats_for_epoch.get("num_active_node_clusters", ""),
-                "node_hard_largest_ratio": stage_stats_for_epoch.get("largest_node_cluster_ratio", ""),
+                "edge_hard_active_clusters": stage_stats_for_epoch.get("num_active_edge_clusters", metrics.get("edge_hard_active_clusters", "")),
+                "edge_hard_largest_ratio": stage_stats_for_epoch.get("largest_edge_cluster_ratio", metrics.get("edge_hard_largest_ratio", "")),
+                "node_hard_active_clusters": stage_stats_for_epoch.get("num_active_node_clusters", metrics.get("node_hard_active_clusters", "")),
+                "node_hard_largest_ratio": stage_stats_for_epoch.get("largest_node_cluster_ratio", metrics.get("node_hard_largest_ratio", "")),
                 "q_rank1_energy_ratio": stage_stats_for_epoch.get("q_rank1_energy_ratio", ""),
                 "q_effective_rank": stage_stats_for_epoch.get("q_effective_rank", ""),
                 "q_centered_energy": stage_stats_for_epoch.get("q_centered_energy", ""),
@@ -1761,6 +1924,7 @@ class EdgeHiNoSTrainer:
                     f"node_up_prox={node_update_from_prox:.6g} node_up_global={node_update_from_global:.6g} "
                     f"entropy={record['Q_mean_entropy']:.4f} max_ratio={record['max_cluster_ratio']:.4f} "
                     f"min_ratio={record['min_cluster_ratio']:.4f} empty={int(record['empty_cluster_count'])} "
+                    f"active_edge={record['edge_hard_active_clusters']} active_node={record['node_hard_active_clusters']} "
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
                     f"cluster_backward_seconds={cluster_backward_seconds:.4f} "
                     f"epoch_seconds={epoch_seconds:.4f} peak_gpu_memory_mb={peak_gpu_memory_mb:.2f} "
@@ -1778,6 +1942,7 @@ class EdgeHiNoSTrainer:
                     f"node_up_prox={node_update_from_prox:.6g} node_up_global={node_update_from_global:.6g} "
                     f"entropy={record['Q_mean_entropy']:.4f} max_ratio={record['max_cluster_ratio']:.4f} "
                     f"min_ratio={record['min_cluster_ratio']:.4f} empty={int(record['empty_cluster_count'])} "
+                    f"active_edge={record['edge_hard_active_clusters']} active_node={record['node_hard_active_clusters']} "
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
                     f"cluster_backward_seconds={cluster_backward_seconds:.4f} "
                     f"epoch_seconds={epoch_seconds:.4f} peak_gpu_memory_mb={peak_gpu_memory_mb:.2f} "
@@ -1796,9 +1961,8 @@ class EdgeHiNoSTrainer:
         self.model.eval()
         chunks = []
         chunk_size = max(1, int(self.args.batch_size) * 4)
-        ids = np.arange(self.data.num_events, dtype=np.int64)
         for start in range(0, self.data.num_events, chunk_size):
-            _, q = self._forward_ids(ids[start : start + chunk_size])
+            _, q = self._forward_range(start, min(self.data.num_events, start + chunk_size))
             chunks.append(q.detach().cpu().numpy())
         return np.vstack(chunks)
 

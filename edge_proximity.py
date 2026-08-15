@@ -45,6 +45,30 @@ def sparse_row_topk(mat: sp.spmatrix, k: int) -> sp.csr_matrix:
     return sp.csr_matrix((data, (rows, cols)), shape=mat.shape, dtype=np.float32)
 
 
+def sparse_symmetric_union_knn(W: sp.spmatrix, k: int) -> sp.csr_matrix:
+    W = W.tocsr().astype(np.float32)
+    if int(k) <= 0:
+        return W
+    topk = sparse_row_topk(W, int(k)).tocsr()
+    mask = topk.copy()
+    if mask.nnz:
+        mask.data = np.ones_like(mask.data, dtype=np.float32)
+    mask = (mask + mask.T).tocsr()
+    if mask.nnz:
+        mask.data = np.ones_like(mask.data, dtype=np.float32)
+    result = W.multiply(mask).tocsr()
+    result.sum_duplicates()
+    result.eliminate_zeros()
+    return result
+
+
+def sparse_symmetry_error(mat: sp.spmatrix) -> float:
+    diff = (mat.tocsr() - mat.T.tocsr()).tocoo()
+    if diff.nnz == 0:
+        return 0.0
+    return float(np.max(np.abs(diff.data)))
+
+
 def build_edge_transition(src, dst, times, num_nodes: int, edge_neighbor_k: int, beta: float) -> sp.csr_matrix:
     """Backward-compatible alias for the exact temporal edge-event Gamma_T."""
     return build_temporal_edge_event_transition(src, dst, times, num_nodes, edge_neighbor_k, beta)
@@ -747,12 +771,24 @@ def compute_forest_edge_ppr(
     return Pi.tocsr()
 
 
-def build_edge_ncut_affinity(Pi_E: sp.csr_matrix, edge_ppr_topk: int) -> sp.csr_matrix:
+def build_edge_ncut_affinity(
+    Pi_E: sp.csr_matrix,
+    edge_ppr_topk: int,
+    affinity_sparsify: str = "symmetric_union_knn",
+) -> sp.csr_matrix:
+    mode = str(affinity_sparsify).lower()
+    if mode not in {"row_topk", "symmetric_union_knn", "none"}:
+        raise ValueError(f"Unsupported affinity_sparsify: {affinity_sparsify}")
     W = 0.5 * (Pi_E.tocsr() + Pi_E.T.tocsr())
     W = W.tolil()
     W.setdiag(0.0)
     W = W.tocsr()
-    W = sparse_row_topk(W, edge_ppr_topk)
+    if int(edge_ppr_topk) <= 0 or mode == "none":
+        W = W
+    elif mode == "row_topk":
+        W = sparse_row_topk(W, edge_ppr_topk)
+    else:
+        W = sparse_symmetric_union_knn(W, edge_ppr_topk)
     W.sum_duplicates()
     W.eliminate_zeros()
     return W.tocsr()
@@ -773,6 +809,7 @@ def compute_edge_ppr_cached(
     edge_ppr_topk: int,
     beta: float,
     seed: int,
+    affinity_sparsify: str = "symmetric_union_knn",
     quiet: bool = False,
 ) -> Tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix, dict]:
     method = str(method)
@@ -785,7 +822,7 @@ def compute_edge_ppr_cached(
     if forest_impl is None:
         raise ValueError(f"Unsupported edge_ppr_method: {method}")
 
-    cfg = {
+    pi_cfg = {
         "dataset": dataset,
         "method": method,
         "alpha": float(alpha),
@@ -798,13 +835,23 @@ def compute_edge_ppr_cached(
         "num_events": int(len(src)),
         "forest_impl": forest_impl,
     }
-    cfg_hash = hash_cfg(cfg)
+    cfg_hash = hash_cfg(pi_cfg)
+    affinity_sparsify = str(affinity_sparsify).lower()
+    affinity_sparsify_effective = "none" if int(edge_ppr_topk) <= 0 else affinity_sparsify
+    w_cfg = dict(pi_cfg)
+    w_cfg.update(
+        {
+            "affinity_sparsify": f"{affinity_sparsify}_v1",
+            "affinity_sparsify_effective": f"{affinity_sparsify_effective}_v1",
+        }
+    )
+    w_cfg_hash = hash_cfg(w_cfg)
     ds_cache = os.path.join(cache_dir, dataset)
     ensure_dir(ds_cache)
     p_path = os.path.join(ds_cache, f"edge_transition_{cfg_hash}.npz")
     pi_path = os.path.join(ds_cache, f"edge_ppr_{method}_{cfg_hash}.npz")
-    w_path = os.path.join(ds_cache, f"edge_ncut_affinity_{method}_{cfg_hash}.npz")
-    meta_path = os.path.join(ds_cache, f"edge_ppr_{method}_{cfg_hash}.json")
+    w_path = os.path.join(ds_cache, f"edge_ncut_affinity_{method}_{w_cfg_hash}.npz")
+    meta_path = os.path.join(ds_cache, f"edge_ppr_{method}_{w_cfg_hash}.json")
 
     if method in ["temporal_state_forest", "forest", "truncated"]:
         if os.path.exists(p_path):
@@ -819,10 +866,10 @@ def compute_edge_ppr_cached(
             P_E = build_sf_etrl_expanded_graph(src, dst, num_nodes)
             sp.save_npz(p_path, P_E)
 
-    cache_hit = os.path.exists(pi_path) and os.path.exists(w_path)
-    if cache_hit:
+    pi_cache_hit = os.path.exists(pi_path)
+    w_cache_hit = os.path.exists(w_path)
+    if pi_cache_hit:
         Pi_E = sp.load_npz(pi_path).tocsr()
-        W_E = sp.load_npz(w_path).tocsr()
     else:
         prox_start = time.time()
         if quiet and method in ["temporal_state_forest", "forest"]:
@@ -856,18 +903,30 @@ def compute_edge_ppr_cached(
             )
         elif method == "truncated":
             Pi_E = compute_truncated_edge_ppr(P_E, alpha, T, edge_ppr_topk)
-        W_E = build_edge_ncut_affinity(Pi_E, edge_ppr_topk)
         if quiet and method in ["temporal_state_forest", "forest"]:
             elapsed = time.time() - prox_start
-            print(f"[proximity] done seconds={elapsed:.2f} Pi_nnz={Pi_E.nnz} W_nnz={W_E.nnz}", flush=True)
+            print(f"[proximity] done seconds={elapsed:.2f} Pi_nnz={Pi_E.nnz}", flush=True)
         sp.save_npz(pi_path, Pi_E)
+    if w_cache_hit:
+        W_E = sp.load_npz(w_path).tocsr()
+    else:
+        W_E = build_edge_ncut_affinity(Pi_E, edge_ppr_topk, affinity_sparsify=affinity_sparsify)
         sp.save_npz(w_path, W_E)
         with open(meta_path, "w", encoding="utf-8") as writer:
-            json.dump(cfg, writer, indent=2, sort_keys=True)
+            json.dump(w_cfg, writer, indent=2, sort_keys=True)
+
+    degree = np.asarray(W_E.sum(axis=1)).ravel().astype(np.float32)
+    positive_degree = degree[degree > 0]
 
     stats = {
-        "config_hash": cfg_hash,
-        "cache_hit": bool(cache_hit),
+        "config_hash": w_cfg_hash,
+        "pi_config_hash": cfg_hash,
+        "w_config_hash": w_cfg_hash,
+        "cache_hit": bool(pi_cache_hit and w_cache_hit),
+        "pi_cache_hit": bool(pi_cache_hit),
+        "w_cache_hit": bool(w_cache_hit),
+        "affinity_sparsify": affinity_sparsify,
+        "affinity_sparsify_effective": affinity_sparsify_effective,
         "P_shape": P_E.shape,
         "P_nnz": int(P_E.nnz),
         "P_avg_outdegree": float(P_E.nnz / max(1, P_E.shape[0])),
@@ -877,5 +936,11 @@ def compute_edge_ppr_cached(
         "W_shape": W_E.shape,
         "W_nnz": int(W_E.nnz),
         "W_avg_row_nnz": float(W_E.nnz / max(1, W_E.shape[0])),
+        "W_symmetry_error": sparse_symmetry_error(W_E),
+        "W_isolated_event_count": int(np.sum(degree <= 0.0)),
+        "W_degree_min": float(degree.min()) if degree.size else 0.0,
+        "W_degree_max": float(degree.max()) if degree.size else 0.0,
+        "W_degree_mean": float(degree.mean()) if degree.size else 0.0,
+        "W_positive_degree_min": float(positive_degree.min()) if positive_degree.size else 0.0,
     }
     return P_E, Pi_E, W_E, stats

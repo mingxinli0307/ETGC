@@ -77,6 +77,102 @@ def _sparse_block_wq_numerator(W_E: sp.csr_matrix, Q_all: torch.Tensor, row_bloc
     return numerator
 
 
+def _sparse_wq_product(W_E, Q_all: torch.Tensor, row_block_size: int = 65536) -> tuple:
+    if isinstance(W_E, torch.Tensor):
+        if W_E.shape[0] != W_E.shape[1] or int(W_E.shape[0]) != int(Q_all.size(0)):
+            raise ValueError(f"W_E shape={tuple(W_E.shape)} does not match Q_all rows={Q_all.size(0)}")
+        if W_E.layout not in (torch.sparse_coo, torch.sparse_csr):
+            raise ValueError(f"W_E tensor must be sparse COO/CSR, got layout={W_E.layout}")
+        W_sparse = W_E.to(device=Q_all.device, dtype=Q_all.dtype)
+        return torch.sparse.mm(W_sparse, Q_all), int(W_sparse._nnz())
+
+    W_csr = W_E.tocsr()
+    m = int(W_csr.shape[0])
+    if W_csr.shape[0] != W_csr.shape[1] or m != int(Q_all.size(0)):
+        raise ValueError(f"W_E shape={W_csr.shape} does not match Q_all rows={Q_all.size(0)}")
+    block_size = max(1, int(row_block_size))
+    chunks = []
+    for start in range(0, m, block_size):
+        end = min(m, start + block_size)
+        sub = W_csr[start:end].tocoo()
+        if sub.nnz == 0:
+            chunks.append(Q_all.new_zeros((end - start, int(Q_all.size(1)))))
+            continue
+        indices = torch.stack(
+            [
+                torch.from_numpy(sub.row.astype(np.int64, copy=False)),
+                torch.from_numpy(sub.col.astype(np.int64, copy=False)),
+            ],
+            dim=0,
+        ).to(device=Q_all.device)
+        values = torch.from_numpy(sub.data.astype(np.float32, copy=False)).to(
+            device=Q_all.device, dtype=Q_all.dtype
+        )
+        W_block = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(end - start, m),
+            device=Q_all.device,
+            dtype=Q_all.dtype,
+        ).coalesce()
+        chunks.append(torch.sparse.mm(W_block, Q_all))
+    return torch.cat(chunks, dim=0), int(W_csr.nnz)
+
+
+def edge_matrix_ncut_loss_global(
+    Q_all: torch.Tensor,
+    W_E,
+    degree,
+    K: int,
+    lambda_orth: float = 1.0,
+    eps: float = 1e-8,
+    row_block_size: int = 65536,
+    orth_type: str = "orthqa",
+) -> tuple:
+    if Q_all.dim() != 2:
+        raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
+    m = int(Q_all.size(0))
+    k = int(Q_all.size(1))
+    if k != int(K):
+        raise ValueError(f"Q_all has K={k}, expected K={K}")
+    WQ, nnz = _sparse_wq_product(W_E, Q_all, int(row_block_size))
+    degree_t = _as_degree_tensor(degree, Q_all)
+    if int(degree_t.numel()) != m:
+        raise ValueError(f"degree length={degree_t.numel()} does not match Q_all rows={m}")
+    DQ = degree_t.unsqueeze(1) * Q_all
+    eye = torch.eye(k, dtype=Q_all.dtype, device=Q_all.device)
+    A = Q_all.t().mm(DQ) + float(eps) * eye
+    B = Q_all.t().mm(DQ - WQ)
+    X = torch.linalg.solve(A, B)
+    ncut_loss = torch.trace(X)
+    selected_orth_type = str(orth_type).lower()
+    if selected_orth_type == "orth":
+        penalty_loss = trace_mincut_orthogonality_loss(Q_all, int(K), eps=float(eps))
+    elif selected_orth_type == "orthqa":
+        penalty_loss = edge_orthqa_penalty_global(Q_all, degree_t, eps=float(eps))
+    else:
+        raise ValueError(f"Unsupported orth_type: {orth_type}")
+    total_cluster_loss = ncut_loss + float(lambda_orth) * penalty_loss
+    stats = {
+        "M": m,
+        "K": k,
+        "W_nnz": nnz,
+        "degree_min": float(degree_t.detach().min().cpu()) if degree_t.numel() else 0.0,
+        "degree_max": float(degree_t.detach().max().cpu()) if degree_t.numel() else 0.0,
+        "A_min": float(A.detach().min().cpu()) if A.numel() else 0.0,
+        "A_max": float(A.detach().max().cpu()) if A.numel() else 0.0,
+        "B_min": float(B.detach().min().cpu()) if B.numel() else 0.0,
+        "B_max": float(B.detach().max().cpu()) if B.numel() else 0.0,
+        "ncut_loss": float(ncut_loss.detach().cpu()),
+        "penalty_loss": float(penalty_loss.detach().cpu()),
+        "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
+    }
+    _check_scalar_finite("matrix_ncut loss", ncut_loss, stats)
+    _check_scalar_finite("matrix_ncut penalty", penalty_loss, stats)
+    _check_scalar_finite("matrix_ncut total_cluster_loss", total_cluster_loss, stats)
+    return total_cluster_loss, ncut_loss, penalty_loss
+
+
 def edge_trace_mincut_loss_global(
     Q_all: torch.Tensor,
     W_E,
@@ -217,7 +313,7 @@ def edge_ppr_proximity_loss(
     num_events: int,
     rng: np.random.RandomState,
     device: torch.device,
-    similarity_mode: str = "event_dot",
+    similarity_mode: str = "cosine",
     node_emb: torch.Tensor = None,
     src_union: torch.Tensor = None,
     dst_union: torch.Tensor = None,
@@ -253,6 +349,9 @@ def edge_ppr_proximity_loss(
     if mode == "event_dot":
         pos_score = (r_union[a] * r_union[p]).sum(dim=-1)
         neg_score = (r_union[a] * r_union[neg]).sum(dim=-1)
+    elif mode == "cosine":
+        pos_score = _cosine_pair(r_union[a], r_union[p], eps)
+        neg_score = _cosine_pair(r_union[a], r_union[neg], eps)
     elif mode == "role_aware":
         pos_score = role_aware_event_scores(
             a,
