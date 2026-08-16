@@ -639,7 +639,11 @@ def avg_delta(config, key, reference="C0_baseline"):
 def collapse_like(row):
     return (
         finite(row.get("final_rank1_energy")) >= 0.999
-        and finite(row.get("final_centered_energy"), 1.0) <= 1e-6
+        and finite(row.get("final_effective_rank"), math.inf) <= 1.01
+        and (
+            finite(row.get("final_active_node_clusters"), math.inf) <= 1
+            or finite(row.get("final_largest_node_ratio"), 0.0) >= 0.99
+        )
     )
 
 
@@ -662,7 +666,7 @@ false_hard = [
     for row in factor_rows
     if finite(row.get("final_active_edge_clusters"), 0) > 1
     and finite(row.get("final_rank1_energy"), 0) >= 0.999
-    and finite(row.get("final_centered_energy"), 1.0) <= 1e-6
+    and finite(row.get("final_effective_rank"), math.inf) <= 1.01
 ]
 global_pullback = [
     row
@@ -700,7 +704,7 @@ lines.extend(["", "## Required Answers", ""])
 lines.append(
     "1. C0 collapse reproduction: "
     + (
-        "yes, both seeds satisfy the strict high-rank1/low-centered-energy check."
+        "yes, both seeds satisfy the high-rank1/effective-rank-near-one/node-collapse check."
         if c0_reproduced
         else "no under the strict check; downstream causal claims should be treated as not established unless the numeric C0 rows are judged to match the earlier failure."
     )
@@ -747,7 +751,7 @@ lines.append(
 )
 lines.append(
     "9. Hard-cluster-only false improvements: "
-    + (", ".join(f"{row['config']}/seed{row['seed']}" for row in false_hard) if false_hard else "none under the strict rank1>=0.999 and centered_energy<=1e-6 check.")
+    + (", ".join(f"{row['config']}/seed{row['seed']}" for row in false_hard) if false_hard else "none under the rank1>=0.999 and effective_rank<=1.01 check.")
 )
 lines.append(
     "10. First global update pullback: "
