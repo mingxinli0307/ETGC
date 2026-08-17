@@ -24,6 +24,8 @@ export TEMPORAL_FOREST_COMBINE_CHUNKS="${TEMPORAL_FOREST_COMBINE_CHUNKS:-8}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/logs/loss_formulation_validation/${RUN_TIMESTAMP}}"
 DEVICE_ARG="${DEVICE:-cuda:0}"
+DATASET_ARG="${DATASET:-school}"
+FOREST_SAMPLES_ARG="${FOREST_SAMPLES:-5}"
 RESUME=1
 
 while [[ $# -gt 0 ]]; do
@@ -59,10 +61,10 @@ print("torch_version=" + str(torch.__version__))
 print("cuda_available=" + str(torch.cuda.is_available()))
 print("cuda_device=" + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"))
 PY
-  env | sort | grep -E '^(DEVICE|CUDA_VISIBLE_DEVICES|OPENBLAS_NUM_THREADS|OMP_NUM_THREADS|TEMPORAL_FOREST_)=' || true
+  env | sort | grep -E '^(DATASET|DEVICE|FOREST_SAMPLES|CUDA_VISIBLE_DEVICES|OPENBLAS_NUM_THREADS|OMP_NUM_THREADS|TEMPORAL_FOREST_)=' || true
 } > "${OUT_DIR}/code_info/environment.txt"
 
-"${PYTHON_BIN}" - "${OUT_DIR}/code_info/common_config.json" "${ROOT_DIR}" "${ASSET_ROOT:-}" <<'PY'
+"${PYTHON_BIN}" - "${OUT_DIR}/code_info/common_config.json" "${ROOT_DIR}" "${ASSET_ROOT:-}" "${DATASET_ARG}" "${FOREST_SAMPLES_ARG}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -70,6 +72,8 @@ from pathlib import Path
 path = Path(sys.argv[1])
 root = Path(sys.argv[2])
 explicit = Path(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+dataset = sys.argv[4]
+forest_samples = int(sys.argv[5])
 server_root = Path("/mnt/data/lin-lab/lmx/projects/my_project/ETGC")
 asset_root = next(
     (candidate for candidate in [explicit, root, server_root] if candidate and (candidate / "dataset/school/school.txt").exists()),
@@ -78,7 +82,7 @@ asset_root = next(
 common = {
     "method": "ETGC",
     "purpose": "loss formulation validation with fixed C6 configuration",
-    "dataset": "school",
+    "dataset": dataset,
     "seeds": [42, 43],
     "epoch": 20,
     "fixed_configuration": {
@@ -94,7 +98,7 @@ common = {
         "prototype_sample_size": 20000,
         "prototype_lloyd_iters": 10,
         "edge_ppr_method": "temporal_state_forest",
-        "forest_samples": 5,
+        "forest_samples": forest_samples,
         "forest_seed": 20260725,
         "edge_neighbor_k": -1,
         "edge_ppr_topk": -1,
@@ -126,7 +130,7 @@ PY
 
 printf 'loss_formulation_out_dir=%s\n' "${OUT_DIR}"
 
-"${PYTHON_BIN}" - "${ROOT_DIR}" "${OUT_DIR}" "${PYTHON_BIN}" "${DEVICE_ARG}" "${RESUME}" "${ASSET_ROOT:-}" <<'PY'
+"${PYTHON_BIN}" - "${ROOT_DIR}" "${OUT_DIR}" "${PYTHON_BIN}" "${DEVICE_ARG}" "${RESUME}" "${ASSET_ROOT:-}" "${DATASET_ARG}" "${FOREST_SAMPLES_ARG}" <<'PY'
 import json
 import shutil
 import subprocess
@@ -140,6 +144,8 @@ python_bin = sys.argv[3]
 device = sys.argv[4]
 resume = bool(int(sys.argv[5]))
 explicit_asset_root = Path(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[6] else None
+dataset = sys.argv[7]
+forest_samples = int(sys.argv[8])
 server_asset_root = Path("/mnt/data/lin-lab/lmx/projects/my_project/ETGC")
 asset_root = next(
     (candidate for candidate in [explicit_asset_root, root, server_asset_root] if candidate and (candidate / "dataset/school/school.txt").exists()),
@@ -193,7 +199,7 @@ def cleanup(run_dir):
 
 def command(loss_type, orth_type, seed, run_dir):
     args = {
-        "dataset": "school",
+        "dataset": dataset,
         "directed": 0,
         "device": device,
         "seed": seed,
@@ -221,7 +227,7 @@ def command(loss_type, orth_type, seed, run_dir):
         "edge_ppr_topk": -1,
         "affinity_sparsify": "symmetric_union_knn",
         "edge_ppr_method": "temporal_state_forest",
-        "forest_samples": 5,
+        "forest_samples": forest_samples,
         "ncut_scope": "global",
         "cluster_loss_type": loss_type,
         "orth_type": orth_type,

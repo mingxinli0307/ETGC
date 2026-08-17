@@ -25,6 +25,7 @@ RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/logs/rank1_cause_validation/${RUN_TIMESTAMP}}"
 CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-${ROOT_DIR}/logs/trace_mincut_global/20260724_002532/phase1_diagnosis}"
 DEVICE_ARG="${DEVICE:-cuda:0}"
+FOREST_SAMPLES_ARG="${FOREST_SAMPLES:-5}"
 RESUME=1
 
 while [[ $# -gt 0 ]]; do
@@ -63,10 +64,10 @@ try:
 except Exception as exc:
     print("torch_probe_error=" + repr(exc))
 PY
-  env | sort | grep -E '^(DEVICE|CUDA_VISIBLE_DEVICES|OPENBLAS_NUM_THREADS|OMP_NUM_THREADS|TEMPORAL_FOREST_)=' || true
+  env | sort | grep -E '^(DEVICE|FOREST_SAMPLES|CUDA_VISIBLE_DEVICES|OPENBLAS_NUM_THREADS|OMP_NUM_THREADS|TEMPORAL_FOREST_)=' || true
 } > "${OUT_DIR}/code_info/environment.txt"
 
-"${PYTHON_BIN}" - "${OUT_DIR}/code_info/common_config.json" "${ROOT_DIR}" "${ASSET_ROOT:-}" <<'PY'
+"${PYTHON_BIN}" - "${OUT_DIR}/code_info/common_config.json" "${ROOT_DIR}" "${ASSET_ROOT:-}" "${FOREST_SAMPLES_ARG}" <<'PY'
 import json
 import os
 import sys
@@ -75,6 +76,7 @@ from pathlib import Path
 path = sys.argv[1]
 root = Path(sys.argv[2])
 explicit_asset_root = Path(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+forest_samples = int(sys.argv[4])
 server_asset_root = Path("/mnt/data/lin-lab/lmx/projects/my_project/ETGC")
 asset_candidates = [p for p in [explicit_asset_root, root, server_asset_root] if p is not None]
 asset_root = next((p for p in asset_candidates if (p / "dataset" / "school" / "school.txt").exists()), root)
@@ -99,6 +101,7 @@ common = {
     "node_emb_mode": "frozen",
     "global_warmup_epochs": 0,
     "prox_warmup_epochs": 0,
+    "forest_samples": forest_samples,
     "uniform_collapse_diagnostic": 1,
     "diagnostic_only_first_epoch": 0,
     "save_embeddings": 0,
@@ -117,7 +120,7 @@ PY
 printf 'launcher_out_dir=%s\n' "${OUT_DIR}" | tee "${OUT_DIR}/launcher.log"
 printf 'config_source_dir=%s\n' "${CONFIG_SOURCE_DIR}" | tee -a "${OUT_DIR}/launcher.log"
 
-"${PYTHON_BIN}" - "${ROOT_DIR}" "${OUT_DIR}" "${CONFIG_SOURCE_DIR}" "${PYTHON_BIN}" "${DEVICE_ARG}" "${RESUME}" "${ASSET_ROOT:-}" <<'PY' 2>&1 | tee -a "${OUT_DIR}/launcher.log"
+"${PYTHON_BIN}" - "${ROOT_DIR}" "${OUT_DIR}" "${CONFIG_SOURCE_DIR}" "${PYTHON_BIN}" "${DEVICE_ARG}" "${RESUME}" "${ASSET_ROOT:-}" "${FOREST_SAMPLES_ARG}" <<'PY' 2>&1 | tee -a "${OUT_DIR}/launcher.log"
 import csv
 import json
 import math
@@ -135,6 +138,7 @@ python_bin = sys.argv[4]
 device = sys.argv[5]
 resume = bool(int(sys.argv[6]))
 explicit_asset_root = Path(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else None
+forest_samples = int(sys.argv[8])
 server_asset_root = Path("/mnt/data/lin-lab/lmx/projects/my_project/ETGC")
 
 
@@ -204,6 +208,7 @@ def load_source_config(seed):
         cfg.setdefault(key, value)
     cfg["dataset"] = "school"
     cfg["seed"] = int(seed)
+    cfg["forest_samples"] = forest_samples
     return cfg
 
 

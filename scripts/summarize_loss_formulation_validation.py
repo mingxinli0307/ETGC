@@ -112,6 +112,7 @@ def main():
     args = parser.parse_args()
     out_dir = Path(args.output_dir).resolve()
     reference_dir = Path(args.c6_reference_dir).resolve() if args.c6_reference_dir else None
+    common_config = read_json(out_dir / "code_info" / "common_config.json")
 
     combined_fields = [
         "loss_config", "seed", "epoch", "cluster_loss_type", "orth_type",
@@ -287,7 +288,7 @@ def main():
     lines = [
         "# ETGC Loss Formulation Validation",
         "",
-        "Scope: School only, seeds 42/43, 20 epochs, fixed C6 representation/head/initialization.",
+        f"Scope: {common_config.get('dataset', 'school')}, seeds 42/43, 20 epochs, fixed C6 representation/head/initialization.",
         "",
         "## Initialization Fairness",
         "",
@@ -359,7 +360,7 @@ def main():
             f"7. Best degree-weighted volume balance: {best_volume}.",
             "8. Low-margin risk runs: " + (", ".join(low_margin) if low_margin else "none at normalized-margin < 0.01"),
             "9. Matrix Ncut conditioning is reported per seed above; non-finite solves or extreme condition numbers must block selection.",
-            "10. Can matrix_ncut + orthqa be fixed as the formal ETGC objective: not yet. This single-dataset two-seed ablation can select the next candidate, not establish a formal all-dataset objective.",
+            "10. Can matrix_ncut + orthqa be fixed as the formal ETGC objective: not yet. This per-dataset two-seed ablation can select the next candidate, not establish a formal all-dataset objective.",
             "",
             "## Files",
             f"- combined_summary.csv: {out_dir / 'combined_summary.csv'}",
