@@ -91,11 +91,11 @@ def copy_reference(reference_dir, seed, run_dir):
     cleanup(run_dir)
 
 
-def command(args, seed, run_dir, prototype_seed=None, epoch=20, init_only=False):
+def command(args, seed, run_dir, prototype_seed=None, epoch=20, init_only=False, dataset="school"):
     if prototype_seed is None:
         prototype_seed = seed
     values = {
-        "dataset": "school", "directed": 0, "device": args.device,
+        "dataset": dataset, "directed": 0, "device": args.device,
         "seed": seed, "model_seed": seed, "prototype_seed": prototype_seed, "forest_seed": 20260725,
         "data_root": str(args.asset_root / "dataset"), "emb_root": str(args.asset_root / "emb"),
         "pretrain_emb_dir": str(args.asset_root / "pretrain"), "cache_dir": str(args.asset_root / "cache"),
