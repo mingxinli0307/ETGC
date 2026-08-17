@@ -128,6 +128,27 @@ def test_matrix_ncut_matches_dense_reference_and_backward():
     assert torch.isfinite(penalty).all()
 
 
+def test_matrix_ncut_rank_deficient_float32_q_uses_finite_regularized_solve():
+    Q = torch.full((4, 2), 0.5, dtype=torch.float32, requires_grad=True)
+    degree = np.ones(4, dtype=np.float32)
+    W = sp.csr_matrix((4, 4), dtype=np.float32)
+    total, ncut, penalty = edge_matrix_ncut_loss_global(
+        Q,
+        W,
+        degree,
+        2,
+        lambda_orth=1.0,
+        eps=1e-8,
+        orth_type="orth",
+    )
+    assert torch.isfinite(total)
+    assert torch.isfinite(ncut)
+    assert torch.isfinite(penalty)
+    total.backward()
+    assert Q.grad is not None
+    assert torch.isfinite(Q.grad).all()
+
+
 def test_symmetric_union_knn_semantics_and_degree_after_sparsification():
     W = sp.csr_matrix(
         np.array(

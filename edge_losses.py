@@ -189,8 +189,21 @@ def edge_matrix_ncut_loss_global(
     eye = torch.eye(k, dtype=Q_all.dtype, device=Q_all.device)
     A = Q_all.t().mm(DQ) + float(eps) * eye
     B = Q_all.t().mm(DQ - WQ)
-    X = torch.linalg.solve(A, B)
-    ncut_loss = torch.trace(X)
+    solve_precision_fallback = False
+    try:
+        X = torch.linalg.solve(A, B)
+        ncut_loss = torch.trace(X)
+    except torch.linalg.LinAlgError:
+        if Q_all.dtype not in {torch.float16, torch.bfloat16, torch.float32} or float(eps) <= 0.0:
+            raise
+        solve_precision_fallback = True
+        Q_solve = Q_all.to(dtype=torch.float64)
+        DQ_solve = degree_t.to(dtype=torch.float64).unsqueeze(1) * Q_solve
+        A_solve = Q_solve.t().mm(DQ_solve) + float(eps) * torch.eye(
+            k, dtype=torch.float64, device=Q_all.device
+        )
+        B_solve = Q_solve.t().mm(DQ_solve - WQ.to(dtype=torch.float64))
+        ncut_loss = torch.trace(torch.linalg.solve(A_solve, B_solve)).to(dtype=Q_all.dtype)
     selected_orth_type = str(orth_type).lower()
     if selected_orth_type == "orth":
         penalty_loss = trace_mincut_orthogonality_loss(Q_all, int(K), eps=float(eps))
@@ -212,6 +225,7 @@ def edge_matrix_ncut_loss_global(
         "ncut_loss": float(ncut_loss.detach().cpu()),
         "penalty_loss": float(penalty_loss.detach().cpu()),
         "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
+        "solve_precision_fallback": solve_precision_fallback,
     }
     _check_scalar_finite("matrix_ncut loss", ncut_loss, stats)
     _check_scalar_finite("matrix_ncut penalty", penalty_loss, stats)
