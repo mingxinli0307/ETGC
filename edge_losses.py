@@ -39,6 +39,52 @@ def _as_degree_tensor(degree, Q_all: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(degree_np).to(device=Q_all.device, dtype=Q_all.dtype)
 
 
+def matrix_ncut_qtdq_diagnostics(
+    Q_all: torch.Tensor,
+    degree,
+    eps: float = 1e-8,
+) -> dict:
+    """Return read-only conditioning diagnostics for the matrix-Ncut solve matrix."""
+    if Q_all.dim() != 2:
+        raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
+    degree_t = _as_degree_tensor(degree, Q_all)
+    if int(degree_t.numel()) != int(Q_all.size(0)):
+        raise ValueError(
+            f"degree length={degree_t.numel()} does not match Q_all rows={Q_all.size(0)}"
+        )
+    k = int(Q_all.size(1))
+    q_diag = Q_all.detach().to(dtype=torch.float64)
+    degree_diag = degree_t.detach().to(dtype=torch.float64)
+    qtdq = q_diag.t().mm(degree_diag.unsqueeze(1) * q_diag)
+    qtdq = 0.5 * (qtdq + qtdq.t())
+    solve_matrix = qtdq + float(eps) * torch.eye(
+        k,
+        dtype=qtdq.dtype,
+        device=Q_all.device,
+    )
+    eigvals = torch.linalg.eigvalsh(qtdq)
+    regularized_eigvals = torch.linalg.eigvalsh(solve_matrix)
+    finite = bool(torch.isfinite(eigvals).all())
+    min_eig = float(eigvals.min().detach().cpu()) if eigvals.numel() else 0.0
+    max_eig = float(eigvals.max().detach().cpu()) if eigvals.numel() else 0.0
+    condition = max_eig / min_eig if finite and min_eig > 0.0 else float("inf")
+    regularized_min = float(regularized_eigvals.min().detach().cpu()) if regularized_eigvals.numel() else 0.0
+    regularized_max = float(regularized_eigvals.max().detach().cpu()) if regularized_eigvals.numel() else 0.0
+    regularized_condition = (
+        regularized_max / regularized_min
+        if bool(torch.isfinite(regularized_eigvals).all()) and regularized_min > 0.0
+        else float("inf")
+    )
+    return {
+        "qtdq_min_eigenvalue": min_eig,
+        "qtdq_max_eigenvalue": max_eig,
+        "qtdq_condition_number": condition,
+        "qtdq_regularized_condition_number": regularized_condition,
+        "qtdq_eigenvalues_finite": finite,
+        "qtdq_regularization_eps": float(eps),
+    }
+
+
 def _check_scalar_finite(name: str, value: torch.Tensor, stats: dict) -> None:
     if not torch.isfinite(value).all():
         details = ", ".join(f"{k}={v}" for k, v in stats.items())

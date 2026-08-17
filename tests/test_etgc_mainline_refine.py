@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -227,6 +229,78 @@ def test_direct_slice_forward_matches_id_gather(tmp_path):
     assert torch.max(torch.abs(logits_id - logits_slice)) < 1e-6
 
 
+def test_loss_formulation_diagnostic_records_each_epoch_and_matrix_conditioning(tmp_path):
+    data_dir = tmp_path / "dataset" / "toy"
+    data_dir.mkdir(parents=True)
+    (data_dir / "toy.txt").write_text(
+        "0 1 0.0\n1 2 0.2\n2 3 0.4\n3 0 0.6\n0 2 0.8\n1 3 1.0\n",
+        encoding="utf-8",
+    )
+    (data_dir / "node2label.txt").write_text("0 0\n1 0\n2 1\n3 1\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    args = build_parser().parse_args(
+        [
+            "--dataset", "toy",
+            "--data_root", str(tmp_path / "dataset"),
+            "--cache_dir", str(tmp_path / "cache"),
+            "--output_dir", str(output_dir),
+            "--diagnostic_output_dir", str(output_dir),
+            "--epoch", "1",
+            "--edge_ppr_method", "truncated",
+            "--edge_ppr_topk", "-1",
+            "--time_dim", "5",
+            "--edge_dim", "4",
+            "--edge_hidden_dim", "6",
+            "--cluster_hidden_dim", "4",
+            "--time_feature_mode", "history",
+            "--edge_encoder_mode", "mlp",
+            "--cluster_head_type", "legacy_mlp",
+            "--cluster_output_bias_mode", "zero",
+            "--cluster_input_norm", "layernorm",
+            "--cluster_init_mode", "prototype",
+            "--prototype_sample_size", "6",
+            "--prototype_lloyd_iters", "1",
+            "--cluster_loss_type", "matrix_ncut",
+            "--orth_type", "orthqa",
+            "--node_emb_mode", "frozen",
+            "--lambda_prox", "0",
+            "--lambda_proj", "0",
+            "--lambda_bal", "0",
+            "--prox_warmup_epochs", "0",
+            "--loss_formulation_diagnostic", "1",
+            "--diagnostic_epochs", "1",
+            "--uniform_collapse_diagnostic", "1",
+            "--diagnostic_only_first_epoch", "0",
+            "--quiet", "1",
+        ]
+    )
+    args.model_seed = args.seed
+    args.prototype_seed = args.seed
+    args.forest_seed = args.seed
+    trainer = EdgeHiNoSTrainer(args)
+    trainer.write_config_json()
+    best_epoch, best_metrics = trainer.train()
+    trainer.write_result_json(best_epoch, best_metrics, trainer.final_metrics, runtime_seconds=0.0)
+
+    diagnostic = json.loads((output_dir / "diagnostic.json").read_text(encoding="utf-8"))
+    epoch_stage = diagnostic["stages"]["epoch_1"]
+    assert epoch_stage["q_centered_to_total_energy_ratio"] >= 0.0
+    assert epoch_stage["q_normalized_margin_mean"] >= 0.0
+    assert len(epoch_stage["cluster_soft_volume_k"]) == 2
+    assert np.isfinite(epoch_stage["qtdq_condition_number"])
+    assert epoch_stage["matrix_ncut_solve_finite"] is True
+    assert "orth_original_value" in epoch_stage
+    assert "orthqa_value" in epoch_stage
+
+    with (output_dir / "metrics.csv").open("r", encoding="utf-8", newline="") as reader:
+        rows = list(csv.DictReader(reader))
+    assert len(rows) == 1
+    assert rows[0]["q_centered_to_total_energy_ratio"] != ""
+    assert rows[0]["q_normalized_margin_mean"] != ""
+    assert rows[0]["cluster_volume_cv"] != ""
+    assert rows[0]["qtdq_condition_number"] != ""
+
+
 def test_formal_default_configuration():
     args = build_parser().parse_args([])
     assert args.time_feature_mode == "current"
@@ -239,3 +313,4 @@ def test_formal_default_configuration():
     assert args.lambda_proj == 0.0
     assert args.lambda_node_anchor == 0.0
     assert args.prox_similarity_mode == "cosine"
+    assert args.loss_formulation_diagnostic == 0

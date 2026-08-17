@@ -19,6 +19,7 @@ from edge_losses import (
     edge_ppr_proximity_loss,
     edge_matrix_ncut_loss_global,
     edge_trace_mincut_loss_global,
+    matrix_ncut_qtdq_diagnostics,
     node_embedding_anchor_loss,
     projection_loss,
     projection_loss_global,
@@ -270,7 +271,12 @@ class EdgeHiNoSTrainer:
         self.epoch_records = []
         self.best_epoch_record = None
         self.overnight_diagnostic = bool(int(getattr(args, "overnight_diagnostic", 0)))
-        self.uniform_collapse_diagnostic = bool(int(getattr(args, "uniform_collapse_diagnostic", 0))) or self.overnight_diagnostic
+        self.loss_formulation_diagnostic = bool(int(getattr(args, "loss_formulation_diagnostic", 0)))
+        self.uniform_collapse_diagnostic = (
+            bool(int(getattr(args, "uniform_collapse_diagnostic", 0)))
+            or self.overnight_diagnostic
+            or self.loss_formulation_diagnostic
+        )
         self.diagnostic_only_first_epoch = bool(int(getattr(args, "diagnostic_only_first_epoch", 1)))
         self.uniform_diag_dir = self._resolve_uniform_diag_dir()
         self.uniform_diag_stages = {}
@@ -832,6 +838,14 @@ class EdgeHiNoSTrainer:
                     row_block_size=int(self.args.global_ncut_row_block_size),
                     orth_type="orth",
                 )
+                extra.update(
+                    matrix_ncut_qtdq_diagnostics(
+                        q_all,
+                        degree_t,
+                        eps=1e-8,
+                    )
+                )
+                extra["matrix_ncut_solve_finite"] = bool(torch.isfinite(cut_loss).all())
             else:
                 _, cut_loss, orth_original = edge_trace_mincut_loss_global(
                     q_all,
@@ -846,6 +860,8 @@ class EdgeHiNoSTrainer:
         extra["cut_loss"] = float(cut_loss.detach().cpu())
         extra["orth_original_loss"] = float(orth_original.detach().cpu())
         extra["orthqa_loss"] = float(orthqa_loss.detach().cpu())
+        extra["orth_original_value"] = extra["orth_original_loss"]
+        extra["orthqa_value"] = extra["orthqa_loss"]
         extra["selected_penalty_loss"] = (
             extra["orthqa_loss"] if selected == "orthqa" else extra["orth_original_loss"]
         )
@@ -1032,7 +1048,9 @@ class EdgeHiNoSTrainer:
             edge_repr_all=edge_repr_all,
             cluster_input_all=cluster_input_all,
             labels=torch.from_numpy(self.data.labels).long().to(self.device),
-            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all)
+            if (self.overnight_diagnostic or self.loss_formulation_diagnostic)
+            else self._current_cluster_output_stats(),
         )
         stats.update(self._independent_gradient_diagnostics(stage_name))
         self.uniform_diag_stages[stage_name] = stats
@@ -1075,7 +1093,9 @@ class EdgeHiNoSTrainer:
             cut_loss=cut_loss,
             orth_loss=orth_loss,
             grad_stats=grad_stats,
-            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all)
+            if (self.overnight_diagnostic or self.loss_formulation_diagnostic)
+            else self._current_cluster_output_stats(),
         )
         stats.update(self._independent_gradient_diagnostics(stage_name))
         self.uniform_diag_stages[stage_name] = stats
@@ -1099,7 +1119,9 @@ class EdgeHiNoSTrainer:
             edge_repr_all=edge_repr_all,
             cluster_input_all=cluster_input_all,
             labels=torch.from_numpy(self.data.labels).long().to(self.device),
-            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all) if self.overnight_diagnostic else self._current_cluster_output_stats(),
+            extra_stats=self._overnight_stage_extra_stats(q_all, edge_repr_all=edge_repr_all)
+            if (self.overnight_diagnostic or self.loss_formulation_diagnostic)
+            else self._current_cluster_output_stats(),
         )
         stats.update(self._independent_gradient_diagnostics("after_first_global_update"))
         self.uniform_diag_stages["after_first_global_update"] = stats
@@ -1318,6 +1340,8 @@ class EdgeHiNoSTrainer:
             "orth_loss",
             "orth_original_loss",
             "orthqa_loss",
+            "orth_original_value",
+            "orthqa_value",
             "selected_penalty_loss",
             "penalty_type",
             "penalty_weight",
@@ -1342,13 +1366,32 @@ class EdgeHiNoSTrainer:
             "node_hard_active_clusters",
             "node_hard_largest_ratio",
             "q_rank1_energy_ratio",
+            "q_second_energy_ratio",
             "q_effective_rank",
+            "q_numerical_rank",
             "q_centered_energy",
+            "q_centered_to_total_energy_ratio",
             "q_centered_effective_rank",
+            "q_centered_numerical_rank",
             "q_margin_mean",
             "q_margin_p99",
+            "q_normalized_margin_mean",
+            "q_normalized_margin_median",
+            "q_normalized_margin_p90",
+            "q_normalized_margin_p99",
+            "q_entropy",
+            "q_entropy_gap",
+            "q_uniform_l2_mean",
             "cluster_volume_coefficient_of_variation",
+            "cluster_volume_cv",
+            "cluster_volume_max_ratio",
+            "cluster_volume_min_ratio",
+            "cluster_volume_entropy",
             "hard_cluster_volume_cv",
+            "qtdq_min_eigenvalue",
+            "qtdq_max_eigenvalue",
+            "qtdq_condition_number",
+            "matrix_ncut_solve_finite",
             "logits_bias_to_event_variation_ratio",
             "edge_encoder_mode",
             "direct_time_scale",
@@ -1816,7 +1859,7 @@ class EdgeHiNoSTrainer:
             epoch_seconds = time.time() - epoch_start
             total_runtime_seconds = time.time() - total_start
             stage_stats_for_epoch = {}
-            if self.overnight_diagnostic and epoch in self.diagnostic_epochs:
+            if (self.overnight_diagnostic or self.loss_formulation_diagnostic) and epoch in self.diagnostic_epochs:
                 self._record_uniform_stage_no_grad(f"epoch_{epoch}")
                 stage_stats_for_epoch = self.uniform_diag_stages.get(f"epoch_{epoch}", {})
             record = {
@@ -1827,8 +1870,10 @@ class EdgeHiNoSTrainer:
                 "Macro_F1": metrics.get("Macro_F1", 0.0),
                 "cut_loss": cut_loss_value,
                 "orth_loss": orth_loss_value,
-                "orth_original_loss": orth_original_loss_value,
-                "orthqa_loss": orthqa_loss_value,
+                "orth_original_loss": stage_stats_for_epoch.get("orth_original_loss", orth_original_loss_value),
+                "orthqa_loss": stage_stats_for_epoch.get("orthqa_loss", orthqa_loss_value),
+                "orth_original_value": stage_stats_for_epoch.get("orth_original_value", ""),
+                "orthqa_value": stage_stats_for_epoch.get("orthqa_value", ""),
                 "selected_penalty_loss": orth_loss_value,
                 "penalty_type": str(getattr(self.args, "orth_type", "orth")).lower(),
                 "penalty_weight": float(getattr(self.args, "lambda_orth", 1.0)),
@@ -1853,13 +1898,32 @@ class EdgeHiNoSTrainer:
                 "node_hard_active_clusters": stage_stats_for_epoch.get("num_active_node_clusters", metrics.get("node_hard_active_clusters", "")),
                 "node_hard_largest_ratio": stage_stats_for_epoch.get("largest_node_cluster_ratio", metrics.get("node_hard_largest_ratio", "")),
                 "q_rank1_energy_ratio": stage_stats_for_epoch.get("q_rank1_energy_ratio", ""),
+                "q_second_energy_ratio": stage_stats_for_epoch.get("q_second_energy_ratio", ""),
                 "q_effective_rank": stage_stats_for_epoch.get("q_effective_rank", ""),
+                "q_numerical_rank": stage_stats_for_epoch.get("q_numerical_rank", ""),
                 "q_centered_energy": stage_stats_for_epoch.get("q_centered_energy", ""),
+                "q_centered_to_total_energy_ratio": stage_stats_for_epoch.get("q_centered_to_total_energy_ratio", ""),
                 "q_centered_effective_rank": stage_stats_for_epoch.get("q_centered_effective_rank", ""),
+                "q_centered_numerical_rank": stage_stats_for_epoch.get("q_centered_numerical_rank", ""),
                 "q_margin_mean": stage_stats_for_epoch.get("q_margin_mean", ""),
                 "q_margin_p99": stage_stats_for_epoch.get("q_margin_p99", ""),
+                "q_normalized_margin_mean": stage_stats_for_epoch.get("q_normalized_margin_mean", ""),
+                "q_normalized_margin_median": stage_stats_for_epoch.get("q_normalized_margin_median", ""),
+                "q_normalized_margin_p90": stage_stats_for_epoch.get("q_normalized_margin_p90", ""),
+                "q_normalized_margin_p99": stage_stats_for_epoch.get("q_normalized_margin_p99", ""),
+                "q_entropy": stage_stats_for_epoch.get("q_entropy", metrics.get("Q_mean_entropy", "")),
+                "q_entropy_gap": stage_stats_for_epoch.get("q_entropy_gap", ""),
+                "q_uniform_l2_mean": stage_stats_for_epoch.get("q_uniform_l2_mean", ""),
                 "cluster_volume_coefficient_of_variation": stage_stats_for_epoch.get("cluster_volume_coefficient_of_variation", ""),
+                "cluster_volume_cv": stage_stats_for_epoch.get("cluster_volume_cv", ""),
+                "cluster_volume_max_ratio": stage_stats_for_epoch.get("cluster_volume_max_ratio", ""),
+                "cluster_volume_min_ratio": stage_stats_for_epoch.get("cluster_volume_min_ratio", ""),
+                "cluster_volume_entropy": stage_stats_for_epoch.get("cluster_volume_entropy", ""),
                 "hard_cluster_volume_cv": stage_stats_for_epoch.get("hard_cluster_volume_cv", ""),
+                "qtdq_min_eigenvalue": stage_stats_for_epoch.get("qtdq_min_eigenvalue", ""),
+                "qtdq_max_eigenvalue": stage_stats_for_epoch.get("qtdq_max_eigenvalue", ""),
+                "qtdq_condition_number": stage_stats_for_epoch.get("qtdq_condition_number", ""),
+                "matrix_ncut_solve_finite": stage_stats_for_epoch.get("matrix_ncut_solve_finite", ""),
                 "logits_bias_to_event_variation_ratio": stage_stats_for_epoch.get("logits_bias_to_event_variation_ratio", ""),
                 "edge_encoder_mode": self.edge_encoder_mode,
                 "direct_time_scale": float(self.direct_time_scale),
@@ -1912,6 +1976,18 @@ class EdgeHiNoSTrainer:
                     record[f"{prefix}_{key_name}"] = stage_metrics.get(key_name, "")
             self._append_epoch_record(record)
 
+            loss_diag_text = ""
+            if self.loss_formulation_diagnostic:
+                loss_diag_text = (
+                    f" rank1={record['q_rank1_energy_ratio']:.6g}"
+                    f" center_ratio={record['q_centered_to_total_energy_ratio']:.6g}"
+                    f" effective_rank={record['q_effective_rank']:.6g}"
+                    f" norm_margin={record['q_normalized_margin_mean']:.6g}"
+                    f" volume_cv={record['cluster_volume_cv']:.6g}"
+                )
+                if record["qtdq_condition_number"] != "":
+                    loss_diag_text += f" qtdq_condition={record['qtdq_condition_number']:.6g}"
+
             if diagnostic:
                 print(
                     f"epoch={epoch} before_f1={record.get('before_Macro_F1', 0.0):.4f} "
@@ -1928,7 +2004,7 @@ class EdgeHiNoSTrainer:
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
                     f"cluster_backward_seconds={cluster_backward_seconds:.4f} "
                     f"epoch_seconds={epoch_seconds:.4f} peak_gpu_memory_mb={peak_gpu_memory_mb:.2f} "
-                    f"global_q_forwards={global_q_forwards}"
+                    f"global_q_forwards={global_q_forwards}{loss_diag_text}"
                 )
             else:
                 print(
@@ -1946,7 +2022,7 @@ class EdgeHiNoSTrainer:
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
                     f"cluster_backward_seconds={cluster_backward_seconds:.4f} "
                     f"epoch_seconds={epoch_seconds:.4f} peak_gpu_memory_mb={peak_gpu_memory_mb:.2f} "
-                    f"global_q_forwards={global_q_forwards}"
+                    f"global_q_forwards={global_q_forwards}{loss_diag_text}"
                 )
         self._record_uniform_final_epoch()
         self.best_metrics_for_result = best_metrics or {}

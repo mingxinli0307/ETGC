@@ -69,9 +69,11 @@ def q_margin_statistics(Q: torch.Tensor) -> dict:
     Q = Q.detach()
     if Q.size(1) < 2:
         margins = torch.zeros((Q.size(0),), dtype=Q.dtype, device=Q.device)
+        normalized_margins = torch.zeros_like(margins)
     else:
         top2 = torch.topk(Q, k=2, dim=1).values
         margins = top2[:, 0] - top2[:, 1]
+        normalized_margins = margins / top2[:, 0].clamp_min(EPS)
     stats = {
         "q_margin_mean": _float(margins.mean()) if margins.numel() else 0.0,
         "q_margin_std": _float(margins.std(unbiased=False)) if margins.numel() else 0.0,
@@ -83,6 +85,10 @@ def q_margin_statistics(Q: torch.Tensor) -> dict:
         "q_margin_p90": _quantile(margins, 0.90),
         "q_margin_p95": _quantile(margins, 0.95),
         "q_margin_p99": _quantile(margins, 0.99),
+        "q_normalized_margin_mean": _float(normalized_margins.mean()) if normalized_margins.numel() else 0.0,
+        "q_normalized_margin_median": _quantile(normalized_margins, 0.50),
+        "q_normalized_margin_p90": _quantile(normalized_margins, 0.90),
+        "q_normalized_margin_p99": _quantile(normalized_margins, 0.99),
         "q_margin_lt_1e_6_ratio": _float((margins < 1e-6).float().mean()) if margins.numel() else 0.0,
         "q_margin_lt_1e_5_ratio": _float((margins < 1e-5).float().mean()) if margins.numel() else 0.0,
         "q_margin_lt_1e_4_ratio": _float((margins < 1e-4).float().mean()) if margins.numel() else 0.0,
@@ -154,6 +160,7 @@ def q_uniform_distance_statistics(Q: torch.Tensor, eps: float = EPS) -> dict:
         "q_uniform_max_abs": _float(diff.abs().max()) if diff.numel() else 0.0,
         "q_uniform_kl_mean": _float(kl.mean()) if kl.numel() else 0.0,
         "q_entropy_mean": entropy_mean,
+        "q_entropy": entropy_mean,
         "q_entropy_max": entropy_max,
         "q_entropy_gap": entropy_max - entropy_mean,
     }
@@ -169,6 +176,7 @@ def q_rank_statistics(Q: torch.Tensor, eps: float = EPS) -> dict:
             "q_effective_rank": 0.0,
             "q_numerical_rank": 0,
             "q_centered_energy": 0.0,
+            "q_centered_to_total_energy_ratio": 0.0,
             "q_centered_effective_rank": 0.0,
             "q_centered_numerical_rank": 0,
         }
@@ -201,6 +209,7 @@ def q_rank_statistics(Q: torch.Tensor, eps: float = EPS) -> dict:
         "q_effective_rank": _float(effective_rank),
         "q_numerical_rank": numerical_rank,
         "q_centered_energy": _float(centered_energy),
+        "q_centered_to_total_energy_ratio": _float(centered_energy / total),
         "q_centered_effective_rank": centered_effective_rank,
         "q_centered_numerical_rank": centered_numerical_rank,
     }
@@ -218,6 +227,7 @@ def cluster_volume_statistics(Q: torch.Tensor, degree: torch.Tensor, eps: float 
         raise ValueError(f"degree length={degree.numel()} does not match Q rows={Q.size(0)}")
     volume = (degree.unsqueeze(1) * Q).sum(dim=0)
     volume_ratio = volume / volume.sum().clamp_min(float(eps))
+    volume_entropy = -(volume_ratio * torch.log(volume_ratio.clamp_min(float(eps)))).sum()
     hard = torch.argmax(Q, dim=1)
     hard_volume = torch.zeros((Q.size(1),), dtype=Q.dtype, device=Q.device)
     hard_volume.index_add_(0, hard.long(), degree)
@@ -228,12 +238,18 @@ def cluster_volume_statistics(Q: torch.Tensor, degree: torch.Tensor, eps: float 
     margin = top1 - top2_value
     entropy = -(Q * torch.log(Q.clamp_min(float(eps)))).sum(dim=1)
     return {
+        "cluster_soft_volume_k": [float(x) for x in volume.detach().cpu().tolist()],
+        "cluster_soft_volume_ratio_k": [float(x) for x in volume_ratio.detach().cpu().tolist()],
         "cluster_volume_min_ratio": _float(volume_ratio.min()) if volume_ratio.numel() else 0.0,
         "cluster_volume_max_ratio": _float(volume_ratio.max()) if volume_ratio.numel() else 0.0,
         "cluster_volume_std": _float(volume_ratio.std(unbiased=False)) if volume_ratio.numel() else 0.0,
         "cluster_volume_coefficient_of_variation": _float(
             volume_ratio.std(unbiased=False) / volume_ratio.mean().clamp_min(float(eps))
         ) if volume_ratio.numel() else 0.0,
+        "cluster_volume_cv": _float(
+            volume_ratio.std(unbiased=False) / volume_ratio.mean().clamp_min(float(eps))
+        ) if volume_ratio.numel() else 0.0,
+        "cluster_volume_entropy": _float(volume_entropy) if volume_ratio.numel() else 0.0,
         "hard_cluster_volume_min_ratio": _float(hard_ratio.min()) if hard_ratio.numel() else 0.0,
         "hard_cluster_volume_max_ratio": _float(hard_ratio.max()) if hard_ratio.numel() else 0.0,
         "hard_cluster_volume_cv": _float(
@@ -549,6 +565,10 @@ SUMMARY_FIELDNAMES = [
     "q_margin_p50",
     "q_margin_p90",
     "q_margin_p99",
+    "q_normalized_margin_mean",
+    "q_normalized_margin_median",
+    "q_normalized_margin_p90",
+    "q_normalized_margin_p99",
     "q_margin_lt_1e4_ratio",
     "q_margin_lt_1e3_ratio",
     "q_margin_lt_1e2_ratio",
@@ -561,6 +581,8 @@ SUMMARY_FIELDNAMES = [
     "cluster_volume_max_ratio",
     "cluster_volume_std",
     "cluster_volume_coefficient_of_variation",
+    "cluster_volume_cv",
+    "cluster_volume_entropy",
     "hard_cluster_volume_min_ratio",
     "hard_cluster_volume_max_ratio",
     "hard_cluster_volume_cv",
@@ -573,12 +595,14 @@ SUMMARY_FIELDNAMES = [
     "q_uniform_max_abs",
     "q_uniform_kl_mean",
     "q_entropy_mean",
+    "q_entropy",
     "q_entropy_gap",
     "q_rank1_energy_ratio",
     "q_second_energy_ratio",
     "q_effective_rank",
     "q_numerical_rank",
     "q_centered_energy",
+    "q_centered_to_total_energy_ratio",
     "q_centered_effective_rank",
     "q_centered_numerical_rank",
     "feature_common_to_variation_ratio_before_norm",
@@ -627,6 +651,8 @@ SUMMARY_FIELDNAMES = [
     "orth_loss",
     "orth_original_loss",
     "orthqa_loss",
+    "orth_original_value",
+    "orthqa_value",
     "selected_penalty_loss",
     "penalty_type",
     "penalty_weight",
@@ -645,6 +671,10 @@ SUMMARY_FIELDNAMES = [
     "orth_grad_to_param_ratio",
     "cut_orth_grad_cosine",
     "cut_penalty_grad_cosine",
+    "qtdq_min_eigenvalue",
+    "qtdq_max_eigenvalue",
+    "qtdq_condition_number",
+    "matrix_ncut_solve_finite",
     "unweighted_proximity_loss",
     "weighted_proximity_loss",
     "node_anchor_loss",
