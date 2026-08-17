@@ -91,13 +91,15 @@ def copy_reference(reference_dir, seed, run_dir):
     cleanup(run_dir)
 
 
-def command(args, seed, run_dir):
+def command(args, seed, run_dir, prototype_seed=None, epoch=20, init_only=False):
+    if prototype_seed is None:
+        prototype_seed = seed
     values = {
         "dataset": "school", "directed": 0, "device": args.device,
-        "seed": seed, "model_seed": seed, "prototype_seed": seed, "forest_seed": 20260725,
+        "seed": seed, "model_seed": seed, "prototype_seed": prototype_seed, "forest_seed": 20260725,
         "data_root": str(args.asset_root / "dataset"), "emb_root": str(args.asset_root / "emb"),
         "pretrain_emb_dir": str(args.asset_root / "pretrain"), "cache_dir": str(args.asset_root / "cache"),
-        "batch_size": 512, "epoch": 20, "learning_rate": 1e-4,
+        "batch_size": 512, "epoch": epoch, "learning_rate": 1e-4,
         "edge_dim": 128, "time_dim": 32, "edge_hidden_dim": 128, "cluster_hidden_dim": 64,
         "time_feature_mode": "history", "edge_encoder_mode": "mlp", "cluster_head_type": "legacy_mlp",
         "alpha": 0.2, "T": 4, "beta": 5.0, "edge_neighbor_k": -1, "edge_ppr_topk": -1,
@@ -114,7 +116,7 @@ def command(args, seed, run_dir):
         "loss_formulation_diagnostic": 1, "diagnostic_epochs": ",".join(map(str, range(1, 21))),
         "diagnostic_stages": 0, "uniform_collapse_diagnostic": 1,
         "diagnostic_output_dir": str(run_dir), "diagnostic_only_first_epoch": 0,
-        "output_dir": str(run_dir), "eval_every": 1, "save_embeddings": 0,
+        "output_dir": str(run_dir), "eval_every": 1, "save_embeddings": 0, "init_only": int(init_only),
     }
     result = [args.python_bin, "edge_main.py"]
     for key, value in values.items():
