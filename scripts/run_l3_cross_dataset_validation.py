@@ -42,6 +42,7 @@ def run_one(args, dataset, seed, run_dir):
         cluster_loss_type="matrix_ncut",
         orth_type=args.orth_type,
         forest_samples=FOREST_SAMPLES,
+        cluster_head_type=args.cluster_head_type,
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
@@ -78,6 +79,7 @@ def result_row(dataset, seed, run_dir):
         "seed": seed,
         "cluster_loss_type": config.get("cluster_loss_type", "matrix_ncut"),
         "orth_type": config.get("orth_type", ""),
+        "cluster_head_type": config.get("cluster_head_type", ""),
         "forest_samples": config.get("forest_samples", FOREST_SAMPLES),
         "M": result.get("M", config.get("M", "")),
         "N": result.get("N", config.get("N", "")),
@@ -113,12 +115,13 @@ def result_row(dataset, seed, run_dir):
     }
 
 
-def write_report(output_dir, rows, datasets, orth_type):
+def write_report(output_dir, rows, datasets, orth_type, cluster_head_type):
     dataset_scope = ", ".join(datasets)
     report = [
         f"# ETGC Matrix-Ncut + {orth_type} Forest-50 Cross-Dataset Validation", "",
         f"Scope: {dataset_scope}; seeds 42/43; 20 epochs; fixed C6; "
-        f"matrix_ncut + {orth_type}; forest_samples=50; no legacy trace-ratio runs.", "",
+        f"matrix_ncut + {orth_type}; cluster_head_type={cluster_head_type}; "
+        "forest_samples=50; no legacy trace-ratio runs.", "",
         "| Dataset | Seed | K | Initial F1 | Best F1 | Best epoch | Final F1 | NMI | ARI | Final Rank1 | Center ratio | Eff rank | Norm margin | Edge active | Node active | QTDQ max | Runtime s |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -160,6 +163,7 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--datasets", default=",".join(DATASETS))
     parser.add_argument("--orth-type", choices=("orth", "orthqa"), default="orth")
+    parser.add_argument("--cluster-head-type", choices=("legacy_mlp", "cosine_prototype"), default="legacy_mlp")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
     args.root_dir = args.root_dir.resolve()
@@ -183,10 +187,14 @@ def main():
         encoding="utf-8",
     )
     common = {
-        "method": "ETGC", "purpose": f"matrix-Ncut + {args.orth_type} forest-50 cross-dataset validation",
+        "method": "ETGC", "purpose": (
+            f"matrix-Ncut + {args.orth_type} + {args.cluster_head_type} "
+            "forest-50 cross-dataset validation"
+        ),
         "datasets": datasets, "seeds": SEEDS, "epoch": 20,
         "forest_samples": FOREST_SAMPLES,
         "cluster_loss_type": "matrix_ncut", "orth_type": args.orth_type,
+        "cluster_head_type": args.cluster_head_type,
         "legacy_trace_ratio_enabled_in_experiment": False,
         "model_seed_equals_prototype_seed": True, "fixed_c6_configuration": True,
         "asset_root": str(args.asset_root), "save_embeddings": 0,
@@ -208,7 +216,7 @@ def main():
     rows = [result_row(dataset, seed, args.output_dir / dataset / f"seed{seed}") for dataset in datasets for seed in SEEDS]
     fields = list(rows[0].keys())
     write_csv(args.output_dir / "cross_dataset_comparison.csv", fields, rows)
-    write_report(args.output_dir, rows, datasets, args.orth_type)
+    write_report(args.output_dir, rows, datasets, args.orth_type, args.cluster_head_type)
     print(f"run_failures={failed}")
     print(f"comparison={args.output_dir / 'cross_dataset_comparison.csv'}")
     print(f"report={args.output_dir / 'diagnosis_report.md'}")

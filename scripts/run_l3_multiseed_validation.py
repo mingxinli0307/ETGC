@@ -102,6 +102,7 @@ def command(
     cluster_loss_type="matrix_ncut",
     orth_type="orth",
     forest_samples=5,
+    cluster_head_type="legacy_mlp",
 ):
     if prototype_seed is None:
         prototype_seed = seed
@@ -112,7 +113,7 @@ def command(
         "pretrain_emb_dir": str(args.asset_root / "pretrain"), "cache_dir": str(args.asset_root / "cache"),
         "batch_size": 512, "epoch": epoch, "learning_rate": 1e-4,
         "edge_dim": 128, "time_dim": 32, "edge_hidden_dim": 128, "cluster_hidden_dim": 64,
-        "time_feature_mode": "history", "edge_encoder_mode": "mlp", "cluster_head_type": "legacy_mlp",
+        "time_feature_mode": "history", "edge_encoder_mode": "mlp", "cluster_head_type": cluster_head_type,
         "alpha": 0.2, "T": 4, "beta": 5.0, "edge_neighbor_k": -1, "edge_ppr_topk": -1,
         "affinity_sparsify": "symmetric_union_knn", "edge_ppr_method": "temporal_state_forest",
         "forest_samples": int(forest_samples), "ncut_scope": "global", "cluster_loss_type": cluster_loss_type,
