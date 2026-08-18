@@ -56,7 +56,7 @@ def build_parser():
         choices=["temporal_state_forest", "forest", "legacy_temporal_forest", "truncated"],
         default="temporal_state_forest",
     )
-    parser.add_argument("--forest_samples", type=int, default=5)
+    parser.add_argument("--forest_samples", type=int, default=50)
     parser.add_argument("--ncut_scope", choices=["batch", "global"], default="global")
     parser.add_argument(
         "--cluster_loss_type",
@@ -128,7 +128,11 @@ def print_config(args, K=None):
     print("projection=S=RowNorm(B_T Q)")
     if args.cluster_loss_type == "matrix_ncut":
         print("cluster_objective=global matrix Ncut")
-        print("matrix_ncut_complexity=O(nnz(W_E) K + M K^2 + K^3)")
+        print("cluster_loss_formula=Tr[(QTDQ)^-1 QT(D-Pi)Q]")
+        print("cut_affinity_source=temporal_edge_ppr")
+        print("cut_affinity_symmetrization=0.5*(Pi_E+Pi_E.T)")
+        print("cut_affinity_diagonal=zero")
+        print("matrix_ncut_complexity=O(nnz(Pi_cut) K + M K^2 + K^3)")
     elif args.cluster_loss_type in {"legacy_trace_ratio", "trace_mincut"}:
         print("cluster_objective=legacy scalar trace ratio")
         print("legacy_trace_ratio_complexity=O(nnz(W_E) K + M K^2)")
@@ -136,9 +140,10 @@ def print_config(args, K=None):
         print("cluster_objective=legacy ncut")
     print(
         f"alpha={args.alpha}, T={args.T}, beta={args.beta}, edge_neighbor_k={args.edge_neighbor_k}, "
-        f"edge_ppr_topk={args.edge_ppr_topk}, affinity_sparsify={args.affinity_sparsify}, "
         f"forest_samples={args.forest_samples}"
     )
+    print(f"edge_ppr_topk={args.edge_ppr_topk}")
+    print(f"affinity_sparsify={args.affinity_sparsify}")
     print(
         f"ncut_scope={args.ncut_scope}, global_q_chunk_size={args.global_q_chunk_size}, "
         f"global_ncut_row_block_size={args.global_ncut_row_block_size}, "
@@ -195,6 +200,8 @@ def main(args):
     args.diagnostic_output_dir = resolve_path(cur_dir, args.diagnostic_output_dir)
     set_random_seed(args.model_seed)
     trainer = EdgeHiNoSTrainer(args)
+    # Persist/log the canonical name even when an old trace_mincut command is replayed.
+    args.cluster_loss_type = trainer.cluster_loss_type
     print_config(args, trainer.K)
     stats = trainer.prox_stats
     trainer.write_config_json()
@@ -206,27 +213,21 @@ def main(args):
     print(f"num_nodes={trainer.data.num_nodes} num_events={trainer.data.num_events} K={trainer.K}")
     print(f"P_E shape={stats['P_shape']} nnz={stats['P_nnz']} avg_outdegree={stats['P_avg_outdegree']:.4f}")
     print(f"Pi_E shape={stats['Pi_shape']} nnz={stats['Pi_nnz']} avg_row_nnz={stats['Pi_avg_row_nnz']:.4f}")
-    print(f"W_E shape={stats['W_shape']} nnz={stats['W_nnz']}")
-    print(f"W_E avg_row_nnz={stats['W_avg_row_nnz']:.4f}")
-    print(f"edge_ppr_topk={args.edge_ppr_topk}")
+    print(f"Pi_cut shape={stats['Pi_cut_shape']} nnz={stats['Pi_cut_nnz']}")
+    print(f"Pi_cut avg_row_nnz={stats['Pi_cut_avg_row_nnz']:.4f}")
+    print(f"Pi_symmetry_error={stats.get('Pi_cut_symmetry_error', 0.0):.8g}")
     print(f"edge_neighbor_k={args.edge_neighbor_k}")
     print(f"forest_samples={args.forest_samples}")
-    print(f"Pi_E nnz={stats['Pi_nnz']}")
-    print(f"W_E nnz={stats['W_nnz']}")
-    print(f"W_E average nnz per row={stats['W_avg_row_nnz']:.4f}")
-    print(f"W_E symmetry error={stats.get('W_symmetry_error', 0.0):.8g}")
-    print(f"W_E isolated event count={stats.get('W_isolated_event_count', 0)}")
-    print(f"W_E degree min={stats.get('W_degree_min', 0.0):.8g}")
-    print(f"W_E degree max={stats.get('W_degree_max', 0.0):.8g}")
-    print(f"W_E degree mean={stats.get('W_degree_mean', 0.0):.8g}")
-    print(f"affinity_sparsify={args.affinity_sparsify}")
+    print(f"Pi_cut isolated event count={stats.get('Pi_cut_isolated_event_count', 0)}")
+    print(f"D_Pi degree min={stats.get('D_Pi_degree_min', 0.0):.8g}")
+    print(f"D_Pi degree max={stats.get('D_Pi_degree_max', 0.0):.8g}")
+    print(f"D_Pi degree mean={stats.get('D_Pi_degree_mean', 0.0):.8g}")
     print(f"affinity_sparsify_effective={stats.get('affinity_sparsify_effective', '')}")
     print(f"ncut_scope={args.ncut_scope}")
-    print(f"cluster_loss_type={args.cluster_loss_type}")
     print(f"orth_type={args.orth_type}")
     print(f"lambda_orth={args.lambda_orth}")
     print(f"legacy_balance_disabled={str(args.cluster_loss_type != 'legacy_ncut').lower()}")
-    print(f"W_E_sparse_mode={trainer.W_E_sparse_mode}")
+    print(f"Pi_cut_sparse_mode={trainer.Pi_cut_sparse_mode}")
     print(f"node_emb_mode_effective={trainer.node_emb_optimizer_info['node_emb_mode']}")
     print(f"node_emb_lr_effective={trainer.node_emb_optimizer_info['node_emb_lr']}")
     print(f"other_lr_effective={trainer.node_emb_optimizer_info['other_lr']}")

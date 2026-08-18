@@ -12,8 +12,9 @@ from pathlib import Path
 from run_l3_multiseed_validation import command, complete, cleanup, number, read_csv, read_json, stages_for, stage_value
 
 
-DATASETS = ["dblp", "patent", "arXivAI"]
+DATASETS = ["school", "dblp", "patent", "arXivAI"]
 SEEDS = [42, 43]
+FOREST_SAMPLES = 50
 
 
 def fmt(value):
@@ -30,7 +31,18 @@ def write_csv(path, fields, rows):
 
 
 def run_one(args, dataset, seed, run_dir):
-    cmd = command(args, seed, run_dir, prototype_seed=seed, epoch=20, init_only=False, dataset=dataset)
+    cmd = command(
+        args,
+        seed,
+        run_dir,
+        prototype_seed=seed,
+        epoch=20,
+        init_only=False,
+        dataset=dataset,
+        cluster_loss_type="matrix_ncut",
+        orth_type="orth",
+        forest_samples=FOREST_SAMPLES,
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     with (run_dir / "train.log").open("w", encoding="utf-8") as log:
@@ -100,8 +112,9 @@ def result_row(dataset, seed, run_dir):
 
 def write_report(output_dir, rows):
     report = [
-        "# ETGC L3 Cross-Dataset Validation", "",
-        "Scope: DBLP, Patent, arXivAI; seeds 42/43; 20 epochs; fixed C6; matrix_ncut + orth.", "",
+        "# ETGC Matrix-Ncut Forest-50 Four-Dataset Validation", "",
+        "Scope: School, DBLP, Patent, arXivAI; seeds 42/43; 20 epochs; fixed C6; "
+        "matrix_ncut + orth; forest_samples=50; no legacy trace-ratio runs.", "",
         "| Dataset | Seed | K | Initial F1 | Best F1 | Best epoch | Final F1 | NMI | ARI | Final Rank1 | Center ratio | Eff rank | Norm margin | Edge active | Node active | QTDQ max | Runtime s |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -157,9 +170,11 @@ def main():
         encoding="utf-8",
     )
     common = {
-        "method": "ETGC", "purpose": "provisional L3 cross-dataset transfer validation",
+        "method": "ETGC", "purpose": "matrix-Ncut forest-50 four-dataset validation",
         "datasets": DATASETS, "seeds": SEEDS, "epoch": 20,
+        "forest_samples": FOREST_SAMPLES,
         "cluster_loss_type": "matrix_ncut", "orth_type": "orth",
+        "legacy_trace_ratio_enabled_in_experiment": False,
         "model_seed_equals_prototype_seed": True, "fixed_c6_configuration": True,
         "asset_root": str(args.asset_root), "save_embeddings": 0,
         "checkpoint": "disabled/not produced by edge_main.py",

@@ -170,6 +170,8 @@ class EdgeHiNoSTrainer:
             raise ValueError(f"Unsupported ncut_scope: {self.ncut_scope}")
         self.cluster_loss_type = str(getattr(args, "cluster_loss_type", "matrix_ncut")).lower()
         if self.cluster_loss_type == "trace_mincut":
+            # Deprecated CLI compatibility alias.  This is the scalar legacy
+            # trace ratio, not the matrix-Ncut objective used by ETGC mainline.
             self.cluster_loss_type = "legacy_trace_ratio"
         if self.cluster_loss_type not in {"matrix_ncut", "legacy_trace_ratio", "legacy_ncut"}:
             raise ValueError(f"Unsupported cluster_loss_type: {self.cluster_loss_type}")
@@ -188,7 +190,7 @@ class EdgeHiNoSTrainer:
             mode=str(getattr(args, "time_feature_mode", "current")),
         )
 
-        self.P_E, self.Pi_E, self.W_E, self.prox_stats = compute_edge_ppr_cached(
+        self.P_E, self.Pi_E, self.Pi_cut, self.prox_stats = compute_edge_ppr_cached(
             dataset=args.dataset,
             src=self.data.src,
             dst=self.data.dst,
@@ -207,21 +209,28 @@ class EdgeHiNoSTrainer:
             quiet=bool(int(getattr(args, "quiet", 0))),
         )
         self.Pi_E.sort_indices()
-        self.W_E.sort_indices()
-        self.W_E_degree_np = np.asarray(self.W_E.sum(axis=1)).ravel().astype(np.float32)
-        self.W_E_sparse_torch = None
-        self.W_E_sparse_mode = "scipy_row_block"
-        if self.ncut_scope == "global" and self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"} and self.W_E.nnz > 0:
+        self.Pi_cut.sort_indices()
+        # Pi_E is raw temporal edge PPR. Pi_cut is its symmetric, zero-diagonal
+        # Ncut affinity. D_Pi is stored only as the matching row-sum vector.
+        self.D_Pi_degree_np = np.asarray(self.Pi_cut.sum(axis=1)).ravel().astype(np.float32)
+        self.Pi_cut_sparse_torch = None
+        self.Pi_cut_sparse_mode = "scipy_row_block"
+        if self.ncut_scope == "global" and self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"} and self.Pi_cut.nnz > 0:
             try:
-                self.W_E_sparse_torch = scipy_csr_to_torch_sparse_coo(self.W_E, self.device, torch.float32)
-                self.W_E_sparse_mode = "torch_sparse_coo"
+                self.Pi_cut_sparse_torch = scipy_csr_to_torch_sparse_coo(self.Pi_cut, self.device, torch.float32)
+                self.Pi_cut_sparse_mode = "torch_sparse_coo"
             except RuntimeError as exc:
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 print(
-                    "trace_mincut_sparse_conversion=failed "
+                    "Pi_cut_sparse_conversion=failed "
                     f"fallback=row_block_sparse_mm reason={type(exc).__name__}: {str(exc).splitlines()[0]}"
                 )
+        # Compatibility attributes for historical diagnostics/result readers.
+        self.W_E = self.Pi_cut
+        self.W_E_degree_np = self.D_Pi_degree_np
+        self.W_E_sparse_torch = self.Pi_cut_sparse_torch
+        self.W_E_sparse_mode = self.Pi_cut_sparse_mode
 
         self.edge_encoder_mode = str(getattr(args, "edge_encoder_mode", "mlp")).lower()
         if self.edge_encoder_mode not in {"mlp", "direct_node_time"}:
@@ -722,7 +731,7 @@ class EdgeHiNoSTrainer:
             h = hidden[start : start + chunk_size]
             c = raw_centers.index_select(0, labels_t[start : start + chunk_size].to(raw_centers.device))
             inertia += float((h.cpu() - c.cpu()).square().sum())
-        degree = np.asarray(self.W_E_degree_np, dtype=np.float64)
+        degree = np.asarray(self.D_Pi_degree_np, dtype=np.float64)
         volumes = np.bincount(edge_labels, weights=degree, minlength=self.K)[: self.K]
         volume_ratios = volumes / max(float(volumes.sum()), 1e-12)
         metrics.update(
@@ -778,7 +787,8 @@ class EdgeHiNoSTrainer:
                 "node_embedding_source": self.node_embedding_source,
                 "node2vec_path": self.node_embedding_path,
                 "affinity_sparsify": str(getattr(self.args, "affinity_sparsify", "symmetric_union_knn")),
-                "W_E_symmetry_error": float(self.prox_stats.get("W_symmetry_error", 0.0)),
+                "Pi_cut_symmetry_error": float(self.prox_stats.get("Pi_cut_symmetry_error", 0.0)),
+                "W_E_symmetry_error": float(self.prox_stats.get("Pi_cut_symmetry_error", 0.0)),
                 "model_parameter_info": self._model_parameter_info(),
                 "projection": "S=RowNorm(BQ) using index_add over src/dst events",
                 "model_init_info": self.model_init_info,
@@ -787,7 +797,7 @@ class EdgeHiNoSTrainer:
         return cfg
 
     def _overnight_stage_extra_stats(self, q_all: torch.Tensor, edge_repr_all: torch.Tensor = None) -> dict:
-        degree_t = torch.from_numpy(self.W_E_degree_np).to(device=q_all.device, dtype=q_all.dtype)
+        degree_t = torch.from_numpy(self.D_Pi_degree_np).to(device=q_all.device, dtype=q_all.dtype)
         extra = self._current_cluster_output_stats()
         extra.update(self._model_parameter_info())
         if self.node_emb_initial_cpu is not None:
@@ -829,15 +839,18 @@ class EdgeHiNoSTrainer:
         extra["lambda_node_anchor"] = float(getattr(self.args, "lambda_node_anchor", 0.0))
         with torch.no_grad():
             if self.cluster_loss_type == "matrix_ncut":
+                solve_diagnostics = {}
                 _, cut_loss, orth_original = edge_matrix_ncut_loss_global(
                     q_all,
-                    self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                    self.W_E_degree_np,
+                    self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                    self.D_Pi_degree_np,
                     self.K,
                     lambda_orth=1.0,
                     row_block_size=int(self.args.global_ncut_row_block_size),
                     orth_type="orth",
+                    diagnostics=solve_diagnostics,
                 )
+                extra.update(solve_diagnostics)
                 extra.update(
                     matrix_ncut_qtdq_diagnostics(
                         q_all,
@@ -849,8 +862,8 @@ class EdgeHiNoSTrainer:
             else:
                 _, cut_loss, orth_original = edge_trace_mincut_loss_global(
                     q_all,
-                    self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                    self.W_E_degree_np,
+                    self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                    self.D_Pi_degree_np,
                     self.K,
                     lambda_orth=1.0,
                     row_block_size=int(self.args.global_ncut_row_block_size),
@@ -944,8 +957,8 @@ class EdgeHiNoSTrainer:
         if self.cluster_loss_type == "matrix_ncut":
             _, cut_loss, penalty_loss = edge_matrix_ncut_loss_global(
                 q_all,
-                self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                self.W_E_degree_np,
+                self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                self.D_Pi_degree_np,
                 self.K,
                 lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
                 row_block_size=int(self.args.global_ncut_row_block_size),
@@ -954,8 +967,8 @@ class EdgeHiNoSTrainer:
         else:
             _, cut_loss, penalty_loss = edge_trace_mincut_loss_global(
                 q_all,
-                self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                self.W_E_degree_np,
+                self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                self.D_Pi_degree_np,
                 self.K,
                 lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
                 row_block_size=int(self.args.global_ncut_row_block_size),
@@ -1392,6 +1405,8 @@ class EdgeHiNoSTrainer:
             "qtdq_max_eigenvalue",
             "qtdq_condition_number",
             "matrix_ncut_solve_finite",
+            "matrix_ncut_cut_loss_finite",
+            "matrix_ncut_solve_precision_fallback",
             "logits_bias_to_event_variation_ratio",
             "edge_encoder_mode",
             "direct_time_scale",
@@ -1505,6 +1520,13 @@ class EdgeHiNoSTrainer:
                 "prototype_seed": self.prototype_seed,
                 "forest_seed": self.forest_seed,
                 "Pi_E_nnz": int(self.Pi_E.nnz),
+                "Pi_cut_nnz": int(self.Pi_cut.nnz),
+                "Pi_cut_avg_nnz_per_row": float(self.Pi_cut.nnz / max(1, self.Pi_cut.shape[0])),
+                "Pi_cut_symmetry_error": float(self.prox_stats.get("Pi_cut_symmetry_error", 0.0)),
+                "D_Pi_degree_min": float(self.prox_stats.get("D_Pi_degree_min", 0.0)),
+                "D_Pi_degree_max": float(self.prox_stats.get("D_Pi_degree_max", 0.0)),
+                "D_Pi_degree_mean": float(self.prox_stats.get("D_Pi_degree_mean", 0.0)),
+                "Pi_cut_sparse_mode": self.Pi_cut_sparse_mode,
                 "W_E_nnz": int(self.W_E.nnz),
                 "W_E_avg_nnz_per_row": float(self.W_E.nnz / max(1, self.W_E.shape[0])),
                 "W_E_symmetry_error": float(self.prox_stats.get("W_symmetry_error", 0.0)),
@@ -1516,7 +1538,7 @@ class EdgeHiNoSTrainer:
                 "affinity_sparsify": str(getattr(self.args, "affinity_sparsify", "symmetric_union_knn")),
                 "affinity_sparsify_effective": self.prox_stats.get("affinity_sparsify_effective", ""),
                 "legacy_balance_disabled": self.cluster_loss_type != "legacy_ncut",
-                "matrix_ncut_complexity": "O(nnz(W_E) K + M K^2 + K^3)",
+                "matrix_ncut_complexity": "O(nnz(Pi_cut) K + M K^2 + K^3)",
                 "legacy_trace_ratio_complexity": "O(nnz(W_E) K + M K^2)",
                 "node_emb_optimizer_info": self.node_emb_optimizer_info,
                 "main_learning_rate": float(self.node_emb_optimizer_info.get("main_learning_rate", 0.0)),
@@ -1569,6 +1591,13 @@ class EdgeHiNoSTrainer:
             "node_embedding_source": self.node_embedding_source,
             "node2vec_path": self.node_embedding_path,
             "Pi_E_nnz": int(self.Pi_E.nnz),
+            "Pi_cut_nnz": int(self.Pi_cut.nnz),
+            "Pi_cut_avg_nnz_per_row": float(self.Pi_cut.nnz / max(1, self.Pi_cut.shape[0])),
+            "Pi_cut_symmetry_error": float(self.prox_stats.get("Pi_cut_symmetry_error", 0.0)),
+            "D_Pi_degree_min": float(self.prox_stats.get("D_Pi_degree_min", 0.0)),
+            "D_Pi_degree_max": float(self.prox_stats.get("D_Pi_degree_max", 0.0)),
+            "D_Pi_degree_mean": float(self.prox_stats.get("D_Pi_degree_mean", 0.0)),
+            "Pi_cut_sparse_mode": self.Pi_cut_sparse_mode,
             "W_E_nnz": int(self.W_E.nnz),
             "W_E_avg_nnz_per_row": float(self.W_E.nnz / max(1, self.W_E.shape[0])),
             "W_E_symmetry_error": float(self.prox_stats.get("W_symmetry_error", 0.0)),
@@ -1579,7 +1608,7 @@ class EdgeHiNoSTrainer:
             "W_E_sparse_mode": self.W_E_sparse_mode,
             "affinity_sparsify": str(getattr(self.args, "affinity_sparsify", "symmetric_union_knn")),
             "affinity_sparsify_effective": self.prox_stats.get("affinity_sparsify_effective", ""),
-            "matrix_ncut_complexity": "O(nnz(W_E) K + M K^2 + K^3)",
+            "matrix_ncut_complexity": "O(nnz(Pi_cut) K + M K^2 + K^3)",
             "legacy_trace_ratio_complexity": "O(nnz(W_E) K + M K^2)",
             "node_emb_optimizer_info": self.node_emb_optimizer_info,
             "main_learning_rate": float(self.node_emb_optimizer_info.get("main_learning_rate", 0.0)),
@@ -1731,8 +1760,8 @@ class EdgeHiNoSTrainer:
                 if self.cluster_loss_type == "matrix_ncut":
                     cluster_loss, cut_loss, orth_loss = edge_matrix_ncut_loss_global(
                         q_all,
-                        self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                        self.W_E_degree_np,
+                        self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                        self.D_Pi_degree_np,
                         self.K,
                         lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
                         row_block_size=int(self.args.global_ncut_row_block_size),
@@ -1741,8 +1770,8 @@ class EdgeHiNoSTrainer:
                 elif self.cluster_loss_type == "legacy_trace_ratio":
                     cluster_loss, cut_loss, orth_loss = edge_trace_mincut_loss_global(
                         q_all,
-                        self.W_E_sparse_torch if self.W_E_sparse_torch is not None else self.W_E,
-                        self.W_E_degree_np,
+                        self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                        self.D_Pi_degree_np,
                         self.K,
                         lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
                         row_block_size=int(self.args.global_ncut_row_block_size),
@@ -1924,6 +1953,10 @@ class EdgeHiNoSTrainer:
                 "qtdq_max_eigenvalue": stage_stats_for_epoch.get("qtdq_max_eigenvalue", ""),
                 "qtdq_condition_number": stage_stats_for_epoch.get("qtdq_condition_number", ""),
                 "matrix_ncut_solve_finite": stage_stats_for_epoch.get("matrix_ncut_solve_finite", ""),
+                "matrix_ncut_cut_loss_finite": stage_stats_for_epoch.get("matrix_ncut_cut_loss_finite", ""),
+                "matrix_ncut_solve_precision_fallback": stage_stats_for_epoch.get(
+                    "matrix_ncut_solve_precision_fallback", ""
+                ),
                 "logits_bias_to_event_variation_ratio": stage_stats_for_epoch.get("logits_bias_to_event_variation_ratio", ""),
                 "edge_encoder_mode": self.edge_encoder_mode,
                 "direct_time_scale": float(self.direct_time_scale),
@@ -1987,6 +2020,11 @@ class EdgeHiNoSTrainer:
                 )
                 if record["qtdq_condition_number"] != "":
                     loss_diag_text += f" qtdq_condition={record['qtdq_condition_number']:.6g}"
+                if record["matrix_ncut_solve_precision_fallback"] != "":
+                    loss_diag_text += (
+                        " solve_precision_fallback="
+                        f"{str(record['matrix_ncut_solve_precision_fallback']).lower()}"
+                    )
 
             if diagnostic:
                 print(

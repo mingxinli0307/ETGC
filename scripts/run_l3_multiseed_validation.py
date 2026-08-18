@@ -101,6 +101,7 @@ def command(
     dataset="school",
     cluster_loss_type="matrix_ncut",
     orth_type="orth",
+    forest_samples=5,
 ):
     if prototype_seed is None:
         prototype_seed = seed
@@ -114,7 +115,7 @@ def command(
         "time_feature_mode": "history", "edge_encoder_mode": "mlp", "cluster_head_type": "legacy_mlp",
         "alpha": 0.2, "T": 4, "beta": 5.0, "edge_neighbor_k": -1, "edge_ppr_topk": -1,
         "affinity_sparsify": "symmetric_union_knn", "edge_ppr_method": "temporal_state_forest",
-        "forest_samples": 5, "ncut_scope": "global", "cluster_loss_type": cluster_loss_type,
+        "forest_samples": int(forest_samples), "ncut_scope": "global", "cluster_loss_type": cluster_loss_type,
         "orth_type": orth_type, "global_q_chunk_size": 8192, "global_ncut_row_block_size": 65536,
         "global_warmup_epochs": 0, "prox_warmup_epochs": 0, "quiet": 1,
         "lambda_prox": 0.0, "lambda_edge_ncut": 0.5, "lambda_orth": 1.0,

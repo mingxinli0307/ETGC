@@ -776,22 +776,28 @@ def build_edge_ncut_affinity(
     edge_ppr_topk: int,
     affinity_sparsify: str = "symmetric_union_knn",
 ) -> sp.csr_matrix:
+    """Build Pi_cut, the symmetric edge-PPR affinity used as Pi in Ncut.
+
+    Pi_E is the raw temporal edge PPR.  Before optional sparsification we use
+    Pi_cut = 0.5 * (Pi_E + Pi_E.T) and remove its diagonal.  A non-positive
+    edge_ppr_topk therefore returns the full symmetrized affinity.
+    """
     mode = str(affinity_sparsify).lower()
     if mode not in {"row_topk", "symmetric_union_knn", "none"}:
         raise ValueError(f"Unsupported affinity_sparsify: {affinity_sparsify}")
-    W = 0.5 * (Pi_E.tocsr() + Pi_E.T.tocsr())
-    W = W.tolil()
-    W.setdiag(0.0)
-    W = W.tocsr()
+    Pi_cut = 0.5 * (Pi_E.tocsr() + Pi_E.T.tocsr())
+    Pi_cut = Pi_cut.tolil()
+    Pi_cut.setdiag(0.0)
+    Pi_cut = Pi_cut.tocsr()
     if int(edge_ppr_topk) <= 0 or mode == "none":
-        W = W
+        pass
     elif mode == "row_topk":
-        W = sparse_row_topk(W, edge_ppr_topk)
+        Pi_cut = sparse_row_topk(Pi_cut, edge_ppr_topk)
     else:
-        W = sparse_symmetric_union_knn(W, edge_ppr_topk)
-    W.sum_duplicates()
-    W.eliminate_zeros()
-    return W.tocsr()
+        Pi_cut = sparse_symmetric_union_knn(Pi_cut, edge_ppr_topk)
+    Pi_cut.sum_duplicates()
+    Pi_cut.eliminate_zeros()
+    return Pi_cut.tocsr()
 
 
 def compute_edge_ppr_cached(
@@ -908,15 +914,17 @@ def compute_edge_ppr_cached(
             print(f"[proximity] done seconds={elapsed:.2f} Pi_nnz={Pi_E.nnz}", flush=True)
         sp.save_npz(pi_path, Pi_E)
     if w_cache_hit:
-        W_E = sp.load_npz(w_path).tocsr()
+        Pi_cut = sp.load_npz(w_path).tocsr()
     else:
-        W_E = build_edge_ncut_affinity(Pi_E, edge_ppr_topk, affinity_sparsify=affinity_sparsify)
-        sp.save_npz(w_path, W_E)
+        Pi_cut = build_edge_ncut_affinity(Pi_E, edge_ppr_topk, affinity_sparsify=affinity_sparsify)
+        sp.save_npz(w_path, Pi_cut)
         with open(meta_path, "w", encoding="utf-8") as writer:
             json.dump(w_cfg, writer, indent=2, sort_keys=True)
 
-    degree = np.asarray(W_E.sum(axis=1)).ravel().astype(np.float32)
+    # D_Pi is represented only by this row-sum vector; no dense M x M matrix is built.
+    degree = np.asarray(Pi_cut.sum(axis=1)).ravel().astype(np.float32)
     positive_degree = degree[degree > 0]
+    pi_cut_symmetry_error = sparse_symmetry_error(Pi_cut)
 
     stats = {
         "config_hash": w_cfg_hash,
@@ -933,14 +941,26 @@ def compute_edge_ppr_cached(
         "Pi_shape": Pi_E.shape,
         "Pi_nnz": int(Pi_E.nnz),
         "Pi_avg_row_nnz": float(Pi_E.nnz / max(1, Pi_E.shape[0])),
-        "W_shape": W_E.shape,
-        "W_nnz": int(W_E.nnz),
-        "W_avg_row_nnz": float(W_E.nnz / max(1, W_E.shape[0])),
-        "W_symmetry_error": sparse_symmetry_error(W_E),
+        "cut_affinity_source": "temporal_edge_ppr",
+        "cut_affinity_symmetrization": "0.5*(Pi_E+Pi_E.T), diag=0",
+        "Pi_cut_shape": Pi_cut.shape,
+        "Pi_cut_nnz": int(Pi_cut.nnz),
+        "Pi_cut_avg_row_nnz": float(Pi_cut.nnz / max(1, Pi_cut.shape[0])),
+        "Pi_cut_symmetry_error": pi_cut_symmetry_error,
+        "Pi_cut_isolated_event_count": int(np.sum(degree <= 0.0)),
+        "D_Pi_degree_min": float(degree.min()) if degree.size else 0.0,
+        "D_Pi_degree_max": float(degree.max()) if degree.size else 0.0,
+        "D_Pi_degree_mean": float(degree.mean()) if degree.size else 0.0,
+        "D_Pi_positive_degree_min": float(positive_degree.min()) if positive_degree.size else 0.0,
+        # Deprecated W_E keys remain for old result readers and cache compatibility.
+        "W_shape": Pi_cut.shape,
+        "W_nnz": int(Pi_cut.nnz),
+        "W_avg_row_nnz": float(Pi_cut.nnz / max(1, Pi_cut.shape[0])),
+        "W_symmetry_error": pi_cut_symmetry_error,
         "W_isolated_event_count": int(np.sum(degree <= 0.0)),
         "W_degree_min": float(degree.min()) if degree.size else 0.0,
         "W_degree_max": float(degree.max()) if degree.size else 0.0,
         "W_degree_mean": float(degree.mean()) if degree.size else 0.0,
         "W_positive_degree_min": float(positive_degree.min()) if positive_degree.size else 0.0,
     }
-    return P_E, Pi_E, W_E, stats
+    return P_E, Pi_E, Pi_cut, stats

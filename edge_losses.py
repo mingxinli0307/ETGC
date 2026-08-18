@@ -88,7 +88,7 @@ def matrix_ncut_qtdq_diagnostics(
 def _check_scalar_finite(name: str, value: torch.Tensor, stats: dict) -> None:
     if not torch.isfinite(value).all():
         details = ", ".join(f"{k}={v}" for k, v in stats.items())
-        raise FloatingPointError(f"{name} is not finite in trace mincut loss: {details}")
+        raise FloatingPointError(f"{name} is not finite: {details}")
 
 
 def _sparse_block_wq_numerator(W_E: sp.csr_matrix, Q_all: torch.Tensor, row_block_size: int) -> torch.Tensor:
@@ -167,28 +167,35 @@ def _sparse_wq_product(W_E, Q_all: torch.Tensor, row_block_size: int = 65536) ->
 
 def edge_matrix_ncut_loss_global(
     Q_all: torch.Tensor,
-    W_E,
+    Pi_cut,
     degree,
     K: int,
     lambda_orth: float = 1.0,
     eps: float = 1e-8,
     row_block_size: int = 65536,
     orth_type: str = "orthqa",
+    diagnostics: dict = None,
 ) -> tuple:
+    """Complete matrix Ncut C-form on the symmetric edge-PPR affinity.
+
+    ``Pi_cut`` is the symmetric, zero-diagonal affinity used as Pi in Ncut;
+    ``degree`` must be its row sum.  D_Pi is applied row-wise and is never
+    materialized as an M x M dense matrix.
+    """
     if Q_all.dim() != 2:
         raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
     m = int(Q_all.size(0))
     k = int(Q_all.size(1))
     if k != int(K):
         raise ValueError(f"Q_all has K={k}, expected K={K}")
-    WQ, nnz = _sparse_wq_product(W_E, Q_all, int(row_block_size))
+    PiQ, nnz = _sparse_wq_product(Pi_cut, Q_all, int(row_block_size))
     degree_t = _as_degree_tensor(degree, Q_all)
     if int(degree_t.numel()) != m:
         raise ValueError(f"degree length={degree_t.numel()} does not match Q_all rows={m}")
     DQ = degree_t.unsqueeze(1) * Q_all
     eye = torch.eye(k, dtype=Q_all.dtype, device=Q_all.device)
     A = Q_all.t().mm(DQ) + float(eps) * eye
-    B = Q_all.t().mm(DQ - WQ)
+    B = Q_all.t().mm(DQ - PiQ)
     solve_precision_fallback = False
     try:
         X = torch.linalg.solve(A, B)
@@ -202,7 +209,7 @@ def edge_matrix_ncut_loss_global(
         A_solve = Q_solve.t().mm(DQ_solve) + float(eps) * torch.eye(
             k, dtype=torch.float64, device=Q_all.device
         )
-        B_solve = Q_solve.t().mm(DQ_solve - WQ.to(dtype=torch.float64))
+        B_solve = Q_solve.t().mm(DQ_solve - PiQ.to(dtype=torch.float64))
         ncut_loss = torch.trace(torch.linalg.solve(A_solve, B_solve)).to(dtype=Q_all.dtype)
     selected_orth_type = str(orth_type).lower()
     if selected_orth_type == "orth":
@@ -230,6 +237,13 @@ def edge_matrix_ncut_loss_global(
     _check_scalar_finite("matrix_ncut loss", ncut_loss, stats)
     _check_scalar_finite("matrix_ncut penalty", penalty_loss, stats)
     _check_scalar_finite("matrix_ncut total_cluster_loss", total_cluster_loss, stats)
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "matrix_ncut_solve_precision_fallback": bool(solve_precision_fallback),
+                "matrix_ncut_cut_loss_finite": bool(torch.isfinite(ncut_loss).all()),
+            }
+        )
     return total_cluster_loss, ncut_loss, penalty_loss
 
 
@@ -243,11 +257,11 @@ def edge_trace_mincut_loss_global(
     row_block_size: int = 65536,
     orth_type: str = "orth",
 ) -> tuple:
-    """Global trace mincut over all temporal edge events.
+    """Deprecated scalar trace-ratio objective over all edge events.
 
-    Computes O(nnz(W_E) K + M K^2) work without materializing dense W_E or D_E.
-    The legacy sum-of-ratios normalized association loss is intentionally kept
-    separate in edge_ncut_loss_global for compatibility and diagnostics.
+    This computes ``-Tr(Q.T @ Pi_cut @ Q) / Tr(Q.T @ D_Pi @ Q)``.  It is
+    retained as ``legacy_trace_ratio`` for historical experiments; it is not
+    the complete matrix-Ncut objective used by the ETGC mainline.
     """
     if Q_all.dim() != 2:
         raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
@@ -288,11 +302,11 @@ def edge_trace_mincut_loss_global(
         "Q_min": float(Q_all.detach().min().cpu()) if Q_all.numel() else 0.0,
         "Q_max": float(Q_all.detach().max().cpu()) if Q_all.numel() else 0.0,
     }
-    _check_scalar_finite("trace_mincut numerator", numerator, stats)
-    _check_scalar_finite("trace_mincut denominator", denominator, stats)
+    _check_scalar_finite("legacy_trace_ratio numerator", numerator, stats)
+    _check_scalar_finite("legacy_trace_ratio denominator", denominator, stats)
     if denom_value <= 0.0:
         details = ", ".join(f"{key}={value}" for key, value in stats.items())
-        raise FloatingPointError(f"trace_mincut denominator is not positive: {details}")
+        raise FloatingPointError(f"legacy_trace_ratio denominator is not positive: {details}")
 
     cut_loss = -numerator / (denominator + float(eps))
     selected_orth_type = str(orth_type).lower()
@@ -312,9 +326,9 @@ def edge_trace_mincut_loss_global(
             "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
         }
     )
-    _check_scalar_finite("trace_mincut cut_loss", cut_loss, stats)
-    _check_scalar_finite("trace_mincut orth_loss", orth_loss, stats)
-    _check_scalar_finite("trace_mincut total_cluster_loss", total_cluster_loss, stats)
+    _check_scalar_finite("legacy_trace_ratio cut_loss", cut_loss, stats)
+    _check_scalar_finite("legacy_trace_ratio orth_loss", orth_loss, stats)
+    _check_scalar_finite("legacy_trace_ratio total_cluster_loss", total_cluster_loss, stats)
     return total_cluster_loss, cut_loss, orth_loss
 
 

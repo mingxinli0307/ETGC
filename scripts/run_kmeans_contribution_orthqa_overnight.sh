@@ -68,7 +68,7 @@ cat > "${OUT_DIR}/code_info/common_config.json" <<EOF
   "epochs": 30,
   "edge_ppr_method": "temporal_state_forest",
   "edge_ppr_topk": -1,
-  "cluster_loss_type": "trace_mincut",
+  "cluster_loss_type": "matrix_ncut",
   "lambda_edge_ncut": 0.5,
   "lambda_proj": 0.0,
   "lambda_bal": 0.0,

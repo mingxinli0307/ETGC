@@ -329,6 +329,7 @@ def test_formal_default_configuration():
     assert args.cluster_head_type == "cosine_prototype"
     assert args.cluster_loss_type == "matrix_ncut"
     assert args.orth_type == "orthqa"
+    assert args.forest_samples == 50
     assert args.affinity_sparsify == "symmetric_union_knn"
     assert args.node_emb_mode == "small_lr"
     assert args.lambda_proj == 0.0
