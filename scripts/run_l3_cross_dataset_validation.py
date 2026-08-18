@@ -40,7 +40,7 @@ def run_one(args, dataset, seed, run_dir):
         init_only=False,
         dataset=dataset,
         cluster_loss_type="matrix_ncut",
-        orth_type="orth",
+        orth_type=args.orth_type,
         forest_samples=FOREST_SAMPLES,
     )
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -76,6 +76,9 @@ def result_row(dataset, seed, run_dir):
     return {
         "dataset": dataset,
         "seed": seed,
+        "cluster_loss_type": config.get("cluster_loss_type", "matrix_ncut"),
+        "orth_type": config.get("orth_type", ""),
+        "forest_samples": config.get("forest_samples", FOREST_SAMPLES),
         "M": result.get("M", config.get("M", "")),
         "N": result.get("N", config.get("N", "")),
         "K": result.get("K", config.get("K", "")),
@@ -110,11 +113,12 @@ def result_row(dataset, seed, run_dir):
     }
 
 
-def write_report(output_dir, rows):
+def write_report(output_dir, rows, datasets, orth_type):
+    dataset_scope = ", ".join(datasets)
     report = [
-        "# ETGC Matrix-Ncut Forest-50 Four-Dataset Validation", "",
-        "Scope: School, DBLP, Patent, arXivAI; seeds 42/43; 20 epochs; fixed C6; "
-        "matrix_ncut + orth; forest_samples=50; no legacy trace-ratio runs.", "",
+        f"# ETGC Matrix-Ncut + {orth_type} Forest-50 Cross-Dataset Validation", "",
+        f"Scope: {dataset_scope}; seeds 42/43; 20 epochs; fixed C6; "
+        f"matrix_ncut + {orth_type}; forest_samples=50; no legacy trace-ratio runs.", "",
         "| Dataset | Seed | K | Initial F1 | Best F1 | Best epoch | Final F1 | NMI | ARI | Final Rank1 | Center ratio | Eff rank | Norm margin | Edge active | Node active | QTDQ max | Runtime s |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -129,7 +133,7 @@ def write_report(output_dir, rows):
             f"{fmt(row['runtime_seconds'])} |"
         )
     report += ["", "## Per-Dataset Aggregate", ""]
-    for dataset in DATASETS:
+    for dataset in datasets:
         subset = [row for row in rows if row["dataset"] == dataset and row["status"] == "success"]
         if not subset:
             report.append(f"- {dataset}: no successful runs.")
@@ -154,11 +158,16 @@ def main():
     parser.add_argument("--asset-root", required=True, type=Path)
     parser.add_argument("--python-bin", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--datasets", default=",".join(DATASETS))
+    parser.add_argument("--orth-type", choices=("orth", "orthqa"), default="orth")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
     args.root_dir = args.root_dir.resolve()
     args.output_dir = args.output_dir.resolve()
     args.asset_root = args.asset_root.resolve()
+    datasets = [value.strip() for value in args.datasets.split(",") if value.strip()]
+    if not datasets:
+        parser.error("--datasets must contain at least one dataset name")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     code_info = args.output_dir / "code_info"
     code_info.mkdir(parents=True, exist_ok=True)
@@ -166,14 +175,18 @@ def main():
     log_line = subprocess.run(["git", "log", "-1", "--oneline"], cwd=args.root_dir, capture_output=True, text=True).stdout.strip()
     (code_info / "commit.txt").write_text(commit + "\n" + log_line + "\n", encoding="utf-8")
     (code_info / "environment.txt").write_text(
-        f"python={args.python_bin}\ndevice={args.device}\nCUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}\n",
+        f"python={args.python_bin}\ndevice={args.device}\n"
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}\n"
+        f"TEMPORAL_FOREST_WORKERS={os.environ.get('TEMPORAL_FOREST_WORKERS', '')}\n"
+        f"TEMPORAL_FOREST_CHUNK_SAMPLES={os.environ.get('TEMPORAL_FOREST_CHUNK_SAMPLES', '')}\n"
+        f"TEMPORAL_FOREST_COMBINE_CHUNKS={os.environ.get('TEMPORAL_FOREST_COMBINE_CHUNKS', '')}\n",
         encoding="utf-8",
     )
     common = {
-        "method": "ETGC", "purpose": "matrix-Ncut forest-50 four-dataset validation",
-        "datasets": DATASETS, "seeds": SEEDS, "epoch": 20,
+        "method": "ETGC", "purpose": f"matrix-Ncut + {args.orth_type} forest-50 cross-dataset validation",
+        "datasets": datasets, "seeds": SEEDS, "epoch": 20,
         "forest_samples": FOREST_SAMPLES,
-        "cluster_loss_type": "matrix_ncut", "orth_type": "orth",
+        "cluster_loss_type": "matrix_ncut", "orth_type": args.orth_type,
         "legacy_trace_ratio_enabled_in_experiment": False,
         "model_seed_equals_prototype_seed": True, "fixed_c6_configuration": True,
         "asset_root": str(args.asset_root), "save_embeddings": 0,
@@ -182,7 +195,7 @@ def main():
     (code_info / "common_config.json").write_text(json.dumps(common, indent=2, sort_keys=True), encoding="utf-8")
 
     failed = []
-    for dataset in DATASETS:
+    for dataset in datasets:
         for seed in SEEDS:
             run_dir = args.output_dir / dataset / f"seed{seed}"
             if not args.no_resume and complete(run_dir):
@@ -192,10 +205,10 @@ def main():
             print(f"run dataset={dataset} seed={seed}", flush=True)
             if run_one(args, dataset, seed, run_dir) != 0:
                 failed.append((dataset, seed))
-    rows = [result_row(dataset, seed, args.output_dir / dataset / f"seed{seed}") for dataset in DATASETS for seed in SEEDS]
+    rows = [result_row(dataset, seed, args.output_dir / dataset / f"seed{seed}") for dataset in datasets for seed in SEEDS]
     fields = list(rows[0].keys())
     write_csv(args.output_dir / "cross_dataset_comparison.csv", fields, rows)
-    write_report(args.output_dir, rows)
+    write_report(args.output_dir, rows, datasets, args.orth_type)
     print(f"run_failures={failed}")
     print(f"comparison={args.output_dir / 'cross_dataset_comparison.csv'}")
     print(f"report={args.output_dir / 'diagnosis_report.md'}")
