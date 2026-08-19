@@ -616,6 +616,69 @@ def projection_loss_global(
     return -(Q_all * torch.log(su * sv + float(eps))).sum(dim=1).mean()
 
 
+def node_sbm_reconstruction_loss_global(
+    S_all: torch.Tensor,
+    pos_src: torch.Tensor,
+    pos_dst: torch.Tensor,
+    neg_src: torch.Tensor,
+    neg_dst: torch.Tensor,
+    directed: bool = False,
+    eps: float = 1e-6,
+    logit_clip: float = 8.0,
+) -> tuple:
+    """Degree-corrected block reconstruction over node assignments.
+
+    Positive pairs are observed temporal interactions. Negative pairs should be
+    formed by independently shuffling endpoints, which preserves endpoint
+    marginals and therefore factors degree effects out of the learned K x K
+    block relation. The block log-odds estimate is detached (an EM-style
+    profile step); gradients from the binary reconstruction objective flow only
+    through the current node assignments S=RowNorm(BQ).
+    """
+    if S_all.dim() != 2:
+        raise ValueError(f"S_all must be 2D, got shape={tuple(S_all.shape)}")
+    if int(pos_src.numel()) == 0 or int(neg_src.numel()) == 0:
+        raise ValueError("node SBM reconstruction requires non-empty positive and negative pairs")
+    if int(pos_src.numel()) != int(pos_dst.numel()):
+        raise ValueError("positive source/destination lengths differ")
+    if int(neg_src.numel()) != int(neg_dst.numel()):
+        raise ValueError("negative source/destination lengths differ")
+
+    pos_src = pos_src.to(device=S_all.device, dtype=torch.long)
+    pos_dst = pos_dst.to(device=S_all.device, dtype=torch.long)
+    neg_src = neg_src.to(device=S_all.device, dtype=torch.long)
+    neg_dst = neg_dst.to(device=S_all.device, dtype=torch.long)
+    pos_u = S_all.index_select(0, pos_src)
+    pos_v = S_all.index_select(0, pos_dst)
+    neg_u = S_all.index_select(0, neg_src)
+    neg_v = S_all.index_select(0, neg_dst)
+
+    with torch.no_grad():
+        pos_prob = pos_u.t().mm(pos_v) / float(pos_u.size(0))
+        neg_prob = neg_u.t().mm(neg_v) / float(neg_u.size(0))
+        if not bool(directed):
+            pos_prob = 0.5 * (pos_prob + pos_prob.t())
+            neg_prob = 0.5 * (neg_prob + neg_prob.t())
+        block_logits = torch.log(pos_prob + float(eps)) - torch.log(neg_prob + float(eps))
+        block_logits = block_logits.clamp(min=-float(logit_clip), max=float(logit_clip))
+
+    pos_scores = torch.einsum("bi,ij,bj->b", pos_u, block_logits, pos_v)
+    neg_scores = torch.einsum("bi,ij,bj->b", neg_u, block_logits, neg_v)
+    loss = F.softplus(-pos_scores).mean() + F.softplus(neg_scores).mean()
+    stats = {
+        "node_sbm_block_logit_min": float(block_logits.min().cpu()),
+        "node_sbm_block_logit_max": float(block_logits.max().cpu()),
+        "node_sbm_block_logit_std": float(block_logits.std(unbiased=False).cpu()),
+        "node_sbm_positive_score_mean": float(pos_scores.detach().mean().cpu()),
+        "node_sbm_negative_score_mean": float(neg_scores.detach().mean().cpu()),
+        "node_sbm_block_symmetry_error": float(
+            torch.max(torch.abs(block_logits - block_logits.t())).cpu()
+        ),
+    }
+    _check_scalar_finite("node_sbm_reconstruction_loss_global", loss, stats)
+    return loss, block_logits, stats
+
+
 def balance_loss(Q: torch.Tensor, K: int) -> torch.Tensor:
     qtq = Q.t().mm(Q)
     qtq = qtq / torch.linalg.norm(qtq, ord="fro").clamp_min(1e-8)
