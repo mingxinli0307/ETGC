@@ -61,7 +61,9 @@ def summarize(output_dir, datasets, seeds):
     rows = []
     for dataset in datasets:
         for seed in seeds:
-            result = read_json(output_dir / dataset / f"seed{seed}" / "result.json")
+            run_dir = output_dir / dataset / f"seed{seed}"
+            result = read_json(run_dir / "result.json")
+            config = read_json(run_dir / "config.json")
             final = result.get("final_metrics", {})
             prior = result.get("node_prior_info", {})
             rows.append(
@@ -78,8 +80,8 @@ def summarize(output_dir, datasets, seeds):
                     "node_prior_connected_components": prior.get("node_prior_connected_components", ""),
                     "node_prior_active_clusters": prior.get("node_prior_active_clusters", ""),
                     "node_prior_logit_strength": result.get("node_prior_logit_strength", ""),
-                    "cluster_loss_type": result.get("cluster_loss_type", ""),
-                    "forest_samples": result.get("forest_samples", ""),
+                    "cluster_loss_type": config.get("cluster_loss_type", ""),
+                    "forest_samples": config.get("forest_samples", ""),
                 }
             )
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
@@ -133,7 +135,8 @@ def main():
         "node_prior_logit_strength": args.logit_strength,
         "node_prior_kmeans_restarts": args.kmeans_restarts,
         "node_prior_bisecting_restarts": args.bisecting_restarts,
-        "label_used_for_training_or_selection": False,
+        "label_used_for_parameter_updates_or_final_checkpoint_selection": False,
+        "acceptance_metric": "final_epoch_Macro_F1",
         "python": args.python_bin,
         "device": args.device,
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
