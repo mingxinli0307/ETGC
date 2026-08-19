@@ -9,6 +9,7 @@ if ROOT not in sys.path:
 
 from edge_losses import node_sbm_reconstruction_loss_global
 from edge_main import build_parser
+from edge_node_prior import build_adaptive_node_prior, temporal_block_validation_auc
 
 
 def test_node_sbm_loss_is_finite_symmetric_and_backpropagates():
@@ -50,3 +51,46 @@ def test_node_sbm_cli_is_opt_in():
     args = build_parser().parse_args([])
     assert args.lambda_node_sbm == 0.0
     assert args.node_sbm_negative_ratio == 1.0
+    assert args.lambda_node_prior == 0.0
+    assert args.node_prior_mode == "none"
+
+
+def test_adaptive_node_prior_is_deterministic_and_label_free():
+    features = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [0.0, 1.0],
+            [0.1, 0.9],
+        ]
+    )
+    src = torch.tensor([0, 1, 0, 2, 3, 2, 0, 2]).numpy()
+    dst = torch.tensor([1, 0, 1, 3, 2, 3, 2, 0]).numpy()
+    times = torch.arange(len(src), dtype=torch.float32).numpy()
+
+    first, first_info = build_adaptive_node_prior(
+        features,
+        src,
+        dst,
+        times,
+        K=2,
+        restarts=4,
+        seed=11,
+        lloyd_iters=5,
+    )
+    second, second_info = build_adaptive_node_prior(
+        features,
+        src,
+        dst,
+        times,
+        K=2,
+        restarts=4,
+        seed=11,
+        lloyd_iters=5,
+    )
+
+    assert torch.equal(first, second)
+    assert first_info == second_info
+    assert first_info["node_prior_active_clusters"] == 2
+    auc = temporal_block_validation_auc(first.numpy(), src, dst, times, K=2)
+    assert 0.0 <= auc <= 1.0

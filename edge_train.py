@@ -6,6 +6,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
 from tqdm import tqdm
 from sklearn.metrics import adjusted_rand_score
@@ -38,6 +39,7 @@ from edge_model import (
     load_pretrained_node_features,
     tensor_checksum,
 )
+from edge_node_prior import build_adaptive_node_prior
 from edge_proximity import compute_edge_ppr_cached
 from edge_time import build_edge_time_features
 from edge_uniform_diagnostic import (
@@ -330,6 +332,9 @@ class EdgeHiNoSTrainer:
         self.model_init_info["cluster_output_weight_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["cluster_output_weight_l2"]
         self._record_uniform_stage_no_grad("after_cluster_initialization")
         self._capture_init_reference()
+        self.node_prior_t = None
+        self.node_prior_info = {}
+        self._initialize_node_prior_if_enabled()
         if bool(int(getattr(args, "direct_kmeans_eval", 0))):
             self.optimizer = None
             self.node_emb_optimizer_info = {
@@ -360,6 +365,25 @@ class EdgeHiNoSTrainer:
                 continue
             result.add(int(part))
         return result
+
+    def _initialize_node_prior_if_enabled(self) -> None:
+        weight = float(getattr(self.args, "lambda_node_prior", 0.0))
+        mode = str(getattr(self.args, "node_prior_mode", "none")).lower()
+        if weight <= 0.0 or mode == "none":
+            return
+        if mode != "adaptive_temporal_kmeans":
+            raise ValueError(f"Unsupported node_prior_mode: {mode}")
+        self.node_prior_t, self.node_prior_info = build_adaptive_node_prior(
+            self.model.node_emb,
+            self.data.src,
+            self.data.dst,
+            self.data.times,
+            self.K,
+            restarts=int(getattr(self.args, "node_prior_restarts", 100)),
+            seed=int(getattr(self.args, "node_prior_seed", 10000)),
+            lloyd_iters=int(getattr(self.args, "node_prior_lloyd_iters", 30)),
+            auc_threshold=float(getattr(self.args, "node_prior_auc_threshold", 0.9)),
+        )
 
     def _resolve_feature_path(self) -> str:
         if getattr(self.args, "feature_path", ""):
@@ -1362,6 +1386,8 @@ class EdgeHiNoSTrainer:
             "penalty_weight",
             "cluster_loss",
             "projection_loss",
+            "node_prior_loss",
+            "weighted_node_prior_loss",
             "node_sbm_loss",
             "weighted_node_sbm_loss",
             "node_sbm_block_logit_min",
@@ -1520,6 +1546,9 @@ class EdgeHiNoSTrainer:
                 "lambda_node_anchor": float(getattr(self.args, "lambda_node_anchor", 0.0)),
                 "lambda_node_sbm": float(getattr(self.args, "lambda_node_sbm", 0.0)),
                 "node_sbm_negative_ratio": float(getattr(self.args, "node_sbm_negative_ratio", 1.0)),
+                "lambda_node_prior": float(getattr(self.args, "lambda_node_prior", 0.0)),
+                "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
+                "node_prior_info": self.node_prior_info,
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
                 "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
                 "node_dim": int(self.node_dim),
@@ -1597,6 +1626,9 @@ class EdgeHiNoSTrainer:
             "lambda_node_anchor": float(getattr(self.args, "lambda_node_anchor", 0.0)),
             "lambda_node_sbm": float(getattr(self.args, "lambda_node_sbm", 0.0)),
             "node_sbm_negative_ratio": float(getattr(self.args, "node_sbm_negative_ratio", 1.0)),
+            "lambda_node_prior": float(getattr(self.args, "lambda_node_prior", 0.0)),
+            "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
+            "node_prior_info": self.node_prior_info,
             "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
             "node_dim": int(self.node_dim),
             "time_dim": int(getattr(self.args, "time_dim", 0)),
@@ -1653,12 +1685,17 @@ class EdgeHiNoSTrainer:
         lambda_node_anchor = float(getattr(self.args, "lambda_node_anchor", 0.0))
         lambda_node_sbm = float(getattr(self.args, "lambda_node_sbm", 0.0))
         node_sbm_negative_ratio = float(getattr(self.args, "node_sbm_negative_ratio", 1.0))
+        lambda_node_prior = float(getattr(self.args, "lambda_node_prior", 0.0))
         if lambda_node_sbm < 0.0:
             raise ValueError(f"lambda_node_sbm must be nonnegative, got {lambda_node_sbm}")
         if node_sbm_negative_ratio <= 0.0:
             raise ValueError(
                 f"node_sbm_negative_ratio must be positive, got {node_sbm_negative_ratio}"
             )
+        if lambda_node_prior < 0.0:
+            raise ValueError(f"lambda_node_prior must be nonnegative, got {lambda_node_prior}")
+        if lambda_node_prior > 0.0 and self.node_prior_t is None:
+            raise ValueError("lambda_node_prior is positive but no node prior was initialized")
         total_start = time.time()
         self._init_metrics_csv()
 
@@ -1746,6 +1783,8 @@ class EdgeHiNoSTrainer:
             node_sbm_loss_value = 0.0
             weighted_node_sbm_loss_value = 0.0
             node_sbm_stats = {}
+            node_prior_loss_value = 0.0
+            weighted_node_prior_loss_value = 0.0
             node_anchor_loss_value = 0.0
             weighted_node_anchor_loss_value = 0.0
             global_total_loss_value = 0.0
@@ -1760,6 +1799,7 @@ class EdgeHiNoSTrainer:
                 h_before_global = self._node_emb_snapshot_cpu()
                 cluster_before_global = self._cluster_head_snapshot_cpu()
                 self.optimizer.zero_grad(set_to_none=True)
+                S_all = None
                 should_uniform_diag = (
                     self.uniform_collapse_diagnostic
                     and not self.uniform_diag_after_first_done
@@ -1863,12 +1903,32 @@ class EdgeHiNoSTrainer:
                         f"node_sbm_reconstruction_loss_global is not finite: value={scalar_value(sbm_loss)}"
                     )
 
+                if lambda_node_prior > 0.0:
+                    if S_all is None:
+                        S_all = project_edge_assignments_to_nodes_global(
+                            q_all,
+                            self.src_t,
+                            self.dst_t,
+                            self.data.num_nodes,
+                        )
+                    prior_loss = F.nll_loss(
+                        torch.log(S_all.clamp_min(1e-8)),
+                        self.node_prior_t,
+                    )
+                else:
+                    prior_loss = self._zero_scalar()
+                if not torch.isfinite(prior_loss).all():
+                    raise FloatingPointError(
+                        f"node_prior_loss is not finite: value={scalar_value(prior_loss)}"
+                    )
+
                 if self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"}:
                     global_loss = (
                         lambda_edge_ncut * cluster_loss
                         + lambda_proj * proj_loss
                         + lambda_node_anchor * anchor_loss
                         + lambda_node_sbm * sbm_loss
+                        + lambda_node_prior * prior_loss
                     )
                 else:
                     global_loss = (
@@ -1877,6 +1937,7 @@ class EdgeHiNoSTrainer:
                         + lambda_bal * orth_loss
                         + lambda_node_anchor * anchor_loss
                         + lambda_node_sbm * sbm_loss
+                        + lambda_node_prior * prior_loss
                     )
 
                 cut_loss_value = scalar_value(cut_loss)
@@ -1891,6 +1952,8 @@ class EdgeHiNoSTrainer:
                 weighted_node_anchor_loss_value = scalar_value(lambda_node_anchor * anchor_loss)
                 node_sbm_loss_value = scalar_value(sbm_loss)
                 weighted_node_sbm_loss_value = scalar_value(lambda_node_sbm * sbm_loss)
+                node_prior_loss_value = scalar_value(prior_loss)
+                weighted_node_prior_loss_value = scalar_value(lambda_node_prior * prior_loss)
                 global_total_loss_value = scalar_value(global_loss)
 
                 if should_uniform_diag:
@@ -1913,6 +1976,7 @@ class EdgeHiNoSTrainer:
                     or lambda_proj != 0.0
                     or lambda_node_anchor != 0.0
                     or lambda_node_sbm != 0.0
+                    or lambda_node_prior != 0.0
                     or (self.cluster_loss_type == "legacy_ncut" and lambda_bal != 0.0)
                 ):
                     sync_cuda()
@@ -1969,6 +2033,8 @@ class EdgeHiNoSTrainer:
                 "penalty_weight": float(getattr(self.args, "lambda_orth", 1.0)),
                 "cluster_loss": cluster_loss_value,
                 "projection_loss": projection_loss_value,
+                "node_prior_loss": node_prior_loss_value,
+                "weighted_node_prior_loss": weighted_node_prior_loss_value,
                 "node_sbm_loss": node_sbm_loss_value,
                 "weighted_node_sbm_loss": weighted_node_sbm_loss_value,
                 **node_sbm_stats,
@@ -2096,7 +2162,8 @@ class EdgeHiNoSTrainer:
                     f"after_prox_f1={record.get('after_prox_Macro_F1', 0.0):.4f} "
                     f"after_global_f1={record.get('after_global_Macro_F1', 0.0):.4f} "
                     f"cut={cut_loss_value:.4f} orth={orth_loss_value:.4f} "
-                    f"proj={projection_loss_value:.4f} sbm={node_sbm_loss_value:.4f} "
+                    f"proj={projection_loss_value:.4f} prior={node_prior_loss_value:.4f} "
+                    f"sbm={node_sbm_loss_value:.4f} "
                     f"cluster={cluster_loss_value:.4f} "
                     f"global={global_total_loss_value:.4f} prox={record['prox_loss']:.4f} "
                     f"wprox={record['weighted_proximity_loss']:.4f} anchor={node_anchor_loss_value:.6g} "
@@ -2115,7 +2182,8 @@ class EdgeHiNoSTrainer:
                     f"ARI={metrics['ARI']:.4f} Macro_F1={metrics['Macro_F1']:.4f} "
                     f"cut={cut_loss_value:.4f} orth={orth_loss_value:.4f} "
                     f"penalty_type={str(getattr(self.args, 'orth_type', 'orth')).lower()} "
-                    f"proj={projection_loss_value:.4f} sbm={node_sbm_loss_value:.4f} "
+                    f"proj={projection_loss_value:.4f} prior={node_prior_loss_value:.4f} "
+                    f"sbm={node_sbm_loss_value:.4f} "
                     f"cluster={cluster_loss_value:.4f} "
                     f"global={global_total_loss_value:.4f} prox={record['prox_loss']:.4f} "
                     f"wprox={record['weighted_proximity_loss']:.4f} anchor={node_anchor_loss_value:.6g} "
