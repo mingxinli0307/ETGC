@@ -39,7 +39,7 @@ from edge_model import (
     load_pretrained_node_features,
     tensor_checksum,
 )
-from edge_node_prior import build_adaptive_node_prior
+from edge_node_prior import build_adaptive_node_prior, build_component_structural_node_prior
 from edge_proximity import compute_edge_ppr_cached
 from edge_time import build_edge_time_features
 from edge_uniform_diagnostic import (
@@ -279,6 +279,9 @@ class EdgeHiNoSTrainer:
         self.src_t = torch.from_numpy(self.data.src).long().to(self.device)
         self.dst_t = torch.from_numpy(self.data.dst).long().to(self.device)
         self.time_feat_t = torch.from_numpy(self.time_feat_np).float().to(self.device)
+        self.node_prior_t = None
+        self.node_prior_info = {}
+        self.node_prior_logit_strength = float(getattr(args, "node_prior_logit_strength", 0.0))
         self.output_dir = str(getattr(args, "output_dir", "") or "")
         self.metrics_csv_path = os.path.join(self.output_dir, "metrics.csv") if self.output_dir else ""
         self.epoch_records = []
@@ -321,6 +324,7 @@ class EdgeHiNoSTrainer:
         self.model_init_info["cluster_output_bias_l2_initial"] = self.model_init_info["output_bias_l2"]
         self.model_init_info["cluster_output_weight_l2_initial"] = self.model_init_info["cluster_output_weight_l2"]
         self.model_init_info["prototype_init_executed"] = False
+        self._initialize_node_prior_if_enabled()
         self._record_uniform_stage_no_grad("after_model_initialization")
         self.prototype_initialization_pending = False
         if self._should_defer_prototype_initialization():
@@ -332,9 +336,6 @@ class EdgeHiNoSTrainer:
         self.model_init_info["cluster_output_weight_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["cluster_output_weight_l2"]
         self._record_uniform_stage_no_grad("after_cluster_initialization")
         self._capture_init_reference()
-        self.node_prior_t = None
-        self.node_prior_info = {}
-        self._initialize_node_prior_if_enabled()
         if bool(int(getattr(args, "direct_kmeans_eval", 0))):
             self.optimizer = None
             self.node_emb_optimizer_info = {
@@ -369,21 +370,32 @@ class EdgeHiNoSTrainer:
     def _initialize_node_prior_if_enabled(self) -> None:
         weight = float(getattr(self.args, "lambda_node_prior", 0.0))
         mode = str(getattr(self.args, "node_prior_mode", "none")).lower()
-        if weight <= 0.0 or mode == "none":
+        if (weight <= 0.0 and self.node_prior_logit_strength <= 0.0) or mode == "none":
             return
-        if mode != "adaptive_temporal_kmeans":
+        if mode == "adaptive_temporal_kmeans":
+            self.node_prior_t, self.node_prior_info = build_adaptive_node_prior(
+                self.model.node_emb,
+                self.data.src,
+                self.data.dst,
+                self.data.times,
+                self.K,
+                restarts=int(getattr(self.args, "node_prior_restarts", 100)),
+                seed=int(getattr(self.args, "node_prior_seed", 10000)),
+                lloyd_iters=int(getattr(self.args, "node_prior_lloyd_iters", 30)),
+                auc_threshold=float(getattr(self.args, "node_prior_auc_threshold", 0.9)),
+            )
+        elif mode == "component_structural":
+            self.node_prior_t, self.node_prior_info = build_component_structural_node_prior(
+                self.model.node_emb,
+                self.data.src,
+                self.data.dst,
+                self.K,
+                seed=int(getattr(self.args, "node_prior_seed", self.model_seed)),
+                kmeans_restarts=int(getattr(self.args, "node_prior_restarts", 500)),
+                bisecting_restarts=int(getattr(self.args, "node_prior_bisecting_restarts", 50)),
+            )
+        else:
             raise ValueError(f"Unsupported node_prior_mode: {mode}")
-        self.node_prior_t, self.node_prior_info = build_adaptive_node_prior(
-            self.model.node_emb,
-            self.data.src,
-            self.data.dst,
-            self.data.times,
-            self.K,
-            restarts=int(getattr(self.args, "node_prior_restarts", 100)),
-            seed=int(getattr(self.args, "node_prior_seed", 10000)),
-            lloyd_iters=int(getattr(self.args, "node_prior_lloyd_iters", 30)),
-            auc_threshold=float(getattr(self.args, "node_prior_auc_threshold", 0.9)),
-        )
 
     def _resolve_feature_path(self) -> str:
         if getattr(self.args, "feature_path", ""):
@@ -444,13 +456,36 @@ class EdgeHiNoSTrainer:
         return_logits: bool = False,
         return_cluster_hidden: bool = False,
     ):
-        return self.model(
+        if self.node_prior_t is None or self.node_prior_logit_strength <= 0.0:
+            return self.model(
+                src,
+                dst,
+                time_feat,
+                return_logits=return_logits,
+                return_cluster_hidden=return_cluster_hidden,
+            )
+        output = self.model(
             src,
             dst,
             time_feat,
-            return_logits=return_logits,
+            return_logits=True,
             return_cluster_hidden=return_cluster_hidden,
         )
+        if return_cluster_hidden:
+            edge_repr, _base_q, logits, cluster_hidden = output
+        else:
+            edge_repr, _base_q, logits = output
+        prior_labels = self.node_prior_t.index_select(0, src.long())
+        prior_logits = F.one_hot(prior_labels, num_classes=self.K).to(dtype=logits.dtype)
+        logits = logits + self.node_prior_logit_strength * prior_logits
+        q = F.softmax(logits, dim=-1)
+        if return_logits and return_cluster_hidden:
+            return edge_repr, q, logits, cluster_hidden
+        if return_logits:
+            return edge_repr, q, logits
+        if return_cluster_hidden:
+            return edge_repr, q, cluster_hidden
+        return edge_repr, q
 
     def _forward_ids(self, ids: np.ndarray):
         ids_t = torch.from_numpy(ids).long().to(self.device)
@@ -1549,6 +1584,7 @@ class EdgeHiNoSTrainer:
                 "lambda_node_prior": float(getattr(self.args, "lambda_node_prior", 0.0)),
                 "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
                 "node_prior_info": self.node_prior_info,
+                "node_prior_logit_strength": float(self.node_prior_logit_strength),
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
                 "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
                 "node_dim": int(self.node_dim),
@@ -1629,6 +1665,7 @@ class EdgeHiNoSTrainer:
             "lambda_node_prior": float(getattr(self.args, "lambda_node_prior", 0.0)),
             "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
             "node_prior_info": self.node_prior_info,
+            "node_prior_logit_strength": float(self.node_prior_logit_strength),
             "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
             "node_dim": int(self.node_dim),
             "time_dim": int(getattr(self.args, "time_dim", 0)),

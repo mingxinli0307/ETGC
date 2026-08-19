@@ -9,7 +9,32 @@ if ROOT not in sys.path:
 
 from edge_losses import node_sbm_reconstruction_loss_global
 from edge_main import build_parser
-from edge_node_prior import build_adaptive_node_prior, temporal_block_validation_auc
+from edge_node_prior import (
+    build_adaptive_node_prior,
+    build_component_structural_node_prior,
+    temporal_block_validation_auc,
+)
+from edge_train import EdgeHiNoSTrainer
+
+
+class _ZeroLogitModel(torch.nn.Module):
+    def forward(
+        self,
+        src,
+        dst,
+        time_feat,
+        return_logits=False,
+        return_cluster_hidden=False,
+    ):
+        edge_repr = torch.zeros((src.numel(), 2), dtype=time_feat.dtype)
+        logits = torch.zeros((src.numel(), 3), dtype=time_feat.dtype)
+        q = torch.softmax(logits, dim=1)
+        result = [edge_repr, q]
+        if return_logits:
+            result.append(logits)
+        if return_cluster_hidden:
+            result.append(torch.ones((src.numel(), 2), dtype=time_feat.dtype))
+        return tuple(result)
 
 
 def test_node_sbm_loss_is_finite_symmetric_and_backpropagates():
@@ -53,6 +78,7 @@ def test_node_sbm_cli_is_opt_in():
     assert args.node_sbm_negative_ratio == 1.0
     assert args.lambda_node_prior == 0.0
     assert args.node_prior_mode == "none"
+    assert args.node_prior_logit_strength == 0.0
 
 
 def test_adaptive_node_prior_is_deterministic_and_label_free():
@@ -94,3 +120,80 @@ def test_adaptive_node_prior_is_deterministic_and_label_free():
     assert first_info["node_prior_active_clusters"] == 2
     auc = temporal_block_validation_auc(first.numpy(), src, dst, times, K=2)
     assert 0.0 <= auc <= 1.0
+
+
+def test_component_structural_prior_preserves_disconnected_residue():
+    features = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [0.0, 1.0],
+            [0.1, 0.9],
+            [-1.0, 0.0],
+            [-0.9, -0.1],
+            [0.0, -1.0],
+            [0.1, -0.9],
+        ]
+    )
+    # Nodes 0..5 form the giant component; nodes 6..7 form a minor one.
+    src = torch.tensor([0, 1, 2, 3, 4, 6]).numpy()
+    dst = torch.tensor([1, 2, 3, 4, 5, 7]).numpy()
+    labels, info = build_component_structural_node_prior(
+        features,
+        src,
+        dst,
+        K=3,
+        seed=17,
+        kmeans_restarts=3,
+        bisecting_restarts=3,
+    )
+
+    assert info["node_prior_mode_effective"] == "component_preserving_bisecting_kmeans"
+    assert info["node_prior_connected_components"] == 2
+    assert info["node_prior_active_clusters"] == 3
+    assert labels[6].item() == 2
+    assert labels[7].item() == 2
+
+
+def test_component_structural_prior_uses_global_kmeans_for_many_components():
+    features = torch.eye(6)
+    # No edge joins distinct nodes, hence component_count > K.
+    nodes = torch.arange(6).numpy()
+    labels, info = build_component_structural_node_prior(
+        features,
+        nodes,
+        nodes,
+        K=2,
+        seed=19,
+        kmeans_restarts=3,
+        bisecting_restarts=3,
+    )
+
+    assert info["node_prior_mode_effective"] == "global_l2_kmeans"
+    assert info["node_prior_connected_components"] == 6
+    assert info["node_prior_active_clusters"] == 2
+
+
+def test_structural_prior_logit_bias_guides_event_q_by_source_node():
+    trainer = EdgeHiNoSTrainer.__new__(EdgeHiNoSTrainer)
+    trainer.model = _ZeroLogitModel()
+    trainer.node_prior_t = torch.tensor([2, 0, 1])
+    trainer.node_prior_logit_strength = 8.0
+    trainer.K = 3
+    src = torch.tensor([0, 1, 2])
+    dst = torch.tensor([1, 2, 0])
+    time_feat = torch.zeros((3, 1))
+
+    edge_repr, q, logits, hidden = trainer._forward_event_tensors(
+        src,
+        dst,
+        time_feat,
+        return_logits=True,
+        return_cluster_hidden=True,
+    )
+
+    assert edge_repr.shape == (3, 2)
+    assert hidden.shape == (3, 2)
+    assert torch.equal(q.argmax(dim=1), trainer.node_prior_t[src])
+    assert torch.equal(logits.argmax(dim=1), trainer.node_prior_t[src])
+    assert torch.allclose(q.sum(dim=1), torch.ones(3))

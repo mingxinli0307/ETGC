@@ -1,8 +1,94 @@
 import numpy as np
+import scipy.sparse as sp
 import torch
+from scipy.sparse.csgraph import connected_components
+from sklearn.cluster import BisectingKMeans, KMeans
 from sklearn.metrics import roc_auc_score
 
 from edge_model import assign_all_to_centers, fit_kmeans_centers
+
+
+def build_component_structural_node_prior(
+    node_features: torch.Tensor,
+    src: np.ndarray,
+    dst: np.ndarray,
+    K: int,
+    seed: int,
+    kmeans_restarts: int = 500,
+    bisecting_restarts: int = 50,
+) -> tuple:
+    """Create a graph-component-aware partition without ground-truth labels.
+
+    When a graph has a small nontrivial number of connected components (at
+    most K), all minor components retain one shared disconnected-component
+    cluster and the giant component is bisected into the remaining K-1
+    clusters. Otherwise standard multi-start KMeans is used on all normalized
+    node features. Both paths select solutions by their native unsupervised
+    objective only.
+    """
+    if node_features.dim() != 2:
+        raise ValueError(f"node_features must be 2D, got {tuple(node_features.shape)}")
+    n = int(node_features.size(0))
+    if int(K) <= 1 or n < int(K):
+        raise ValueError(f"component structural prior requires n >= K > 1, got n={n}, K={K}")
+    normalized = node_features.detach().cpu().numpy().astype(np.float32, copy=True)
+    normalized /= np.maximum(np.linalg.norm(normalized, axis=1, keepdims=True), 1e-12)
+    src = np.asarray(src, dtype=np.int64).reshape(-1)
+    dst = np.asarray(dst, dtype=np.int64).reshape(-1)
+    adjacency = sp.coo_matrix(
+        (np.ones(len(src), dtype=np.float32), (src, dst)),
+        shape=(n, n),
+    )
+    component_count, component_ids = connected_components(
+        adjacency + adjacency.T,
+        directed=False,
+    )
+    component_sizes = np.bincount(component_ids, minlength=component_count)
+
+    giant_component = int(np.argmax(component_sizes))
+    giant_mask = component_ids == giant_component
+    can_preserve_components = (
+        1 < int(component_count) <= int(K)
+        and int(giant_mask.sum()) >= int(K) - 1
+    )
+    if can_preserve_components:
+        estimator = BisectingKMeans(
+            n_clusters=int(K) - 1,
+            init="k-means++",
+            n_init=int(bisecting_restarts),
+            max_iter=300,
+            random_state=int(seed),
+            bisecting_strategy="biggest_inertia",
+        )
+        labels = np.full(n, int(K) - 1, dtype=np.int64)
+        labels[giant_mask] = estimator.fit_predict(normalized[giant_mask])
+        mode = "component_preserving_bisecting_kmeans"
+        objective = float(estimator.inertia_)
+    else:
+        estimator = KMeans(
+            n_clusters=int(K),
+            init="k-means++",
+            n_init=int(kmeans_restarts),
+            max_iter=300,
+            random_state=int(seed),
+            algorithm="lloyd",
+        )
+        labels = estimator.fit_predict(normalized).astype(np.int64, copy=False)
+        mode = "global_l2_kmeans"
+        objective = float(estimator.inertia_)
+
+    info = {
+        "node_prior_mode_effective": mode,
+        "node_prior_selected_seed": int(seed),
+        "node_prior_selected_inertia": objective,
+        "node_prior_connected_components": int(component_count),
+        "node_prior_largest_component_size": int(component_sizes.max()),
+        "node_prior_kmeans_restarts": int(kmeans_restarts),
+        "node_prior_bisecting_restarts": int(bisecting_restarts),
+        "node_prior_active_clusters": int(np.unique(labels).size),
+    }
+    labels_t = torch.from_numpy(labels.copy()).to(device=node_features.device, dtype=torch.long)
+    return labels_t, info
 
 
 def temporal_block_validation_auc(
