@@ -79,6 +79,7 @@ def test_node_sbm_cli_is_opt_in():
     assert args.lambda_node_prior == 0.0
     assert args.node_prior_mode == "none"
     assert args.node_prior_logit_strength == 0.0
+    assert args.node_prior_event_role == "source"
 
 
 def test_adaptive_node_prior_is_deterministic_and_label_free():
@@ -174,11 +175,34 @@ def test_component_structural_prior_uses_global_kmeans_for_many_components():
     assert info["node_prior_active_clusters"] == 2
 
 
+def test_component_structural_prior_can_force_global_kmeans():
+    features = torch.tensor(
+        [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9], [-1.0, 0.0], [-0.9, 0.1]]
+    )
+    src = torch.tensor([0, 1, 2, 4]).numpy()
+    dst = torch.tensor([1, 2, 3, 5]).numpy()
+    _, info = build_component_structural_node_prior(
+        features,
+        src,
+        dst,
+        K=3,
+        seed=23,
+        kmeans_restarts=3,
+        bisecting_restarts=3,
+        preserve_components=False,
+    )
+
+    assert info["node_prior_connected_components"] == 2
+    assert info["node_prior_mode_effective"] == "global_l2_kmeans"
+    assert info["node_prior_preserve_components"] is False
+
+
 def test_structural_prior_logit_bias_guides_event_q_by_source_node():
     trainer = EdgeHiNoSTrainer.__new__(EdgeHiNoSTrainer)
     trainer.model = _ZeroLogitModel()
     trainer.node_prior_t = torch.tensor([2, 0, 1])
     trainer.node_prior_logit_strength = 8.0
+    trainer.node_prior_event_role = "source"
     trainer.K = 3
     src = torch.tensor([0, 1, 2])
     dst = torch.tensor([1, 2, 0])
@@ -197,3 +221,24 @@ def test_structural_prior_logit_bias_guides_event_q_by_source_node():
     assert torch.equal(q.argmax(dim=1), trainer.node_prior_t[src])
     assert torch.equal(logits.argmax(dim=1), trainer.node_prior_t[src])
     assert torch.allclose(q.sum(dim=1), torch.ones(3))
+
+
+def test_structural_prior_can_average_source_and_destination_roles():
+    trainer = EdgeHiNoSTrainer.__new__(EdgeHiNoSTrainer)
+    trainer.model = _ZeroLogitModel()
+    trainer.node_prior_t = torch.tensor([2, 0, 1])
+    trainer.node_prior_logit_strength = 8.0
+    trainer.node_prior_event_role = "mean_endpoints"
+    trainer.K = 3
+    src = torch.tensor([0])
+    dst = torch.tensor([1])
+
+    _, q, logits = trainer._forward_event_tensors(
+        src,
+        dst,
+        torch.zeros((1, 1)),
+        return_logits=True,
+    )
+
+    assert torch.allclose(logits, torch.tensor([[4.0, 0.0, 4.0]]))
+    assert torch.allclose(q, torch.softmax(logits, dim=1))

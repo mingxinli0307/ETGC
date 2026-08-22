@@ -282,6 +282,7 @@ class EdgeHiNoSTrainer:
         self.node_prior_t = None
         self.node_prior_info = {}
         self.node_prior_logit_strength = float(getattr(args, "node_prior_logit_strength", 0.0))
+        self.node_prior_event_role = str(getattr(args, "node_prior_event_role", "source")).lower()
         self.output_dir = str(getattr(args, "output_dir", "") or "")
         self.metrics_csv_path = os.path.join(self.output_dir, "metrics.csv") if self.output_dir else ""
         self.epoch_records = []
@@ -384,7 +385,7 @@ class EdgeHiNoSTrainer:
                 lloyd_iters=int(getattr(self.args, "node_prior_lloyd_iters", 30)),
                 auc_threshold=float(getattr(self.args, "node_prior_auc_threshold", 0.9)),
             )
-        elif mode == "component_structural":
+        elif mode in {"component_structural", "global_structural"}:
             self.node_prior_t, self.node_prior_info = build_component_structural_node_prior(
                 self.model.node_emb,
                 self.data.src,
@@ -393,6 +394,7 @@ class EdgeHiNoSTrainer:
                 seed=int(getattr(self.args, "node_prior_seed", self.model_seed)),
                 kmeans_restarts=int(getattr(self.args, "node_prior_restarts", 500)),
                 bisecting_restarts=int(getattr(self.args, "node_prior_bisecting_restarts", 50)),
+                preserve_components=(mode == "component_structural"),
             )
         else:
             raise ValueError(f"Unsupported node_prior_mode: {mode}")
@@ -475,8 +477,14 @@ class EdgeHiNoSTrainer:
             edge_repr, _base_q, logits, cluster_hidden = output
         else:
             edge_repr, _base_q, logits = output
-        prior_labels = self.node_prior_t.index_select(0, src.long())
-        prior_logits = F.one_hot(prior_labels, num_classes=self.K).to(dtype=logits.dtype)
+        source_labels = self.node_prior_t.index_select(0, src.long())
+        prior_logits = F.one_hot(source_labels, num_classes=self.K).to(dtype=logits.dtype)
+        if self.node_prior_event_role == "mean_endpoints":
+            destination_labels = self.node_prior_t.index_select(0, dst.long())
+            destination_prior = F.one_hot(destination_labels, num_classes=self.K).to(dtype=logits.dtype)
+            prior_logits = 0.5 * (prior_logits + destination_prior)
+        elif self.node_prior_event_role != "source":
+            raise ValueError(f"Unsupported node_prior_event_role: {self.node_prior_event_role}")
         logits = logits + self.node_prior_logit_strength * prior_logits
         q = F.softmax(logits, dim=-1)
         if return_logits and return_cluster_hidden:
@@ -1585,6 +1593,7 @@ class EdgeHiNoSTrainer:
                 "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
                 "node_prior_info": self.node_prior_info,
                 "node_prior_logit_strength": float(self.node_prior_logit_strength),
+                "node_prior_event_role": self.node_prior_event_role,
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
                 "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
                 "node_dim": int(self.node_dim),
@@ -1666,6 +1675,7 @@ class EdgeHiNoSTrainer:
             "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
             "node_prior_info": self.node_prior_info,
             "node_prior_logit_strength": float(self.node_prior_logit_strength),
+            "node_prior_event_role": self.node_prior_event_role,
             "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
             "node_dim": int(self.node_dim),
             "time_dim": int(getattr(self.args, "time_dim", 0)),

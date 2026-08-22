@@ -80,7 +80,7 @@ def build_parser():
     parser.add_argument("--lambda_node_prior", type=float, default=0.0)
     parser.add_argument(
         "--node_prior_mode",
-        choices=["none", "adaptive_temporal_kmeans", "component_structural"],
+        choices=["none", "adaptive_temporal_kmeans", "component_structural", "global_structural"],
         default="none",
     )
     parser.add_argument("--node_prior_restarts", type=int, default=100)
@@ -89,6 +89,7 @@ def build_parser():
     parser.add_argument("--node_prior_auc_threshold", type=float, default=0.9)
     parser.add_argument("--node_prior_bisecting_restarts", type=int, default=50)
     parser.add_argument("--node_prior_logit_strength", type=float, default=0.0)
+    parser.add_argument("--node_prior_event_role", choices=["source", "mean_endpoints"], default="source")
     parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="small_lr")
     parser.add_argument("--node_emb_lr", type=float, default=1e-5)
     parser.add_argument("--prox_similarity_mode", choices=["event_dot", "cosine", "role_aware"], default="cosine")
@@ -187,7 +188,8 @@ def print_config(args, K=None):
     print(
         f"lambda_node_prior={args.lambda_node_prior}, node_prior_mode={args.node_prior_mode}, "
         f"node_prior_restarts={args.node_prior_restarts}, "
-        f"node_prior_logit_strength={args.node_prior_logit_strength}"
+        f"node_prior_logit_strength={args.node_prior_logit_strength}, "
+        f"node_prior_event_role={args.node_prior_event_role}"
     )
     print(f"cluster_output_bias_mode={args.cluster_output_bias_mode}")
     print(f"cluster_input_norm={args.cluster_input_norm}")
@@ -278,6 +280,7 @@ def main(args):
     print(f"lambda_node_sbm={args.lambda_node_sbm}")
     print(f"lambda_node_prior={args.lambda_node_prior}")
     print(f"node_prior_logit_strength={args.node_prior_logit_strength}")
+    print(f"node_prior_event_role={args.node_prior_event_role}")
     if trainer.node_prior_info:
         print(f"node_prior_info={trainer.node_prior_info}")
     for group in trainer.node_emb_optimizer_info.get("optimizer_groups", []):

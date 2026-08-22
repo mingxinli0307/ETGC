@@ -32,11 +32,12 @@ def run_one(args, dataset, seed, run_dir):
     )
     cmd.extend(
         [
-            "--node_prior_mode", "component_structural",
+            "--node_prior_mode", args.prior_mode,
             "--node_prior_seed", str(seed),
             "--node_prior_restarts", str(args.kmeans_restarts),
             "--node_prior_bisecting_restarts", str(args.bisecting_restarts),
             "--node_prior_logit_strength", str(args.logit_strength),
+            "--node_prior_event_role", args.event_role,
             "--lambda_node_prior", "0.0",
         ]
     )
@@ -57,6 +58,7 @@ def summarize(output_dir, datasets, seeds):
         "final_ari", "runtime_seconds", "node_prior_mode_effective",
         "node_prior_connected_components", "node_prior_active_clusters",
         "node_prior_logit_strength", "cluster_loss_type", "forest_samples",
+        "node_prior_event_role",
     ]
     rows = []
     for dataset in datasets:
@@ -80,6 +82,7 @@ def summarize(output_dir, datasets, seeds):
                     "node_prior_connected_components": prior.get("node_prior_connected_components", ""),
                     "node_prior_active_clusters": prior.get("node_prior_active_clusters", ""),
                     "node_prior_logit_strength": result.get("node_prior_logit_strength", ""),
+                    "node_prior_event_role": result.get("node_prior_event_role", ""),
                     "cluster_loss_type": config.get("cluster_loss_type", ""),
                     "forest_samples": config.get("forest_samples", ""),
                 }
@@ -103,6 +106,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--init-only", type=int, choices=(0, 1), default=0)
     parser.add_argument("--logit-strength", type=float, default=8.0)
+    parser.add_argument(
+        "--prior-mode", choices=("component_structural", "global_structural"),
+        default="component_structural",
+    )
+    parser.add_argument("--event-role", choices=("source", "mean_endpoints"), default="source")
     parser.add_argument("--kmeans-restarts", type=int, default=500)
     parser.add_argument("--bisecting-restarts", type=int, default=50)
     parser.add_argument("--no-resume", action="store_true")
@@ -131,8 +139,9 @@ def main():
         "cluster_output_bias_mode": "zero",
         "cluster_input_norm": "layernorm",
         "cluster_init_mode": "prototype",
-        "node_prior_mode": "component_structural",
+        "node_prior_mode": args.prior_mode,
         "node_prior_logit_strength": args.logit_strength,
+        "node_prior_event_role": args.event_role,
         "node_prior_kmeans_restarts": args.kmeans_restarts,
         "node_prior_bisecting_restarts": args.bisecting_restarts,
         "label_used_for_parameter_updates_or_final_checkpoint_selection": False,

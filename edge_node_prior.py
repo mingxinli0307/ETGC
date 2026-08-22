@@ -16,6 +16,7 @@ def build_component_structural_node_prior(
     seed: int,
     kmeans_restarts: int = 500,
     bisecting_restarts: int = 50,
+    preserve_components: bool = True,
 ) -> tuple:
     """Create a graph-component-aware partition without ground-truth labels.
 
@@ -48,7 +49,8 @@ def build_component_structural_node_prior(
     giant_component = int(np.argmax(component_sizes))
     giant_mask = component_ids == giant_component
     can_preserve_components = (
-        1 < int(component_count) <= int(K)
+        bool(preserve_components)
+        and 1 < int(component_count) <= int(K)
         and int(giant_mask.sum()) >= int(K) - 1
     )
     if can_preserve_components:
@@ -85,6 +87,7 @@ def build_component_structural_node_prior(
         "node_prior_largest_component_size": int(component_sizes.max()),
         "node_prior_kmeans_restarts": int(kmeans_restarts),
         "node_prior_bisecting_restarts": int(bisecting_restarts),
+        "node_prior_preserve_components": bool(preserve_components),
         "node_prior_active_clusters": int(np.unique(labels).size),
     }
     labels_t = torch.from_numpy(labels.copy()).to(device=node_features.device, dtype=torch.long)
