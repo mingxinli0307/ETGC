@@ -56,8 +56,8 @@ ABLATIONS = {
     "A2_current_time_only": {"time_feature_mode": "current"},
     "A3_random_cluster_init": {"cluster_init_mode": "random"},
     "A4_no_layernorm": {"cluster_input_norm": "none"},
-    "A5_no_matrix_ncut_update": {"lambda_edge_ncut": 0.0},
-    "A6_no_orth": {"lambda_orth": 0.0},
+    "A5_no_global_cluster_objective": {"global_cut_scale": 0.0, "global_orth_scale": 0.0},
+    "A6_no_orth": {"global_orth_scale": 0.0},
     "A7_global_prior": {"node_prior_mode": "global_structural"},
 }
 
@@ -231,6 +231,8 @@ def result_row(output_dir: Path, task: Task, epochs: int) -> dict:
         "node_prior_logit_strength": config.get("node_prior_logit_strength", ""),
         "lambda_orth": config.get("lambda_orth", ""),
         "lambda_edge_ncut": config.get("lambda_edge_ncut", ""),
+        "global_cut_scale": config.get("global_cut_scale", 1.0),
+        "global_orth_scale": config.get("global_orth_scale", 1.0),
         "time_feature_mode": config.get("time_feature_mode", ""),
         "cluster_init_mode": config.get("cluster_init_mode", ""),
         "cluster_input_norm": config.get("cluster_input_norm", ""),

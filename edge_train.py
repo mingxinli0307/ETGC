@@ -13,6 +13,7 @@ from sklearn.metrics import adjusted_rand_score
 
 from edge_data import load_edge_event_data
 from edge_losses import (
+    combine_cluster_objective,
     balance_loss,
     edge_orthqa_penalty_global,
     edge_ncut_loss,
@@ -1308,6 +1309,24 @@ class EdgeHiNoSTrainer:
             "edge_prediction_ari_init_final": float(adjusted_rand_score(self.init_reference["edge_labels"], edge_final)),
             "q_drift_fro_normalized": q_drift,
             "cluster_weight_drift_relative": weight_drift,
+            "ACC_init": float(self.init_reference_metrics.get("ACC", 0.0)),
+            "ACC_final": float(metrics_final.get("ACC", final_metrics.get("ACC", 0.0))),
+            "ACC_delta_final_init": float(
+                metrics_final.get("ACC", final_metrics.get("ACC", 0.0))
+                - self.init_reference_metrics.get("ACC", 0.0)
+            ),
+            "NMI_init": float(self.init_reference_metrics.get("NMI", 0.0)),
+            "NMI_final": float(metrics_final.get("NMI", final_metrics.get("NMI", 0.0))),
+            "NMI_delta_final_init": float(
+                metrics_final.get("NMI", final_metrics.get("NMI", 0.0))
+                - self.init_reference_metrics.get("NMI", 0.0)
+            ),
+            "ARI_init": float(self.init_reference_metrics.get("ARI", 0.0)),
+            "ARI_final": float(metrics_final.get("ARI", final_metrics.get("ARI", 0.0))),
+            "ARI_delta_final_init": float(
+                metrics_final.get("ARI", final_metrics.get("ARI", 0.0))
+                - self.init_reference_metrics.get("ARI", 0.0)
+            ),
             "macro_f1_delta_final_init": float(metrics_final.get("Macro_F1", final_metrics.get("Macro_F1", 0.0)) - self.init_reference_metrics.get("Macro_F1", 0.0)),
             "macro_f1_delta_best_init": float((getattr(self, "best_metrics_for_result", {}) or {}).get("Macro_F1", 0.0) - self.init_reference_metrics.get("Macro_F1", 0.0)),
             "MacroF1_init": float(self.init_reference_metrics.get("Macro_F1", 0.0)),
@@ -1420,6 +1439,10 @@ class EdgeHiNoSTrainer:
             "Macro_F1",
             "cut_loss",
             "orth_loss",
+            "global_cut_scale",
+            "global_orth_scale",
+            "weighted_cut_loss",
+            "weighted_orth_loss",
             "orth_original_loss",
             "orthqa_loss",
             "orth_original_value",
@@ -1727,12 +1750,18 @@ class EdgeHiNoSTrainer:
         warmup_epochs = int(getattr(self.args, "prox_warmup_epochs", getattr(self.args, "global_warmup_epochs", 0)))
         lambda_prox = float(self.args.lambda_prox)
         lambda_edge_ncut = float(self.args.lambda_edge_ncut)
+        global_cut_scale = float(getattr(self.args, "global_cut_scale", 1.0))
+        global_orth_scale = float(getattr(self.args, "global_orth_scale", 1.0))
         lambda_proj = float(self.args.lambda_proj)
         lambda_bal = float(self.args.lambda_bal)
         lambda_node_anchor = float(getattr(self.args, "lambda_node_anchor", 0.0))
         lambda_node_sbm = float(getattr(self.args, "lambda_node_sbm", 0.0))
         node_sbm_negative_ratio = float(getattr(self.args, "node_sbm_negative_ratio", 1.0))
         lambda_node_prior = float(getattr(self.args, "lambda_node_prior", 0.0))
+        if global_cut_scale < 0.0:
+            raise ValueError(f"global_cut_scale must be nonnegative, got {global_cut_scale}")
+        if global_orth_scale < 0.0:
+            raise ValueError(f"global_orth_scale must be nonnegative, got {global_orth_scale}")
         if lambda_node_sbm < 0.0:
             raise ValueError(f"lambda_node_sbm must be nonnegative, got {lambda_node_sbm}")
         if node_sbm_negative_ratio <= 0.0:
@@ -1870,7 +1899,7 @@ class EdgeHiNoSTrainer:
                 sync_cuda()
                 cluster_start = time.time()
                 if self.cluster_loss_type == "matrix_ncut":
-                    cluster_loss, cut_loss, orth_loss = edge_matrix_ncut_loss_global(
+                    _combined_cluster_loss, cut_loss, orth_loss = edge_matrix_ncut_loss_global(
                         q_all,
                         self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
                         self.D_Pi_degree_np,
@@ -1880,7 +1909,7 @@ class EdgeHiNoSTrainer:
                         orth_type=str(getattr(self.args, "orth_type", "orthqa")),
                     )
                 elif self.cluster_loss_type == "legacy_trace_ratio":
-                    cluster_loss, cut_loss, orth_loss = edge_trace_mincut_loss_global(
+                    _combined_cluster_loss, cut_loss, orth_loss = edge_trace_mincut_loss_global(
                         q_all,
                         self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
                         self.D_Pi_degree_np,
@@ -1898,6 +1927,14 @@ class EdgeHiNoSTrainer:
                     )
                     orth_loss = balance_loss(q_all, self.K)
                     cluster_loss = cut_loss
+                if self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"}:
+                    cluster_loss = combine_cluster_objective(
+                        cut_loss,
+                        orth_loss,
+                        lambda_orth=float(getattr(self.args, "lambda_orth", 1.0)),
+                        cut_scale=global_cut_scale,
+                        orth_scale=global_orth_scale,
+                    )
                 sync_cuda()
                 cluster_forward_seconds = time.time() - cluster_start
 
@@ -1994,6 +2031,19 @@ class EdgeHiNoSTrainer:
                 elif str(getattr(self.args, "orth_type", "orth")).lower() == "orthqa":
                     orthqa_loss_value = orth_loss_value
                 cluster_loss_value = scalar_value(cluster_loss)
+                if self.cluster_loss_type in {"matrix_ncut", "legacy_trace_ratio"}:
+                    weighted_cut_loss_value = scalar_value(
+                        lambda_edge_ncut * global_cut_scale * cut_loss
+                    )
+                    weighted_orth_loss_value = scalar_value(
+                        lambda_edge_ncut
+                        * float(getattr(self.args, "lambda_orth", 1.0))
+                        * global_orth_scale
+                        * orth_loss
+                    )
+                else:
+                    weighted_cut_loss_value = scalar_value(lambda_edge_ncut * cut_loss)
+                    weighted_orth_loss_value = scalar_value(lambda_bal * orth_loss)
                 projection_loss_value = scalar_value(proj_loss)
                 node_anchor_loss_value = scalar_value(anchor_loss)
                 weighted_node_anchor_loss_value = scalar_value(lambda_node_anchor * anchor_loss)
@@ -2019,7 +2069,13 @@ class EdgeHiNoSTrainer:
                     )
 
                 if global_loss.requires_grad and (
-                    lambda_edge_ncut != 0.0
+                    (
+                        lambda_edge_ncut != 0.0
+                        and (
+                            global_cut_scale != 0.0
+                            or float(getattr(self.args, "lambda_orth", 1.0)) * global_orth_scale != 0.0
+                        )
+                    )
                     or lambda_proj != 0.0
                     or lambda_node_anchor != 0.0
                     or lambda_node_sbm != 0.0
@@ -2071,6 +2127,10 @@ class EdgeHiNoSTrainer:
                 "Macro_F1": metrics.get("Macro_F1", 0.0),
                 "cut_loss": cut_loss_value,
                 "orth_loss": orth_loss_value,
+                "global_cut_scale": global_cut_scale,
+                "global_orth_scale": global_orth_scale,
+                "weighted_cut_loss": weighted_cut_loss_value,
+                "weighted_orth_loss": weighted_orth_loss_value,
                 "orth_original_loss": stage_stats_for_epoch.get("orth_original_loss", orth_original_loss_value),
                 "orthqa_loss": stage_stats_for_epoch.get("orthqa_loss", orthqa_loss_value),
                 "orth_original_value": stage_stats_for_epoch.get("orth_original_value", ""),

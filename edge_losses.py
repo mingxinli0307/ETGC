@@ -91,6 +91,27 @@ def _check_scalar_finite(name: str, value: torch.Tensor, stats: dict) -> None:
         raise FloatingPointError(f"{name} is not finite: {details}")
 
 
+def combine_cluster_objective(
+    cut_loss: torch.Tensor,
+    orth_loss: torch.Tensor,
+    lambda_orth: float,
+    cut_scale: float = 1.0,
+    orth_scale: float = 1.0,
+) -> torch.Tensor:
+    """Combine cut and orthogonality terms with independent ablation gates.
+
+    The default scales preserve the established ETGC objective exactly:
+    ``L_cut + lambda_orth * L_orth``.  The separate nonnegative scales exist
+    only to support a clean Cut x Orth factorial ablation without changing the
+    mainline default semantics.
+    """
+    if float(cut_scale) < 0.0:
+        raise ValueError(f"cut_scale must be nonnegative, got {cut_scale}")
+    if float(orth_scale) < 0.0:
+        raise ValueError(f"orth_scale must be nonnegative, got {orth_scale}")
+    return float(cut_scale) * cut_loss + float(lambda_orth) * float(orth_scale) * orth_loss
+
+
 def _sparse_block_wq_numerator(W_E: sp.csr_matrix, Q_all: torch.Tensor, row_block_size: int) -> torch.Tensor:
     W_E = W_E.tocsr()
     m = int(W_E.shape[0])

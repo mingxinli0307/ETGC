@@ -47,7 +47,7 @@ def test_ablation_matrix_covers_final_modules_and_only_patent_global_prior():
         "A2_current_time_only",
         "A3_random_cluster_init",
         "A4_no_layernorm",
-        "A5_no_matrix_ncut_update",
+        "A5_no_global_cluster_objective",
         "A6_no_orth",
         "A7_global_prior",
     }
@@ -55,6 +55,19 @@ def test_ablation_matrix_covers_final_modules_and_only_patent_global_prior():
     global_tasks = [task for task in tasks if task.name == "A7_global_prior"]
     assert {(task.dataset, task.seed) for task in global_tasks} == {("patent", 42), ("patent", 43)}
     assert len(tasks) == 7 * 4 * 2 + 2
+
+
+def test_no_global_cluster_objective_disables_cut_and_orth_independently(tmp_path):
+    args = _args(tmp_path)
+    task = next(
+        task
+        for task in make_ablation_tasks()
+        if task.name == "A5_no_global_cluster_objective" and task.dataset == "patent" and task.seed == 42
+    )
+    cmd = " ".join(build_task_command(args, task, "cuda:0", task_run_dir(args.output_dir, task)))
+    assert "--global_cut_scale 0.0" in cmd
+    assert "--global_orth_scale 0.0" in cmd
+    assert "--lambda_edge_ncut 0.5" in cmd
 
 
 def test_commands_keep_paper_base_and_apply_ablation(tmp_path):

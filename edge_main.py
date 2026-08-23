@@ -72,6 +72,8 @@ def build_parser():
     parser.add_argument("--lambda_prox", type=float, default=1.0)
     parser.add_argument("--lambda_edge_ncut", type=float, default=0.5)
     parser.add_argument("--lambda_orth", type=float, default=1.0)
+    parser.add_argument("--global_cut_scale", type=float, default=1.0)
+    parser.add_argument("--global_orth_scale", type=float, default=1.0)
     parser.add_argument("--lambda_proj", type=float, default=0.0)
     parser.add_argument("--lambda_bal", type=float, default=50.0)
     parser.add_argument("--lambda_node_anchor", type=float, default=0.0)
@@ -168,6 +170,7 @@ def print_config(args, K=None):
     print(f"cluster_loss_type={args.cluster_loss_type}, orth_type={args.orth_type}, lambda_orth={args.lambda_orth}")
     print(
         f"lambda_prox={args.lambda_prox}, lambda_edge_ncut={args.lambda_edge_ncut}, "
+        f"global_cut_scale={args.global_cut_scale}, global_orth_scale={args.global_orth_scale}, "
         f"lambda_proj={args.lambda_proj}, lambda_bal={args.lambda_bal}"
     )
     print(f"legacy_balance_disabled={str(args.cluster_loss_type != 'legacy_ncut').lower()}")
@@ -251,6 +254,8 @@ def main(args):
     print(f"ncut_scope={args.ncut_scope}")
     print(f"orth_type={args.orth_type}")
     print(f"lambda_orth={args.lambda_orth}")
+    print(f"global_cut_scale={args.global_cut_scale}")
+    print(f"global_orth_scale={args.global_orth_scale}")
     print(f"legacy_balance_disabled={str(args.cluster_loss_type != 'legacy_ncut').lower()}")
     print(f"Pi_cut_sparse_mode={trainer.Pi_cut_sparse_mode}")
     print(f"node_emb_mode_effective={trainer.node_emb_optimizer_info['node_emb_mode']}")

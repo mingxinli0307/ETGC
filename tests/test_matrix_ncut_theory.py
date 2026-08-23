@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from edge_losses import edge_matrix_ncut_loss_global, edge_trace_mincut_loss_global
+from edge_losses import combine_cluster_objective, edge_matrix_ncut_loss_global, edge_trace_mincut_loss_global
 from edge_proximity import build_edge_ncut_affinity, sparse_symmetry_error
 
 
@@ -101,3 +101,24 @@ def test_matrix_ncut_is_not_legacy_scalar_trace_ratio():
         q, pi_cut, degree, K=3, lambda_orth=0.0, eps=1e-6, orth_type="orthqa"
     )
     assert abs(float(matrix_cut.detach() - legacy_cut.detach())) > 1e-3
+
+
+def test_cut_and_orth_ablation_scales_are_independent_and_default_is_compatible():
+    cut = torch.tensor(2.0, requires_grad=True)
+    orth = torch.tensor(3.0, requires_grad=True)
+
+    default = combine_cluster_objective(cut, orth, lambda_orth=0.5)
+    cut_only = combine_cluster_objective(cut, orth, lambda_orth=0.5, orth_scale=0.0)
+    orth_only = combine_cluster_objective(cut, orth, lambda_orth=0.5, cut_scale=0.0)
+    neither = combine_cluster_objective(
+        cut,
+        orth,
+        lambda_orth=0.5,
+        cut_scale=0.0,
+        orth_scale=0.0,
+    )
+
+    assert torch.isclose(default, torch.tensor(3.5))
+    assert torch.isclose(cut_only, torch.tensor(2.0))
+    assert torch.isclose(orth_only, torch.tensor(1.5))
+    assert torch.isclose(neither, torch.tensor(0.0))
