@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 import time
@@ -283,6 +284,7 @@ class EdgeHiNoSTrainer:
         self.node_prior_t = None
         self.node_prior_info = {}
         self.node_prior_logit_strength = float(getattr(args, "node_prior_logit_strength", 0.0))
+        self.node_prior_initial_logit_strength = self.node_prior_logit_strength
         self.node_prior_event_role = str(getattr(args, "node_prior_event_role", "source")).lower()
         self.output_dir = str(getattr(args, "output_dir", "") or "")
         self.metrics_csv_path = os.path.join(self.output_dir, "metrics.csv") if self.output_dir else ""
@@ -326,19 +328,45 @@ class EdgeHiNoSTrainer:
         self.model_init_info["cluster_output_bias_l2_initial"] = self.model_init_info["output_bias_l2"]
         self.model_init_info["cluster_output_weight_l2_initial"] = self.model_init_info["cluster_output_weight_l2"]
         self.model_init_info["prototype_init_executed"] = False
-        self._initialize_node_prior_if_enabled()
-        self._record_uniform_stage_no_grad("after_model_initialization")
+        initialization_state_in = str(getattr(args, "initialization_state_in", "") or "")
         self.prototype_initialization_pending = False
-        if self._should_defer_prototype_initialization():
-            self.prototype_initialization_pending = True
-            self.model_init_info["cluster_init_mode_effective"] = "deferred_until_after_prox_warmup"
+        if initialization_state_in:
+            # Validation branches bypass expensive/stochastic prior and prototype fitting.
+            # The snapshot restores both, then the branch captures its own Q reference.
+            self._load_initialization_state(initialization_state_in)
+            self._record_uniform_stage_no_grad("after_model_initialization")
+            if bool(int(getattr(args, "apply_cluster_initialization_after_state_load", 0))):
+                self._apply_cluster_initialization()
+                self.model_init_info["cluster_initialization_after_state_load"] = True
         else:
-            self._apply_cluster_initialization()
+            self._initialize_node_prior_if_enabled()
+            self._record_uniform_stage_no_grad("after_model_initialization")
+            if self._should_defer_prototype_initialization():
+                self.prototype_initialization_pending = True
+                self.model_init_info["cluster_init_mode_effective"] = "deferred_until_after_prox_warmup"
+            else:
+                self._apply_cluster_initialization()
         self.model_init_info["cluster_output_bias_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["output_bias_l2"]
         self.model_init_info["cluster_output_weight_l2_after_cluster_initialization"] = self._current_cluster_output_stats()["cluster_output_weight_l2"]
         self._record_uniform_stage_no_grad("after_cluster_initialization")
         self._capture_init_reference()
-        if bool(int(getattr(args, "direct_kmeans_eval", 0))):
+        initialization_state_out = str(getattr(args, "initialization_state_out", "") or "")
+        if initialization_state_out:
+            self._save_initialization_state(initialization_state_out)
+        training_prior_strength = getattr(args, "node_prior_training_logit_strength", None)
+        if training_prior_strength is not None:
+            self.node_prior_logit_strength = float(training_prior_strength)
+            if self.node_prior_logit_strength < 0.0:
+                raise ValueError("node_prior_training_logit_strength must be nonnegative")
+            self.model_init_info["node_prior_logit_strength_during_initialization"] = float(
+                self.node_prior_initial_logit_strength
+            )
+            self.model_init_info["node_prior_logit_strength_during_training"] = float(
+                self.node_prior_logit_strength
+            )
+        if bool(int(getattr(args, "direct_kmeans_eval", 0))) or bool(
+            int(getattr(args, "direct_node_prior_eval", 0))
+        ):
             self.optimizer = None
             self.node_emb_optimizer_info = {
                 "node_emb_mode": str(getattr(args, "node_emb_mode", "full")),
@@ -356,6 +384,135 @@ class EdgeHiNoSTrainer:
                 node_emb_lr=float(getattr(args, "node_emb_lr", 1e-5)),
             )
         self.model_init_info.update(self._model_parameter_info())
+
+    def _model_state_checksum(self) -> str:
+        digest = hashlib.sha256()
+        for name, value in sorted(self.model.state_dict().items()):
+            tensor = value.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
+            digest.update(tensor.numpy().tobytes())
+        return digest.hexdigest()
+
+    def _pi_cut_checksum(self) -> str:
+        matrix = self.Pi_cut.tocsr()
+        digest = hashlib.sha256()
+        digest.update(np.asarray(matrix.shape, dtype=np.int64).tobytes())
+        digest.update(np.asarray(matrix.indptr, dtype=np.int64).tobytes())
+        digest.update(np.asarray(matrix.indices, dtype=np.int64).tobytes())
+        digest.update(np.asarray(matrix.data, dtype=np.float64).tobytes())
+        return digest.hexdigest()
+
+    def _initialization_metadata(self) -> dict:
+        return {
+            "dataset": str(self.args.dataset),
+            "M": int(self.data.num_events),
+            "N": int(self.data.num_nodes),
+            "K": int(self.K),
+            "cluster_head_type": self.cluster_head_type,
+            "edge_encoder_mode": self.edge_encoder_mode,
+            "model_seed": int(self.model_seed),
+            "prototype_seed": int(self.prototype_seed),
+            "forest_seed": int(self.forest_seed),
+            "model_state_checksum": self._model_state_checksum(),
+            "Pi_cut_checksum": self._pi_cut_checksum(),
+        }
+
+    def _save_initialization_state(self, path: str) -> None:
+        path = os.path.abspath(path)
+        ensure_dir(os.path.dirname(path))
+        metadata = self._initialization_metadata()
+        self.model_init_info.update(
+            {
+                "initialization_state_source": "generated",
+                "initialization_state_path": path,
+                **metadata,
+            }
+        )
+        payload = {
+            "format": "etgc_initialization_state_v1",
+            "metadata": metadata,
+            "model_state_dict": {
+                name: value.detach().cpu() for name, value in self.model.state_dict().items()
+            },
+            "node_prior_t": None if self.node_prior_t is None else self.node_prior_t.detach().cpu(),
+            "node_prior_info": self.node_prior_info,
+            "numpy_rng_state": self.rng.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state(self.device).cpu()
+                if self.device.type == "cuda"
+                else None
+            ),
+            "model_init_info": self.model_init_info,
+        }
+        torch.save(payload, path)
+        print(
+            "initialization_state_saved="
+            f"{path} model_checksum={metadata['model_state_checksum']} "
+            f"Pi_cut_checksum={metadata['Pi_cut_checksum']}"
+        )
+
+    def _load_initialization_state(self, path: str) -> None:
+        path = os.path.abspath(path)
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        if payload.get("format") != "etgc_initialization_state_v1":
+            raise ValueError(f"Unsupported ETGC initialization snapshot: {path}")
+        metadata = payload.get("metadata", {})
+        expected = {
+            "dataset": str(self.args.dataset),
+            "M": int(self.data.num_events),
+            "N": int(self.data.num_nodes),
+            "K": int(self.K),
+            "cluster_head_type": self.cluster_head_type,
+            "edge_encoder_mode": self.edge_encoder_mode,
+        }
+        mismatches = {
+            key: (metadata.get(key), value)
+            for key, value in expected.items()
+            if metadata.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"Initialization snapshot metadata mismatch: {mismatches}")
+        affinity_checksum = self._pi_cut_checksum()
+        if metadata.get("Pi_cut_checksum") != affinity_checksum:
+            raise ValueError(
+                "Initialization snapshot Pi_cut mismatch: "
+                f"snapshot={metadata.get('Pi_cut_checksum')} current={affinity_checksum}"
+            )
+        self.model.load_state_dict(payload["model_state_dict"], strict=True)
+        node_prior = payload.get("node_prior_t")
+        self.node_prior_t = None if node_prior is None else node_prior.to(self.device)
+        self.node_prior_info = dict(payload.get("node_prior_info") or {})
+        self.rng.set_state(payload["numpy_rng_state"])
+        torch.set_rng_state(payload["torch_rng_state"])
+        cuda_rng_state = payload.get("cuda_rng_state")
+        if cuda_rng_state is not None and self.device.type == "cuda":
+            torch.cuda.set_rng_state(cuda_rng_state, self.device)
+        loaded_checksum = self._model_state_checksum()
+        if metadata.get("model_state_checksum") != loaded_checksum:
+            raise ValueError(
+                "Initialization snapshot model mismatch after load: "
+                f"snapshot={metadata.get('model_state_checksum')} loaded={loaded_checksum}"
+            )
+        source_info = dict(payload.get("model_init_info") or {})
+        self.model_init_info.update(source_info)
+        self.model_init_info.update(
+            {
+                "initialization_state_source": "loaded",
+                "initialization_state_path": path,
+                "model_state_checksum": loaded_checksum,
+                "Pi_cut_checksum": affinity_checksum,
+            }
+        )
+        print(
+            "initialization_state_loaded="
+            f"{path} model_checksum={loaded_checksum} Pi_cut_checksum={affinity_checksum}"
+        )
 
     @staticmethod
     def _parse_diagnostic_epochs(value) -> set:
@@ -1378,6 +1535,46 @@ class EdgeHiNoSTrainer:
         self.training_change_metrics = self._compute_init_final_change_metrics(metrics)
         return metrics
 
+    def run_direct_node_prior_eval(self) -> dict:
+        """Evaluate the component-aware node prior labels before Q or incidence projection."""
+        if self.node_prior_t is None:
+            raise ValueError("direct_node_prior_eval requires an initialized node prior")
+        pred_y = self.node_prior_t.detach().cpu().numpy().astype(np.int64)
+        if pred_y.shape != (int(self.data.num_nodes),):
+            raise ValueError(
+                "node prior labels must have shape (N,), "
+                f"got {pred_y.shape} for N={self.data.num_nodes}"
+            )
+        metrics = evaluate_node_clustering(self.data.labels, pred_y)
+        counts = np.bincount(pred_y, minlength=self.K)[: self.K]
+        metrics.update(
+            {
+                "node_hard_active_clusters": int(np.sum(counts > 0)),
+                "node_hard_largest_ratio": float(counts.max() / max(1, int(counts.sum()))),
+                "direct_node_prior_eval": True,
+                "uses_event_assignment_Q": False,
+                "uses_incidence_projection": False,
+                "uses_training": False,
+            }
+        )
+        self._init_metrics_csv()
+        self._append_epoch_record(
+            {
+                "epoch": 0,
+                "ACC": metrics.get("ACC", 0.0),
+                "NMI": metrics.get("NMI", 0.0),
+                "ARI": metrics.get("ARI", 0.0),
+                "Macro_F1": metrics.get("Macro_F1", 0.0),
+                "penalty_type": str(getattr(self.args, "orth_type", "orth")).lower(),
+                "penalty_weight": float(getattr(self.args, "lambda_orth", 1.0)),
+                "node_hard_active_clusters": metrics["node_hard_active_clusters"],
+                "node_hard_largest_ratio": metrics["node_hard_largest_ratio"],
+            }
+        )
+        self.final_metrics = metrics.copy()
+        self.training_change_metrics = {}
+        return metrics
+
     def run_direct_kmeans_eval(self) -> dict:
         hidden = self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
         metrics = self._direct_kmeans_metrics_from_hidden(
@@ -1616,6 +1813,12 @@ class EdgeHiNoSTrainer:
                 "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
                 "node_prior_info": self.node_prior_info,
                 "node_prior_logit_strength": float(self.node_prior_logit_strength),
+                "node_prior_logit_strength_during_initialization": float(
+                    self.node_prior_initial_logit_strength
+                ),
+                "node_prior_training_logit_strength": getattr(
+                    self.args, "node_prior_training_logit_strength", None
+                ),
                 "node_prior_event_role": self.node_prior_event_role,
                 "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
                 "require_pretrained_node2vec": int(self.require_pretrained_node2vec),
@@ -1698,6 +1901,12 @@ class EdgeHiNoSTrainer:
             "node_prior_mode": str(getattr(self.args, "node_prior_mode", "none")),
             "node_prior_info": self.node_prior_info,
             "node_prior_logit_strength": float(self.node_prior_logit_strength),
+            "node_prior_logit_strength_during_initialization": float(
+                self.node_prior_initial_logit_strength
+            ),
+            "node_prior_training_logit_strength": getattr(
+                self.args, "node_prior_training_logit_strength", None
+            ),
             "node_prior_event_role": self.node_prior_event_role,
             "node_emb_mode": str(getattr(self.args, "node_emb_mode", "full")),
             "node_dim": int(self.node_dim),

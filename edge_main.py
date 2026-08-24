@@ -91,6 +91,12 @@ def build_parser():
     parser.add_argument("--node_prior_auc_threshold", type=float, default=0.9)
     parser.add_argument("--node_prior_bisecting_restarts", type=int, default=50)
     parser.add_argument("--node_prior_logit_strength", type=float, default=0.0)
+    parser.add_argument(
+        "--node_prior_training_logit_strength",
+        type=float,
+        default=None,
+        help="Optional training-time prior strength applied only after the initialization reference is captured.",
+    )
     parser.add_argument("--node_prior_event_role", choices=["source", "mean_endpoints"], default="source")
     parser.add_argument("--node_emb_mode", choices=["frozen", "small_lr", "full"], default="small_lr")
     parser.add_argument("--node_emb_lr", type=float, default=1e-5)
@@ -112,7 +118,25 @@ def build_parser():
     parser.add_argument("--prototype_sample_size", type=int, default=20000)
     parser.add_argument("--prototype_lloyd_iters", type=int, default=10)
     parser.add_argument("--direct_kmeans_eval", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--direct_node_prior_eval", type=int, choices=[0, 1], default=0)
     parser.add_argument("--init_only", type=int, choices=[0, 1], default=0)
+    parser.add_argument(
+        "--initialization_state_in",
+        default="",
+        help="Load a validation-only ETGC initialization snapshot after model/prior construction.",
+    )
+    parser.add_argument(
+        "--initialization_state_out",
+        default="",
+        help="Write a validation-only ETGC initialization snapshot before any optimizer step.",
+    )
+    parser.add_argument(
+        "--apply_cluster_initialization_after_state_load",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Validation-only: refit the configured cluster head after loading a shared pre-init snapshot.",
+    )
     parser.add_argument("--overnight_diagnostic", type=int, choices=[0, 1], default=0)
     parser.add_argument("--loss_formulation_diagnostic", type=int, choices=[0, 1], default=0)
     parser.add_argument("--diagnostic_epochs", default="1,5,10,20,30")
@@ -192,6 +216,7 @@ def print_config(args, K=None):
         f"lambda_node_prior={args.lambda_node_prior}, node_prior_mode={args.node_prior_mode}, "
         f"node_prior_restarts={args.node_prior_restarts}, "
         f"node_prior_logit_strength={args.node_prior_logit_strength}, "
+        f"node_prior_training_logit_strength={args.node_prior_training_logit_strength}, "
         f"node_prior_event_role={args.node_prior_event_role}"
     )
     print(f"cluster_output_bias_mode={args.cluster_output_bias_mode}")
@@ -199,7 +224,16 @@ def print_config(args, K=None):
     print(f"cluster_init_mode={args.cluster_init_mode}")
     print(f"prototype_init_mode={args.prototype_init_mode}")
     print(f"prototype_sample_size={args.prototype_sample_size}, prototype_lloyd_iters={args.prototype_lloyd_iters}")
-    print(f"direct_kmeans_eval={args.direct_kmeans_eval}, init_only={args.init_only}")
+    print(
+        f"direct_kmeans_eval={args.direct_kmeans_eval}, "
+        f"direct_node_prior_eval={args.direct_node_prior_eval}, init_only={args.init_only}"
+    )
+    print(f"initialization_state_in={args.initialization_state_in}")
+    print(f"initialization_state_out={args.initialization_state_out}")
+    print(
+        "apply_cluster_initialization_after_state_load="
+        f"{args.apply_cluster_initialization_after_state_load}"
+    )
     print(f"overnight_diagnostic={args.overnight_diagnostic}, diagnostic_epochs={args.diagnostic_epochs}")
     print(f"loss_formulation_diagnostic={args.loss_formulation_diagnostic}")
     print(f"diagnostic_stages={args.diagnostic_stages}")
@@ -226,6 +260,18 @@ def main(args):
         args.feature_path = resolve_path(cur_dir, args.feature_path)
     args.cache_dir = resolve_path(cur_dir, args.cache_dir)
     args.diagnostic_output_dir = resolve_path(cur_dir, args.diagnostic_output_dir)
+    if args.initialization_state_in:
+        args.initialization_state_in = resolve_path(cur_dir, args.initialization_state_in)
+    if args.initialization_state_out:
+        args.initialization_state_out = resolve_path(cur_dir, args.initialization_state_out)
+    exclusive_eval_modes = sum(
+        int(bool(value))
+        for value in (args.direct_kmeans_eval, args.direct_node_prior_eval, args.init_only)
+    )
+    if exclusive_eval_modes > 1:
+        raise ValueError("direct_kmeans_eval, direct_node_prior_eval, and init_only are mutually exclusive")
+    if args.initialization_state_in and args.initialization_state_out:
+        raise ValueError("initialization_state_in and initialization_state_out are mutually exclusive")
     set_random_seed(args.model_seed)
     trainer = EdgeHiNoSTrainer(args)
     # Persist/log the canonical name even when an old trace_mincut command is replayed.
@@ -285,6 +331,7 @@ def main(args):
     print(f"lambda_node_sbm={args.lambda_node_sbm}")
     print(f"lambda_node_prior={args.lambda_node_prior}")
     print(f"node_prior_logit_strength={args.node_prior_logit_strength}")
+    print(f"node_prior_logit_strength_during_training={trainer.node_prior_logit_strength}")
     print(f"node_prior_event_role={args.node_prior_event_role}")
     if trainer.node_prior_info:
         print(f"node_prior_info={trainer.node_prior_info}")
@@ -304,6 +351,23 @@ def main(args):
     print("F1_type=macro")
     if int(getattr(args, "direct_kmeans_eval", 0)):
         metrics = trainer.run_direct_kmeans_eval()
+        runtime_seconds = time.time() - start_time
+        trainer.write_result_json(
+            best_epoch=0,
+            best_metrics=metrics,
+            final_metrics=metrics,
+            runtime_seconds=runtime_seconds,
+        )
+        print("\nFinal Results:")
+        print("best_epoch=0")
+        for key in ["ACC", "NMI", "ARI", "Macro_F1"]:
+            print(f"{key}={metrics.get(key, 0.0):.4f}")
+        print(f"runtime_seconds={runtime_seconds:.2f}")
+        print("peak_gpu_memory_mb=0.00")
+        print("status=success")
+        return
+    if int(getattr(args, "direct_node_prior_eval", 0)):
+        metrics = trainer.run_direct_node_prior_eval()
         runtime_seconds = time.time() - start_time
         trainer.write_result_json(
             best_epoch=0,
