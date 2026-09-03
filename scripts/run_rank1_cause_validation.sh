@@ -25,6 +25,7 @@ RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/logs/rank1_cause_validation/${RUN_TIMESTAMP}}"
 CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-${ROOT_DIR}/logs/trace_mincut_global/20260724_002532/phase1_diagnosis}"
 DEVICE_ARG="${DEVICE:-cuda:0}"
+FOREST_SAMPLES_ARG="${FOREST_SAMPLES:-5}"
 RESUME=1
 
 while [[ $# -gt 0 ]]; do
@@ -63,14 +64,22 @@ try:
 except Exception as exc:
     print("torch_probe_error=" + repr(exc))
 PY
-  env | sort | grep -E '^(DEVICE|CUDA_VISIBLE_DEVICES|OPENBLAS_NUM_THREADS|OMP_NUM_THREADS|TEMPORAL_FOREST_)=' || true
+  env | sort | grep -E '^(DEVICE|FOREST_SAMPLES|CUDA_VISIBLE_DEVICES|OPENBLAS_NUM_THREADS|OMP_NUM_THREADS|TEMPORAL_FOREST_)=' || true
 } > "${OUT_DIR}/code_info/environment.txt"
 
-"${PYTHON_BIN}" - "${OUT_DIR}/code_info/common_config.json" <<'PY'
+"${PYTHON_BIN}" - "${OUT_DIR}/code_info/common_config.json" "${ROOT_DIR}" "${ASSET_ROOT:-}" "${FOREST_SAMPLES_ARG}" <<'PY'
 import json
+import os
 import sys
+from pathlib import Path
 
 path = sys.argv[1]
+root = Path(sys.argv[2])
+explicit_asset_root = Path(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+forest_samples = int(sys.argv[4])
+server_asset_root = Path("/mnt/data/lin-lab/lmx/projects/my_project/ETGC")
+asset_candidates = [p for p in [explicit_asset_root, root, server_asset_root] if p is not None]
+asset_root = next((p for p in asset_candidates if (p / "dataset" / "school" / "school.txt").exists()), root)
 common = {
     "method": "ETGC",
     "purpose": "rank-1 collapse cause validation",
@@ -92,10 +101,12 @@ common = {
     "node_emb_mode": "frozen",
     "global_warmup_epochs": 0,
     "prox_warmup_epochs": 0,
+    "forest_samples": forest_samples,
     "uniform_collapse_diagnostic": 1,
     "diagnostic_only_first_epoch": 0,
     "save_embeddings": 0,
     "checkpoint": "disabled/not produced by edge_main.py",
+    "asset_root": str(asset_root),
     "factors_varied": [
         "cluster_output_bias_mode",
         "cluster_input_norm",
@@ -109,7 +120,7 @@ PY
 printf 'launcher_out_dir=%s\n' "${OUT_DIR}" | tee "${OUT_DIR}/launcher.log"
 printf 'config_source_dir=%s\n' "${CONFIG_SOURCE_DIR}" | tee -a "${OUT_DIR}/launcher.log"
 
-"${PYTHON_BIN}" - "${ROOT_DIR}" "${OUT_DIR}" "${CONFIG_SOURCE_DIR}" "${PYTHON_BIN}" "${DEVICE_ARG}" "${RESUME}" <<'PY' 2>&1 | tee -a "${OUT_DIR}/launcher.log"
+"${PYTHON_BIN}" - "${ROOT_DIR}" "${OUT_DIR}" "${CONFIG_SOURCE_DIR}" "${PYTHON_BIN}" "${DEVICE_ARG}" "${RESUME}" "${ASSET_ROOT:-}" "${FOREST_SAMPLES_ARG}" <<'PY' 2>&1 | tee -a "${OUT_DIR}/launcher.log"
 import csv
 import json
 import math
@@ -126,6 +137,20 @@ config_source = Path(sys.argv[3])
 python_bin = sys.argv[4]
 device = sys.argv[5]
 resume = bool(int(sys.argv[6]))
+explicit_asset_root = Path(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else None
+forest_samples = int(sys.argv[8])
+server_asset_root = Path("/mnt/data/lin-lab/lmx/projects/my_project/ETGC")
+
+
+def resolve_asset_root():
+    candidates = [p for p in [explicit_asset_root, root, server_asset_root] if p is not None]
+    for candidate in candidates:
+        if (candidate / "dataset" / "school" / "school.txt").exists():
+            return candidate
+    return root
+
+
+asset_root = resolve_asset_root()
 
 CONFIGS = [
     ("C0_baseline", "default", "none", "random"),
@@ -183,6 +208,7 @@ def load_source_config(seed):
         cfg.setdefault(key, value)
     cfg["dataset"] = "school"
     cfg["seed"] = int(seed)
+    cfg["forest_samples"] = forest_samples
     return cfg
 
 
@@ -200,11 +226,11 @@ def command_for(config_name, seed, bias_mode, input_norm, init_mode, run_dir):
         "model_seed": seed,
         "prototype_seed": seed,
         "forest_seed": FOREST_SEED,
-        "data_root": str(root / "dataset"),
-        "emb_root": str(root / "emb"),
-        "pretrain_emb_dir": str(root / "pretrain"),
+        "data_root": str(asset_root / "dataset"),
+        "emb_root": str(asset_root / "emb"),
+        "pretrain_emb_dir": str(asset_root / "pretrain"),
         "feature_path": cfg.get("feature_path", ""),
-        "cache_dir": str(root / "cache"),
+        "cache_dir": str(asset_root / "cache"),
         "batch_size": cfg["batch_size"],
         "epoch": 3,
         "learning_rate": cfg["learning_rate"],
@@ -618,7 +644,11 @@ def avg_delta(config, key, reference="C0_baseline"):
 def collapse_like(row):
     return (
         finite(row.get("final_rank1_energy")) >= 0.999
-        and finite(row.get("final_centered_energy"), 1.0) <= 1e-6
+        and finite(row.get("final_effective_rank"), math.inf) <= 1.01
+        and (
+            finite(row.get("final_active_node_clusters"), math.inf) <= 1
+            or finite(row.get("final_largest_node_ratio"), 0.0) >= 0.99
+        )
     )
 
 
@@ -641,7 +671,7 @@ false_hard = [
     for row in factor_rows
     if finite(row.get("final_active_edge_clusters"), 0) > 1
     and finite(row.get("final_rank1_energy"), 0) >= 0.999
-    and finite(row.get("final_centered_energy"), 1.0) <= 1e-6
+    and finite(row.get("final_effective_rank"), math.inf) <= 1.01
 ]
 global_pullback = [
     row
@@ -655,6 +685,7 @@ lines = [
     "# Rank-1 Collapse Cause Validation",
     "",
     f"Output directory: {out_dir}",
+    f"Asset root: {asset_root}",
     "Common configuration: School, seeds 42/43, 3 epochs, legacy_mlp, mlp history-time edge encoder, legacy scalar trace-ratio cut, orth penalty, lambda_prox=0, lambda_proj=0, lambda_bal=0, frozen node embeddings.",
     "",
     "## Per-Seed Factor Summary",
@@ -678,7 +709,7 @@ lines.extend(["", "## Required Answers", ""])
 lines.append(
     "1. C0 collapse reproduction: "
     + (
-        "yes, both seeds satisfy the strict high-rank1/low-centered-energy check."
+        "yes, both seeds satisfy the high-rank1/effective-rank-near-one/node-collapse check."
         if c0_reproduced
         else "no under the strict check; downstream causal claims should be treated as not established unless the numeric C0 rows are judged to match the earlier failure."
     )
@@ -725,7 +756,7 @@ lines.append(
 )
 lines.append(
     "9. Hard-cluster-only false improvements: "
-    + (", ".join(f"{row['config']}/seed{row['seed']}" for row in false_hard) if false_hard else "none under the strict rank1>=0.999 and centered_energy<=1e-6 check.")
+    + (", ".join(f"{row['config']}/seed{row['seed']}" for row in false_hard) if false_hard else "none under the rank1>=0.999 and effective_rank<=1.01 check.")
 )
 lines.append(
     "10. First global update pullback: "

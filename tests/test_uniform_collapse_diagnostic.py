@@ -9,14 +9,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from edge_losses import edge_trace_mincut_loss_global, project_edge_assignments_to_nodes_global
+from edge_losses import (
+    edge_trace_mincut_loss_global,
+    matrix_ncut_qtdq_diagnostics,
+    project_edge_assignments_to_nodes_global,
+)
 from edge_model import EdgeHiNoSModel
 from edge_uniform_diagnostic import (
     cluster_head_gradient_diagnostics,
+    cluster_volume_statistics,
     compute_uniform_collapse_stage,
     hard_cluster_statistics,
     logits_statistics,
     q_margin_statistics,
+    q_rank_statistics,
     q_uniform_distance_statistics,
     uniform_delta,
 )
@@ -64,6 +70,54 @@ def test_q_margin_statistics_match_known_probabilities():
     assert abs(stats["q_margin_p90"] - float(torch.quantile(margins, 0.9))) < 1e-6
     assert abs(stats["q_margin_lt_1e2_ratio"] - (1.0 / 3.0)) < 1e-6
     assert abs(stats["q_margin_lt_1e_2_ratio"] - (1.0 / 3.0)) < 1e-6
+
+
+def test_normalized_margin_matches_top1_relative_gap():
+    Q = torch.tensor([[0.6, 0.3, 0.1]], dtype=torch.float32)
+    stats = q_margin_statistics(Q)
+    assert abs(stats["q_normalized_margin_mean"] - 0.5) < 1e-7
+    assert abs(stats["q_normalized_margin_median"] - 0.5) < 1e-7
+    assert abs(stats["q_normalized_margin_p90"] - 0.5) < 1e-7
+    assert abs(stats["q_normalized_margin_p99"] - 0.5) < 1e-7
+
+
+def test_centered_to_total_energy_ratio_detects_event_variation():
+    fixed_rows = torch.tensor([[0.2, 0.3, 0.5]], dtype=torch.float32).repeat(8, 1)
+    varied_rows = torch.eye(3, dtype=torch.float32).repeat(3, 1)
+    fixed_stats = q_rank_statistics(fixed_rows)
+    varied_stats = q_rank_statistics(varied_rows)
+    assert fixed_stats["q_centered_to_total_energy_ratio"] < 1e-10
+    assert varied_stats["q_centered_to_total_energy_ratio"] > 0.0
+
+
+def test_cluster_volume_vector_cv_ratio_and_entropy_match_reference():
+    Q = torch.tensor([[0.8, 0.2], [0.1, 0.9], [0.4, 0.6]], dtype=torch.float32)
+    degree = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    volume = (degree[:, None] * Q).sum(dim=0)
+    ratio = volume / volume.sum()
+    expected_cv = ratio.std(unbiased=False) / ratio.mean()
+    expected_entropy = -(ratio * torch.log(ratio)).sum()
+    stats = cluster_volume_statistics(Q, degree)
+    assert np.allclose(stats["cluster_soft_volume_k"], volume.numpy())
+    assert abs(stats["cluster_volume_cv"] - float(expected_cv)) < 1e-7
+    assert abs(stats["cluster_volume_max_ratio"] - float(ratio.max())) < 1e-7
+    assert abs(stats["cluster_volume_min_ratio"] - float(ratio.min())) < 1e-7
+    assert abs(stats["cluster_volume_entropy"] - float(expected_entropy)) < 1e-7
+
+
+def test_matrix_ncut_qtdq_diagnostics_are_finite_and_match_eigenvalues():
+    Q = torch.tensor([[0.8, 0.2], [0.1, 0.9], [0.4, 0.6]], dtype=torch.float32)
+    degree = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    eps = 1e-6
+    qtdq = Q.double().t().mm(degree.double()[:, None] * Q.double())
+    eigvals = torch.linalg.eigvalsh(qtdq)
+    stats = matrix_ncut_qtdq_diagnostics(Q, degree, eps=eps)
+    assert stats["qtdq_eigenvalues_finite"] is True
+    assert np.isfinite(stats["qtdq_condition_number"])
+    assert abs(stats["qtdq_min_eigenvalue"] - float(eigvals.min())) < 1e-6
+    assert abs(stats["qtdq_max_eigenvalue"] - float(eigvals.max())) < 1e-6
+    assert abs(stats["qtdq_condition_number"] - float(eigvals.max() / eigvals.min())) < 1e-5
+    assert np.isfinite(stats["qtdq_regularized_condition_number"])
 
 
 def test_uniform_distance_is_zero_for_uniform_q():

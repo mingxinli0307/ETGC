@@ -39,10 +39,77 @@ def _as_degree_tensor(degree, Q_all: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(degree_np).to(device=Q_all.device, dtype=Q_all.dtype)
 
 
+def matrix_ncut_qtdq_diagnostics(
+    Q_all: torch.Tensor,
+    degree,
+    eps: float = 1e-8,
+) -> dict:
+    """Return read-only conditioning diagnostics for the matrix-Ncut solve matrix."""
+    if Q_all.dim() != 2:
+        raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
+    degree_t = _as_degree_tensor(degree, Q_all)
+    if int(degree_t.numel()) != int(Q_all.size(0)):
+        raise ValueError(
+            f"degree length={degree_t.numel()} does not match Q_all rows={Q_all.size(0)}"
+        )
+    k = int(Q_all.size(1))
+    q_diag = Q_all.detach().to(dtype=torch.float64)
+    degree_diag = degree_t.detach().to(dtype=torch.float64)
+    qtdq = q_diag.t().mm(degree_diag.unsqueeze(1) * q_diag)
+    qtdq = 0.5 * (qtdq + qtdq.t())
+    solve_matrix = qtdq + float(eps) * torch.eye(
+        k,
+        dtype=qtdq.dtype,
+        device=Q_all.device,
+    )
+    eigvals = torch.linalg.eigvalsh(qtdq)
+    regularized_eigvals = torch.linalg.eigvalsh(solve_matrix)
+    finite = bool(torch.isfinite(eigvals).all())
+    min_eig = float(eigvals.min().detach().cpu()) if eigvals.numel() else 0.0
+    max_eig = float(eigvals.max().detach().cpu()) if eigvals.numel() else 0.0
+    condition = max_eig / min_eig if finite and min_eig > 0.0 else float("inf")
+    regularized_min = float(regularized_eigvals.min().detach().cpu()) if regularized_eigvals.numel() else 0.0
+    regularized_max = float(regularized_eigvals.max().detach().cpu()) if regularized_eigvals.numel() else 0.0
+    regularized_condition = (
+        regularized_max / regularized_min
+        if bool(torch.isfinite(regularized_eigvals).all()) and regularized_min > 0.0
+        else float("inf")
+    )
+    return {
+        "qtdq_min_eigenvalue": min_eig,
+        "qtdq_max_eigenvalue": max_eig,
+        "qtdq_condition_number": condition,
+        "qtdq_regularized_condition_number": regularized_condition,
+        "qtdq_eigenvalues_finite": finite,
+        "qtdq_regularization_eps": float(eps),
+    }
+
+
 def _check_scalar_finite(name: str, value: torch.Tensor, stats: dict) -> None:
     if not torch.isfinite(value).all():
         details = ", ".join(f"{k}={v}" for k, v in stats.items())
-        raise FloatingPointError(f"{name} is not finite in trace mincut loss: {details}")
+        raise FloatingPointError(f"{name} is not finite: {details}")
+
+
+def combine_cluster_objective(
+    cut_loss: torch.Tensor,
+    orth_loss: torch.Tensor,
+    lambda_orth: float,
+    cut_scale: float = 1.0,
+    orth_scale: float = 1.0,
+) -> torch.Tensor:
+    """Combine cut and orthogonality terms with independent ablation gates.
+
+    The default scales preserve the established ETGC objective exactly:
+    ``L_cut + lambda_orth * L_orth``.  The separate nonnegative scales exist
+    only to support a clean Cut x Orth factorial ablation without changing the
+    mainline default semantics.
+    """
+    if float(cut_scale) < 0.0:
+        raise ValueError(f"cut_scale must be nonnegative, got {cut_scale}")
+    if float(orth_scale) < 0.0:
+        raise ValueError(f"orth_scale must be nonnegative, got {orth_scale}")
+    return float(cut_scale) * cut_loss + float(lambda_orth) * float(orth_scale) * orth_loss
 
 
 def _sparse_block_wq_numerator(W_E: sp.csr_matrix, Q_all: torch.Tensor, row_block_size: int) -> torch.Tensor:
@@ -121,30 +188,50 @@ def _sparse_wq_product(W_E, Q_all: torch.Tensor, row_block_size: int = 65536) ->
 
 def edge_matrix_ncut_loss_global(
     Q_all: torch.Tensor,
-    W_E,
+    Pi_cut,
     degree,
     K: int,
     lambda_orth: float = 1.0,
     eps: float = 1e-8,
     row_block_size: int = 65536,
     orth_type: str = "orthqa",
+    diagnostics: dict = None,
 ) -> tuple:
+    """Complete matrix Ncut C-form on the symmetric edge-PPR affinity.
+
+    ``Pi_cut`` is the symmetric, zero-diagonal affinity used as Pi in Ncut;
+    ``degree`` must be its row sum.  D_Pi is applied row-wise and is never
+    materialized as an M x M dense matrix.
+    """
     if Q_all.dim() != 2:
         raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
     m = int(Q_all.size(0))
     k = int(Q_all.size(1))
     if k != int(K):
         raise ValueError(f"Q_all has K={k}, expected K={K}")
-    WQ, nnz = _sparse_wq_product(W_E, Q_all, int(row_block_size))
+    PiQ, nnz = _sparse_wq_product(Pi_cut, Q_all, int(row_block_size))
     degree_t = _as_degree_tensor(degree, Q_all)
     if int(degree_t.numel()) != m:
         raise ValueError(f"degree length={degree_t.numel()} does not match Q_all rows={m}")
     DQ = degree_t.unsqueeze(1) * Q_all
     eye = torch.eye(k, dtype=Q_all.dtype, device=Q_all.device)
     A = Q_all.t().mm(DQ) + float(eps) * eye
-    B = Q_all.t().mm(DQ - WQ)
-    X = torch.linalg.solve(A, B)
-    ncut_loss = torch.trace(X)
+    B = Q_all.t().mm(DQ - PiQ)
+    solve_precision_fallback = False
+    try:
+        X = torch.linalg.solve(A, B)
+        ncut_loss = torch.trace(X)
+    except torch.linalg.LinAlgError:
+        if Q_all.dtype not in {torch.float16, torch.bfloat16, torch.float32} or float(eps) <= 0.0:
+            raise
+        solve_precision_fallback = True
+        Q_solve = Q_all.to(dtype=torch.float64)
+        DQ_solve = degree_t.to(dtype=torch.float64).unsqueeze(1) * Q_solve
+        A_solve = Q_solve.t().mm(DQ_solve) + float(eps) * torch.eye(
+            k, dtype=torch.float64, device=Q_all.device
+        )
+        B_solve = Q_solve.t().mm(DQ_solve - PiQ.to(dtype=torch.float64))
+        ncut_loss = torch.trace(torch.linalg.solve(A_solve, B_solve)).to(dtype=Q_all.dtype)
     selected_orth_type = str(orth_type).lower()
     if selected_orth_type == "orth":
         penalty_loss = trace_mincut_orthogonality_loss(Q_all, int(K), eps=float(eps))
@@ -166,10 +253,18 @@ def edge_matrix_ncut_loss_global(
         "ncut_loss": float(ncut_loss.detach().cpu()),
         "penalty_loss": float(penalty_loss.detach().cpu()),
         "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
+        "solve_precision_fallback": solve_precision_fallback,
     }
     _check_scalar_finite("matrix_ncut loss", ncut_loss, stats)
     _check_scalar_finite("matrix_ncut penalty", penalty_loss, stats)
     _check_scalar_finite("matrix_ncut total_cluster_loss", total_cluster_loss, stats)
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "matrix_ncut_solve_precision_fallback": bool(solve_precision_fallback),
+                "matrix_ncut_cut_loss_finite": bool(torch.isfinite(ncut_loss).all()),
+            }
+        )
     return total_cluster_loss, ncut_loss, penalty_loss
 
 
@@ -183,11 +278,11 @@ def edge_trace_mincut_loss_global(
     row_block_size: int = 65536,
     orth_type: str = "orth",
 ) -> tuple:
-    """Global trace mincut over all temporal edge events.
+    """Deprecated scalar trace-ratio objective over all edge events.
 
-    Computes O(nnz(W_E) K + M K^2) work without materializing dense W_E or D_E.
-    The legacy sum-of-ratios normalized association loss is intentionally kept
-    separate in edge_ncut_loss_global for compatibility and diagnostics.
+    This computes ``-Tr(Q.T @ Pi_cut @ Q) / Tr(Q.T @ D_Pi @ Q)``.  It is
+    retained as ``legacy_trace_ratio`` for historical experiments; it is not
+    the complete matrix-Ncut objective used by the ETGC mainline.
     """
     if Q_all.dim() != 2:
         raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
@@ -228,11 +323,11 @@ def edge_trace_mincut_loss_global(
         "Q_min": float(Q_all.detach().min().cpu()) if Q_all.numel() else 0.0,
         "Q_max": float(Q_all.detach().max().cpu()) if Q_all.numel() else 0.0,
     }
-    _check_scalar_finite("trace_mincut numerator", numerator, stats)
-    _check_scalar_finite("trace_mincut denominator", denominator, stats)
+    _check_scalar_finite("legacy_trace_ratio numerator", numerator, stats)
+    _check_scalar_finite("legacy_trace_ratio denominator", denominator, stats)
     if denom_value <= 0.0:
         details = ", ".join(f"{key}={value}" for key, value in stats.items())
-        raise FloatingPointError(f"trace_mincut denominator is not positive: {details}")
+        raise FloatingPointError(f"legacy_trace_ratio denominator is not positive: {details}")
 
     cut_loss = -numerator / (denominator + float(eps))
     selected_orth_type = str(orth_type).lower()
@@ -252,9 +347,9 @@ def edge_trace_mincut_loss_global(
             "total_cluster_loss": float(total_cluster_loss.detach().cpu()),
         }
     )
-    _check_scalar_finite("trace_mincut cut_loss", cut_loss, stats)
-    _check_scalar_finite("trace_mincut orth_loss", orth_loss, stats)
-    _check_scalar_finite("trace_mincut total_cluster_loss", total_cluster_loss, stats)
+    _check_scalar_finite("legacy_trace_ratio cut_loss", cut_loss, stats)
+    _check_scalar_finite("legacy_trace_ratio orth_loss", orth_loss, stats)
+    _check_scalar_finite("legacy_trace_ratio total_cluster_loss", total_cluster_loss, stats)
     return total_cluster_loss, cut_loss, orth_loss
 
 
@@ -540,6 +635,69 @@ def projection_loss_global(
     su = S_all.index_select(0, src_all.long())
     sv = S_all.index_select(0, dst_all.long())
     return -(Q_all * torch.log(su * sv + float(eps))).sum(dim=1).mean()
+
+
+def node_sbm_reconstruction_loss_global(
+    S_all: torch.Tensor,
+    pos_src: torch.Tensor,
+    pos_dst: torch.Tensor,
+    neg_src: torch.Tensor,
+    neg_dst: torch.Tensor,
+    directed: bool = False,
+    eps: float = 1e-6,
+    logit_clip: float = 8.0,
+) -> tuple:
+    """Degree-corrected block reconstruction over node assignments.
+
+    Positive pairs are observed temporal interactions. Negative pairs should be
+    formed by independently shuffling endpoints, which preserves endpoint
+    marginals and therefore factors degree effects out of the learned K x K
+    block relation. The block log-odds estimate is detached (an EM-style
+    profile step); gradients from the binary reconstruction objective flow only
+    through the current node assignments S=RowNorm(BQ).
+    """
+    if S_all.dim() != 2:
+        raise ValueError(f"S_all must be 2D, got shape={tuple(S_all.shape)}")
+    if int(pos_src.numel()) == 0 or int(neg_src.numel()) == 0:
+        raise ValueError("node SBM reconstruction requires non-empty positive and negative pairs")
+    if int(pos_src.numel()) != int(pos_dst.numel()):
+        raise ValueError("positive source/destination lengths differ")
+    if int(neg_src.numel()) != int(neg_dst.numel()):
+        raise ValueError("negative source/destination lengths differ")
+
+    pos_src = pos_src.to(device=S_all.device, dtype=torch.long)
+    pos_dst = pos_dst.to(device=S_all.device, dtype=torch.long)
+    neg_src = neg_src.to(device=S_all.device, dtype=torch.long)
+    neg_dst = neg_dst.to(device=S_all.device, dtype=torch.long)
+    pos_u = S_all.index_select(0, pos_src)
+    pos_v = S_all.index_select(0, pos_dst)
+    neg_u = S_all.index_select(0, neg_src)
+    neg_v = S_all.index_select(0, neg_dst)
+
+    with torch.no_grad():
+        pos_prob = pos_u.t().mm(pos_v) / float(pos_u.size(0))
+        neg_prob = neg_u.t().mm(neg_v) / float(neg_u.size(0))
+        if not bool(directed):
+            pos_prob = 0.5 * (pos_prob + pos_prob.t())
+            neg_prob = 0.5 * (neg_prob + neg_prob.t())
+        block_logits = torch.log(pos_prob + float(eps)) - torch.log(neg_prob + float(eps))
+        block_logits = block_logits.clamp(min=-float(logit_clip), max=float(logit_clip))
+
+    pos_scores = torch.einsum("bi,ij,bj->b", pos_u, block_logits, pos_v)
+    neg_scores = torch.einsum("bi,ij,bj->b", neg_u, block_logits, neg_v)
+    loss = F.softplus(-pos_scores).mean() + F.softplus(neg_scores).mean()
+    stats = {
+        "node_sbm_block_logit_min": float(block_logits.min().cpu()),
+        "node_sbm_block_logit_max": float(block_logits.max().cpu()),
+        "node_sbm_block_logit_std": float(block_logits.std(unbiased=False).cpu()),
+        "node_sbm_positive_score_mean": float(pos_scores.detach().mean().cpu()),
+        "node_sbm_negative_score_mean": float(neg_scores.detach().mean().cpu()),
+        "node_sbm_block_symmetry_error": float(
+            torch.max(torch.abs(block_logits - block_logits.t())).cpu()
+        ),
+    }
+    _check_scalar_finite("node_sbm_reconstruction_loss_global", loss, stats)
+    return loss, block_logits, stats
 
 
 def balance_loss(Q: torch.Tensor, K: int) -> torch.Tensor:
