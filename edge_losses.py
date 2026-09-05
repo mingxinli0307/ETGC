@@ -186,6 +186,46 @@ def _sparse_wq_product(W_E, Q_all: torch.Tensor, row_block_size: int = 65536) ->
     return torch.cat(chunks, dim=0), int(W_csr.nnz)
 
 
+def edge_expected_structural_score_gain_loss_global(
+    Q_all: torch.Tensor,
+    W_E,
+    degree,
+    tau: float = 0.5,
+    eps: float = 1e-8,
+    row_block_size: int = 65536,
+) -> tuple:
+    """Expected Structural Score Gain on the global sparse edge affinity."""
+    if Q_all.dim() != 2:
+        raise ValueError(f"Q_all must be 2D, got shape={tuple(Q_all.shape)}")
+    m = int(Q_all.size(0))
+    if m <= 0:
+        raise ValueError("Q_all must contain at least one edge event")
+    if float(tau) < 0.0:
+        raise ValueError(f"tau must be nonnegative, got {tau}")
+    if float(eps) <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}")
+
+    WQ, _nnz = _sparse_wq_product(W_E, Q_all, int(row_block_size))
+    degree_t = _as_degree_tensor(degree, Q_all)
+    if int(degree_t.numel()) != m:
+        raise ValueError(f"degree length={degree_t.numel()} does not match Q_all rows={m}")
+
+    # Apply P = D^{-1} W_E without materializing P or a dense W_E.
+    R = WQ / degree_t.clamp_min(float(eps)).unsqueeze(1)
+    cluster_mass = Q_all.sum(dim=0)
+    actual = (Q_all * R).sum(dim=0)
+    expected = (cluster_mass / float(m)) * R.sum(dim=0)
+    gain = (actual - expected) / (cluster_mass + float(eps)).pow(float(tau))
+    esg_loss = -gain.mean()
+    stats = {
+        "mean_gain": float(gain.detach().mean().cpu()),
+        "min_gain": float(gain.detach().min().cpu()),
+        "max_gain": float(gain.detach().max().cpu()),
+    }
+    _check_scalar_finite("expected structural score gain loss", esg_loss, stats)
+    return esg_loss, stats
+
+
 def edge_matrix_ncut_loss_global(
     Q_all: torch.Tensor,
     Pi_cut,

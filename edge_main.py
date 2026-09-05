@@ -72,6 +72,7 @@ def build_parser():
     parser.add_argument("--lambda_prox", type=float, default=1.0)
     parser.add_argument("--lambda_edge_ncut", type=float, default=0.5)
     parser.add_argument("--lambda_orth", type=float, default=1.0)
+    parser.add_argument("--lambda_esg", type=float, default=1.0)
     parser.add_argument("--global_cut_scale", type=float, default=1.0)
     parser.add_argument("--global_orth_scale", type=float, default=1.0)
     parser.add_argument("--lambda_proj", type=float, default=0.0)
@@ -191,7 +192,10 @@ def print_config(args, K=None):
         f"global_warmup_epochs={args.global_warmup_epochs}, prox_warmup_epochs={args.prox_warmup_epochs}, "
         f"F1_type=macro"
     )
-    print(f"cluster_loss_type={args.cluster_loss_type}, orth_type={args.orth_type}, lambda_orth={args.lambda_orth}")
+    print(
+        f"cluster_loss_type={args.cluster_loss_type}, orth_type={args.orth_type}, "
+        f"lambda_orth={args.lambda_orth}, lambda_esg={args.lambda_esg}"
+    )
     print(
         f"lambda_prox={args.lambda_prox}, lambda_edge_ncut={args.lambda_edge_ncut}, "
         f"global_cut_scale={args.global_cut_scale}, global_orth_scale={args.global_orth_scale}, "
@@ -300,6 +304,7 @@ def main(args):
     print(f"ncut_scope={args.ncut_scope}")
     print(f"orth_type={args.orth_type}")
     print(f"lambda_orth={args.lambda_orth}")
+    print(f"lambda_esg={args.lambda_esg}")
     print(f"global_cut_scale={args.global_cut_scale}")
     print(f"global_orth_scale={args.global_orth_scale}")
     print(f"legacy_balance_disabled={str(args.cluster_loss_type != 'legacy_ncut').lower()}")

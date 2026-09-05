@@ -20,6 +20,7 @@ from edge_losses import (
     edge_ncut_loss,
     edge_ncut_loss_global,
     edge_ppr_proximity_loss,
+    edge_expected_structural_score_gain_loss_global,
     edge_matrix_ncut_loss_global,
     edge_trace_mincut_loss_global,
     matrix_ncut_qtdq_diagnostics,
@@ -1640,6 +1641,10 @@ class EdgeHiNoSTrainer:
             "global_orth_scale",
             "weighted_cut_loss",
             "weighted_orth_loss",
+            "esg_loss",
+            "mean_gain",
+            "min_gain",
+            "max_gain",
             "orth_original_loss",
             "orthqa_loss",
             "orth_original_value",
@@ -1967,6 +1972,7 @@ class EdgeHiNoSTrainer:
         lambda_node_sbm = float(getattr(self.args, "lambda_node_sbm", 0.0))
         node_sbm_negative_ratio = float(getattr(self.args, "node_sbm_negative_ratio", 1.0))
         lambda_node_prior = float(getattr(self.args, "lambda_node_prior", 0.0))
+        lambda_esg = float(getattr(self.args, "lambda_esg", 1.0))
         if global_cut_scale < 0.0:
             raise ValueError(f"global_cut_scale must be nonnegative, got {global_cut_scale}")
         if global_orth_scale < 0.0:
@@ -1979,6 +1985,8 @@ class EdgeHiNoSTrainer:
             )
         if lambda_node_prior < 0.0:
             raise ValueError(f"lambda_node_prior must be nonnegative, got {lambda_node_prior}")
+        if lambda_esg < 0.0:
+            raise ValueError(f"lambda_esg must be nonnegative, got {lambda_esg}")
         if lambda_node_prior > 0.0 and self.node_prior_t is None:
             raise ValueError("lambda_node_prior is positive but no node prior was initialized")
         total_start = time.time()
@@ -2061,6 +2069,10 @@ class EdgeHiNoSTrainer:
 
             cut_loss_value = float("nan")
             orth_loss_value = float("nan")
+            esg_loss_value = float("nan")
+            mean_gain_value = float("nan")
+            min_gain_value = float("nan")
+            max_gain_value = float("nan")
             orth_original_loss_value = float("nan")
             orthqa_loss_value = float("nan")
             cluster_loss_value = float("nan")
@@ -2144,6 +2156,14 @@ class EdgeHiNoSTrainer:
                         cut_scale=global_cut_scale,
                         orth_scale=global_orth_scale,
                     )
+                esg_loss, esg_stats = edge_expected_structural_score_gain_loss_global(
+                    q_all,
+                    self.Pi_cut_sparse_torch if self.Pi_cut_sparse_torch is not None else self.Pi_cut,
+                    self.D_Pi_degree_np,
+                    tau=0.5,
+                    eps=1e-8,
+                    row_block_size=int(self.args.global_ncut_row_block_size),
+                )
                 sync_cuda()
                 cluster_forward_seconds = time.time() - cluster_start
 
@@ -2232,6 +2252,7 @@ class EdgeHiNoSTrainer:
                         + lambda_node_sbm * sbm_loss
                         + lambda_node_prior * prior_loss
                     )
+                global_loss = global_loss + lambda_esg * esg_loss
 
                 cut_loss_value = scalar_value(cut_loss)
                 orth_loss_value = scalar_value(orth_loss)
@@ -2253,6 +2274,10 @@ class EdgeHiNoSTrainer:
                 else:
                     weighted_cut_loss_value = scalar_value(lambda_edge_ncut * cut_loss)
                     weighted_orth_loss_value = scalar_value(lambda_bal * orth_loss)
+                esg_loss_value = scalar_value(esg_loss)
+                mean_gain_value = float(esg_stats["mean_gain"])
+                min_gain_value = float(esg_stats["min_gain"])
+                max_gain_value = float(esg_stats["max_gain"])
                 projection_loss_value = scalar_value(proj_loss)
                 node_anchor_loss_value = scalar_value(anchor_loss)
                 weighted_node_anchor_loss_value = scalar_value(lambda_node_anchor * anchor_loss)
@@ -2289,6 +2314,7 @@ class EdgeHiNoSTrainer:
                     or lambda_node_anchor != 0.0
                     or lambda_node_sbm != 0.0
                     or lambda_node_prior != 0.0
+                    or lambda_esg != 0.0
                     or (self.cluster_loss_type == "legacy_ncut" and lambda_bal != 0.0)
                 ):
                     sync_cuda()
@@ -2340,6 +2366,10 @@ class EdgeHiNoSTrainer:
                 "global_orth_scale": global_orth_scale,
                 "weighted_cut_loss": weighted_cut_loss_value,
                 "weighted_orth_loss": weighted_orth_loss_value,
+                "esg_loss": esg_loss_value,
+                "mean_gain": mean_gain_value,
+                "min_gain": min_gain_value,
+                "max_gain": max_gain_value,
                 "orth_original_loss": stage_stats_for_epoch.get("orth_original_loss", orth_original_loss_value),
                 "orthqa_loss": stage_stats_for_epoch.get("orthqa_loss", orthqa_loss_value),
                 "orth_original_value": stage_stats_for_epoch.get("orth_original_value", ""),
@@ -2478,6 +2508,8 @@ class EdgeHiNoSTrainer:
                     f"after_prox_f1={record.get('after_prox_Macro_F1', 0.0):.4f} "
                     f"after_global_f1={record.get('after_global_Macro_F1', 0.0):.4f} "
                     f"cut={cut_loss_value:.4f} orth={orth_loss_value:.4f} "
+                    f"esg={esg_loss_value:.4f} gain_mean={mean_gain_value:.4f} "
+                    f"gain_min={min_gain_value:.4f} gain_max={max_gain_value:.4f} "
                     f"proj={projection_loss_value:.4f} prior={node_prior_loss_value:.4f} "
                     f"sbm={node_sbm_loss_value:.4f} "
                     f"cluster={cluster_loss_value:.4f} "
@@ -2497,6 +2529,8 @@ class EdgeHiNoSTrainer:
                     f"epoch={epoch} ACC={metrics['ACC']:.4f} NMI={metrics['NMI']:.4f} "
                     f"ARI={metrics['ARI']:.4f} Macro_F1={metrics['Macro_F1']:.4f} "
                     f"cut={cut_loss_value:.4f} orth={orth_loss_value:.4f} "
+                    f"esg={esg_loss_value:.4f} gain_mean={mean_gain_value:.4f} "
+                    f"gain_min={min_gain_value:.4f} gain_max={max_gain_value:.4f} "
                     f"penalty_type={str(getattr(self.args, 'orth_type', 'orth')).lower()} "
                     f"proj={projection_loss_value:.4f} prior={node_prior_loss_value:.4f} "
                     f"sbm={node_sbm_loss_value:.4f} "
