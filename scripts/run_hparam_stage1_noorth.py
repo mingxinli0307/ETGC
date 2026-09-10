@@ -11,6 +11,7 @@ import os
 import platform
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -255,6 +256,9 @@ def gpu_inventory() -> list[dict]:
 
 
 def cache_audit(args) -> dict:
+    root_text = str(args.root_dir)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
     from edge_data import load_edge_event_data
     from utils import hash_cfg
 
@@ -596,6 +600,8 @@ def main() -> int:
     branch = subprocess.run(
         ["git", "branch", "--show-current"], cwd=args.root_dir, text=True, capture_output=True, check=True
     ).stdout.strip()
+    if not branch:
+        branch = "exp/etgc-mainline-refine (detached worktree at exact commit)"
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=args.root_dir, text=True, capture_output=True, check=True
     ).stdout.strip()
