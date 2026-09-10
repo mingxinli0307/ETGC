@@ -485,8 +485,13 @@ def edge_ppr_proximity_loss(
         pos_score = (r_union[a] * r_union[p]).sum(dim=-1)
         neg_score = (r_union[a] * r_union[neg]).sum(dim=-1)
     elif mode == "cosine":
-        pos_score = _cosine_pair(r_union[a], r_union[p], eps)
-        neg_score = _cosine_pair(r_union[a], r_union[neg], eps)
+        r_norm = torch.linalg.norm(r_union, dim=-1)
+        pos_score = (r_union[a] * r_union[p]).sum(dim=-1) / (
+            r_norm[a] * r_norm[p] + float(eps)
+        )
+        neg_score = (r_union[a] * r_union[neg]).sum(dim=-1) / (
+            r_norm[a] * r_norm[neg] + float(eps)
+        )
     elif mode == "role_aware":
         pos_score = role_aware_event_scores(
             a,

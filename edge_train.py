@@ -662,6 +662,15 @@ class EdgeHiNoSTrainer:
             self.time_feat_t.index_select(0, ids_t),
         )
 
+    def _encode_ids(self, ids: np.ndarray) -> torch.Tensor:
+        """Encode event ids without evaluating the cluster head or assignments."""
+        ids_t = torch.from_numpy(ids).long().to(self.device)
+        return self.model.encode_edge_events(
+            self.src_t.index_select(0, ids_t),
+            self.dst_t.index_select(0, ids_t),
+            self.time_feat_t.index_select(0, ids_t),
+        )
+
     def _forward_ids_with_logits(self, ids: np.ndarray):
         ids_t = torch.from_numpy(ids).long().to(self.device)
         return self._forward_event_tensors(
@@ -709,7 +718,15 @@ class EdgeHiNoSTrainer:
         batch_ids: np.ndarray,
         rng: np.random.RandomState,
     ) -> torch.Tensor:
-        ids_t = torch.from_numpy(union_ids).long().to(self.device)
+        role_kwargs = {}
+        if self.prox_similarity_mode == "role_aware":
+            ids_t = torch.from_numpy(union_ids).long().to(self.device)
+            role_kwargs = {
+                "node_emb": self.model.node_emb,
+                "src_union": self.src_t.index_select(0, ids_t),
+                "dst_union": self.dst_t.index_select(0, ids_t),
+                "time_feat_union": self.time_feat_t.index_select(0, ids_t),
+            }
         return edge_ppr_proximity_loss(
             r_union,
             local_index,
@@ -719,10 +736,7 @@ class EdgeHiNoSTrainer:
             rng,
             self.device,
             similarity_mode=self.prox_similarity_mode,
-            node_emb=self.model.node_emb,
-            src_union=self.src_t.index_select(0, ids_t),
-            dst_union=self.dst_t.index_select(0, ids_t),
-            time_feat_union=self.time_feat_t.index_select(0, ids_t),
+            **role_kwargs,
             prox_role_ss_weight=float(getattr(self.args, "prox_role_ss_weight", 0.25)),
             prox_role_dd_weight=float(getattr(self.args, "prox_role_dd_weight", 0.25)),
             prox_role_ds_weight=float(getattr(self.args, "prox_role_ds_weight", 1.0)),
@@ -1164,7 +1178,7 @@ class EdgeHiNoSTrainer:
             batch_ids = np.arange(min(int(self.args.batch_size), self.data.num_events), dtype=np.int64)
             union_ids = self._batch_union_ids(batch_ids)
             local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
-            r_union, _ = self._forward_ids(union_ids)
+            r_union = self._encode_ids(union_ids)
             diag_rng = np.random.RandomState(int(self.model_seed) + 104729)
             prox_loss = self._proximity_loss_for_union(r_union, union_ids, local_index, batch_ids, diag_rng)
             prox_grads = torch.autograd.grad(
@@ -1751,6 +1765,8 @@ class EdgeHiNoSTrainer:
             "top_bottom_drift_ratio",
             "cluster_forward_seconds",
             "cluster_backward_seconds",
+            "prox_forward_backward_seconds",
+            "prox_optimizer_steps",
             "epoch_seconds",
             "total_runtime_seconds",
             "peak_gpu_memory_mb",
@@ -2005,10 +2021,13 @@ class EdgeHiNoSTrainer:
             epoch_start = time.time()
             before_metrics = self._evaluate_stage() if diagnostic else {}
             self.model.train()
-            prox_total = 0.0
-            weighted_prox_total = 0.0
+            prox_total_t = torch.zeros((), dtype=self.model.node_emb.dtype, device=self.device)
+            weighted_prox_total_t = torch.zeros((), dtype=self.model.node_emb.dtype, device=self.device)
             prox_steps = 0
+            prox_optimizer_steps = 0
             h_before_prox = self._node_emb_snapshot_cpu()
+            sync_cuda()
+            prox_start = time.time()
             if self.ncut_scope == "global":
                 if lambda_prox > 0.0:
                     order = self.rng.permutation(m)
@@ -2017,15 +2036,16 @@ class EdgeHiNoSTrainer:
                         batch_ids = order[start : start + batch_size]
                         union_ids = self._batch_union_ids(batch_ids)
                         local_index = {int(eid): i for i, eid in enumerate(union_ids.tolist())}
-                        r_union, _ = self._forward_ids(union_ids)
+                        r_union = self._encode_ids(union_ids)
                         l_prox = self._proximity_loss_for_union(r_union, union_ids, local_index, batch_ids, self.rng)
                         loss = lambda_prox * l_prox
                         self.optimizer.zero_grad()
                         if loss.requires_grad:
                             loss.backward()
                             self.optimizer.step()
-                        prox_total += scalar_value(l_prox)
-                        weighted_prox_total += scalar_value(loss)
+                            prox_optimizer_steps += 1
+                        prox_total_t += l_prox.detach()
+                        weighted_prox_total_t += loss.detach()
                         prox_steps += 1
             else:
                 order = self.rng.permutation(m)
@@ -2059,9 +2079,14 @@ class EdgeHiNoSTrainer:
                     if loss.requires_grad:
                         loss.backward()
                         self.optimizer.step()
-                    prox_total += scalar_value(l_prox)
-                    weighted_prox_total += scalar_value(lambda_prox * l_prox)
+                        prox_optimizer_steps += 1
+                    prox_total_t += l_prox.detach()
+                    weighted_prox_total_t += (lambda_prox * l_prox).detach()
                     prox_steps += 1
+            sync_cuda()
+            prox_forward_backward_seconds = time.time() - prox_start
+            prox_total = scalar_value(prox_total_t)
+            weighted_prox_total = scalar_value(weighted_prox_total_t)
             node_update_from_prox = self._node_update_from_snapshot(h_before_prox)
             del h_before_prox
 
@@ -2463,6 +2488,8 @@ class EdgeHiNoSTrainer:
                 "cut_penalty_gradient_cosine": stage_stats_for_epoch.get("cut_penalty_gradient_cosine", ""),
                 "cluster_forward_seconds": cluster_forward_seconds,
                 "cluster_backward_seconds": cluster_backward_seconds,
+                "prox_forward_backward_seconds": prox_forward_backward_seconds,
+                "prox_optimizer_steps": prox_optimizer_steps,
                 "epoch_seconds": epoch_seconds,
                 "total_runtime_seconds": total_runtime_seconds,
                 "peak_gpu_memory_mb": peak_gpu_memory_mb,
@@ -2521,6 +2548,8 @@ class EdgeHiNoSTrainer:
                     f"active_edge={record['edge_hard_active_clusters']} active_node={record['node_hard_active_clusters']} "
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
                     f"cluster_backward_seconds={cluster_backward_seconds:.4f} "
+                    f"prox_forward_backward_seconds={prox_forward_backward_seconds:.4f} "
+                    f"prox_optimizer_steps={prox_optimizer_steps} "
                     f"epoch_seconds={epoch_seconds:.4f} peak_gpu_memory_mb={peak_gpu_memory_mb:.2f} "
                     f"global_q_forwards={global_q_forwards}{loss_diag_text}"
                 )
@@ -2543,6 +2572,8 @@ class EdgeHiNoSTrainer:
                     f"active_edge={record['edge_hard_active_clusters']} active_node={record['node_hard_active_clusters']} "
                     f"cluster_forward_seconds={cluster_forward_seconds:.4f} "
                     f"cluster_backward_seconds={cluster_backward_seconds:.4f} "
+                    f"prox_forward_backward_seconds={prox_forward_backward_seconds:.4f} "
+                    f"prox_optimizer_steps={prox_optimizer_steps} "
                     f"epoch_seconds={epoch_seconds:.4f} peak_gpu_memory_mb={peak_gpu_memory_mb:.2f} "
                     f"global_q_forwards={global_q_forwards}{loss_diag_text}"
                 )

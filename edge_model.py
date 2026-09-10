@@ -152,8 +152,17 @@ class EdgeHiNoSModel(nn.Module):
         dst: torch.Tensor,
         time_feat: torch.Tensor,
     ) -> torch.Tensor:
+        """Compatibility helper for callers that provide event endpoint ids."""
         h_src = self.node_emb.index_select(0, src.long())
         h_dst = self.node_emb.index_select(0, dst.long())
+        return self._direct_node_time_event_repr(h_src, h_dst, time_feat)
+
+    def _direct_node_time_event_repr(
+        self,
+        h_src: torch.Tensor,
+        h_dst: torch.Tensor,
+        time_feat: torch.Tensor,
+    ) -> torch.Tensor:
         return torch.cat([h_src, h_dst, float(self.direct_time_scale) * time_feat], dim=-1)
 
     def encode_edge_events(
@@ -172,7 +181,7 @@ class EdgeHiNoSModel(nn.Module):
             x_e = torch.cat([pair_feat, time_feat], dim=-1)
             return self.edge_mlp(x_e)
         if self.edge_encoder_mode == "direct_node_time":
-            return self.build_direct_node_time_event_repr(src, dst, time_feat)
+            return self._direct_node_time_event_repr(h_u, h_v, time_feat)
         raise ValueError(f"Unsupported edge_encoder_mode: {self.edge_encoder_mode}")
 
     def cluster_hidden_from_edge_repr(self, edge_repr: torch.Tensor):
