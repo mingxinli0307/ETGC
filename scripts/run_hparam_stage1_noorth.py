@@ -538,6 +538,7 @@ def run_task(args, task: Task, physical_gpu: str) -> dict:
     validate_command(command, task)
     (run_dir / "command.txt").write_text(" ".join(command) + "\n", encoding="utf-8")
     environment = os.environ.copy()
+    environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     environment["CUDA_VISIBLE_DEVICES"] = str(physical_gpu)
     environment.setdefault("OMP_NUM_THREADS", "4")
     environment.setdefault("OPENBLAS_NUM_THREADS", "4")
@@ -545,6 +546,7 @@ def run_task(args, task: Task, physical_gpu: str) -> dict:
     error = ""
     with (run_dir / "train.log").open("w", encoding="utf-8") as log:
         log.write(f"assigned_physical_gpu={physical_gpu}\n")
+        log.write("CUDA_DEVICE_ORDER=PCI_BUS_ID\n")
         log.write(f"CUDA_VISIBLE_DEVICES={physical_gpu}\n")
         log.write("resolved_command=" + " ".join(command) + "\n")
         log.flush()
