@@ -179,3 +179,54 @@ def test_one_epoch_global_cosine_proximity_smoke(tmp_path):
     assert int(rows[0]["prox_optimizer_steps"]) > 0
     assert float(rows[0]["prox_forward_backward_seconds"]) >= 0.0
     assert np.isfinite(float(rows[0]["prox_loss"]))
+
+
+def test_zero_orth_during_proximity_warmup_logs_uncomputed_global_losses(tmp_path):
+    data_dir = tmp_path / "dataset" / "toy"
+    data_dir.mkdir(parents=True)
+    (data_dir / "toy.txt").write_text(
+        "0 1 0.0\n1 2 0.2\n2 3 0.4\n3 0 0.6\n0 2 0.8\n1 3 1.0\n",
+        encoding="utf-8",
+    )
+    (data_dir / "node2label.txt").write_text("0 0\n1 0\n2 1\n3 1\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    args = build_parser().parse_args(
+        [
+            "--dataset", "toy",
+            "--data_root", str(tmp_path / "dataset"),
+            "--cache_dir", str(tmp_path / "cache"),
+            "--output_dir", str(output_dir),
+            "--epoch", "1",
+            "--batch_size", "2",
+            "--edge_ppr_method", "truncated",
+            "--edge_ppr_topk", "-1",
+            "--time_dim", "3",
+            "--edge_encoder_mode", "direct_node_time",
+            "--cluster_head_type", "cosine_prototype",
+            "--prototype_init_mode", "random",
+            "--cluster_loss_type", "matrix_ncut",
+            "--orth_type", "orthqa",
+            "--ncut_scope", "global",
+            "--node_emb_mode", "full",
+            "--lambda_prox", "1",
+            "--lambda_orth", "0",
+            "--lambda_esg", "0.1",
+            "--prox_similarity_mode", "cosine",
+            "--prox_warmup_epochs", "5",
+            "--global_warmup_epochs", "0",
+            "--loss_formulation_diagnostic", "1",
+            "--quiet", "1",
+        ]
+    )
+    args.model_seed = args.seed
+    args.prototype_seed = args.seed
+    args.forest_seed = args.seed
+
+    EdgeHiNoSTrainer(args).train()
+
+    with (output_dir / "metrics.csv").open("r", encoding="utf-8", newline="") as reader:
+        rows = list(csv.DictReader(reader))
+    assert len(rows) == 1
+    assert np.isnan(float(rows[0]["weighted_cut_loss"]))
+    assert np.isnan(float(rows[0]["weighted_orth_loss"]))
+    assert int(rows[0]["prox_optimizer_steps"]) > 0

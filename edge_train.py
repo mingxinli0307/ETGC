@@ -2098,6 +2098,10 @@ class EdgeHiNoSTrainer:
             mean_gain_value = float("nan")
             min_gain_value = float("nan")
             max_gain_value = float("nan")
+            # Global cut/orth are intentionally absent during proximity warmup.
+            # Keep their logged values explicit instead of leaving locals undefined.
+            weighted_cut_loss_value = float("nan")
+            weighted_orth_loss_value = float("nan")
             orth_original_loss_value = float("nan")
             orthqa_loss_value = float("nan")
             cluster_loss_value = float("nan")
@@ -2513,7 +2517,7 @@ class EdgeHiNoSTrainer:
             self._append_epoch_record(record)
 
             loss_diag_text = ""
-            if self.loss_formulation_diagnostic:
+            if self.loss_formulation_diagnostic and record["q_rank1_energy_ratio"] != "":
                 loss_diag_text = (
                     f" rank1={record['q_rank1_energy_ratio']:.6g}"
                     f" center_ratio={record['q_centered_to_total_energy_ratio']:.6g}"
