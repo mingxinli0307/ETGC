@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Tune the four ETGC losses on School and summarize runtime composition.
+"""Tune the four ETGC losses on one ETGC dataset and summarize runtime composition.
 
 Only matrix Ncut, ESG, cosine proximity, and OrthQA are allowed to contribute
 to optimization.  The task list is a fixed, label-independent local design
-around the best completed no-orth School configuration.
+around the best completed no-orth School configuration.  The same search
+design can be reused on another dataset through ``--dataset``.
 """
 
 from __future__ import annotations
@@ -102,7 +103,7 @@ FIXED = {
 }
 
 SUMMARY_FIELDS = (
-    "config", "axis", "seed", "epochs", "status", "error",
+    "dataset", "config", "axis", "seed", "epochs", "status", "error",
     "lambda_edge_ncut", "lambda_esg", "lambda_prox", "lambda_orth",
     "effective_orth_weight", "best_epoch", "best_ACC", "best_Macro_F1",
     "best_NMI", "best_ARI", "final_ACC", "final_Macro_F1", "final_NMI",
@@ -215,7 +216,7 @@ def complete(output_dir: Path, task: Task) -> bool:
     if result.get("status") != "success" or len(rows) < EPOCHS:
         return False
     expected = {
-        "dataset": "school",
+        "dataset": FIXED["dataset"],
         "epoch": EPOCHS,
         "cluster_loss_type": "matrix_ncut",
         "orth_type": ORTH_TYPE,
@@ -263,7 +264,7 @@ def build_command(args, task: Task, directory: Path) -> list[str]:
 def validate_command(command: list[str], task: Task) -> None:
     parsed = {command[index][2:]: command[index + 1] for index in range(3, len(command), 2)}
     expected = {
-        "dataset": "school",
+        "dataset": FIXED["dataset"],
         "cluster_loss_type": "matrix_ncut",
         "orth_type": ORTH_TYPE,
         "lambda_edge_ncut": task.lambda_edge_ncut,
@@ -319,6 +320,7 @@ def summary_row(output_dir: Path, task: Task, gpu: str = "") -> dict:
     memories = [number(row.get("peak_gpu_memory_mb")) for row in rows]
     memories = [value for value in memories if math.isfinite(value)]
     return {
+        "dataset": FIXED["dataset"],
         "config": task.slug,
         "axis": task.axis,
         "seed": SEED,
@@ -404,7 +406,7 @@ def write_analysis(path: Path, rows: list[dict]) -> None:
     successful = [row for row in rows if row.get("status") == "success"]
     ranked = sorted(successful, key=lambda row: (collapsed(row), -number(row.get("final_Macro_F1"))))
     lines = [
-        "# School Four-Loss Tuning",
+        f"# {str(FIXED['dataset']).upper()} Four-Loss Tuning",
         "",
         f"Completed: {len(successful)}/{len(rows)}.",
         "Only matrix Ncut, ESG, cosine proximity, and OrthQA can contribute to optimization.",
@@ -591,6 +593,7 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--python-bin", required=True)
     parser.add_argument("--physical-gpus", required=True)
+    parser.add_argument("--dataset", default="school")
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--dependency-complete-file", type=Path)
     parser.add_argument("--dependency-pid", type=int, default=0)
@@ -607,6 +610,10 @@ def main() -> int:
     if EPOCHS <= 0:
         raise ValueError("epochs must be positive")
     FIXED["epoch"] = EPOCHS
+    dataset = args.dataset.strip()
+    if not dataset:
+        raise ValueError("dataset must be non-empty")
+    FIXED["dataset"] = dataset
     diagnostic_epochs = [1, 5, 10, 20, 30, 50, 75, 100]
     if EPOCHS >= 150:
         diagnostic_epochs.append(150)
@@ -622,8 +629,9 @@ def main() -> int:
         raise ValueError("GPU polling interval and stable-check count must be positive")
     if args.dependency_poll_seconds <= 0:
         raise ValueError("dependency polling interval must be positive")
-    if not (args.asset_root / "dataset" / "school" / "school.txt").exists():
-        raise FileNotFoundError("School dataset is missing from asset root")
+    dataset_file = args.asset_root / "dataset" / dataset / f"{dataset}.txt"
+    if not dataset_file.exists():
+        raise FileNotFoundError(f"Dataset file is missing: {dataset_file}")
 
     tasks = make_tasks()
     queues = partition(tasks, devices)
@@ -636,7 +644,7 @@ def main() -> int:
     ).stdout.strip()
     common = {
         "method": "ETGC",
-        "dataset": "school",
+        "dataset": dataset,
         "seed": SEED,
         "epochs": EPOCHS,
         "allowed_losses": ALLOWED_LOSSES,
