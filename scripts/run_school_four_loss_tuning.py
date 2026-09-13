@@ -21,6 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 EPOCHS = 100
@@ -496,10 +497,17 @@ def gpu_compute_process_count(physical_gpu: str) -> int:
     return sum(1 for row in process_rows if row.split(",", 1)[0].strip() == uuid)
 
 
-def wait_until_gpu_idle(physical_gpu: str, poll_seconds: float, stable_checks: int) -> None:
+def wait_until_gpu_idle(
+    physical_gpu: str,
+    poll_seconds: float,
+    stable_checks: int,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
     consecutive = 0
     checks = 0
     while consecutive < stable_checks:
+        if stop_event is not None and stop_event.is_set():
+            return False
         count = gpu_compute_process_count(physical_gpu)
         checks += 1
         if count == 0:
@@ -513,7 +521,11 @@ def wait_until_gpu_idle(physical_gpu: str, poll_seconds: float, stable_checks: i
                 flush=True,
             )
         if consecutive < stable_checks:
-            time.sleep(poll_seconds)
+            if stop_event is not None and stop_event.wait(poll_seconds):
+                return False
+            if stop_event is None:
+                time.sleep(poll_seconds)
+    return True
 
 
 def run_task(args, task: Task, gpu: str) -> dict:
@@ -603,6 +615,7 @@ def main() -> int:
         "fixed": FIXED,
         "commit": commit,
         "physical_gpus": devices,
+        "scheduling": "dynamic_shared_queue",
     }
     (code_info / "common_config.json").write_text(
         json.dumps(common, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -619,7 +632,7 @@ def main() -> int:
             "lambda_esg": task.lambda_esg,
             "lambda_prox": task.lambda_prox,
             "lambda_orth": task.lambda_orth,
-            "assigned_physical_gpu": assignments[task],
+            "initial_queue_gpu": assignments[task],
         }
         for task in tasks
     ]
@@ -636,12 +649,26 @@ def main() -> int:
         return 0
 
     lock = threading.Lock()
+    pending = sorted(tasks, key=lambda item: item.estimated_cost, reverse=True)
+    all_assigned = threading.Event()
 
-    def worker(device: str, queue: list[Task]) -> list[dict]:
+    def worker(device: str) -> list[dict]:
         records = []
-        for task in queue:
-            if args.wait_for_free_gpus:
-                wait_until_gpu_idle(device, args.gpu_poll_seconds, args.gpu_stable_checks)
+        while True:
+            if args.wait_for_free_gpus and not wait_until_gpu_idle(
+                device,
+                args.gpu_poll_seconds,
+                args.gpu_stable_checks,
+                stop_event=all_assigned,
+            ):
+                break
+            with lock:
+                if not pending:
+                    break
+                task = pending.pop(0)
+                assignments[task] = device
+                if not pending:
+                    all_assigned.set()
             print(
                 f"run config={task.slug} gpu={device} ncut={task.lambda_edge_ncut} "
                 f"esg={task.lambda_esg} prox={task.lambda_prox} orth={task.lambda_orth}",
@@ -657,7 +684,7 @@ def main() -> int:
     started = time.time()
     records = []
     with ThreadPoolExecutor(max_workers=len(devices)) as pool:
-        futures = [pool.submit(worker, device, queue) for device, queue in queues.items()]
+        futures = [pool.submit(worker, device) for device in devices]
         for future in as_completed(futures):
             records.extend(future.result())
     rows = refresh(args.output_dir, tasks, assignments)
