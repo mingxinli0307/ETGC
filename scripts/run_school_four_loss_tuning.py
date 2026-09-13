@@ -114,6 +114,11 @@ SUMMARY_FIELDS = (
     "node_largest_ratio", "runtime_seconds", "mean_epoch_seconds",
     "median_epoch_seconds", "mean_prox_seconds", "mean_global_forward_seconds",
     "mean_global_backward_seconds", "mean_residual_seconds", "prox_time_fraction",
+    "mean_prox_pair_build_seconds", "mean_prox_pair_build_wait_seconds",
+    "mean_prox_h2d_seconds", "mean_prox_encode_seconds",
+    "mean_prox_loss_forward_seconds", "mean_prox_backward_seconds",
+    "mean_prox_optimizer_step_seconds", "mean_prox_pair_count",
+    "mean_prox_optimizer_steps",
     "measured_global_loss_time_fraction", "peak_gpu_memory_mb", "assigned_physical_gpu",
     "run_dir",
 )
@@ -360,6 +365,15 @@ def summary_row(output_dir: Path, task: Task, gpu: str = "") -> dict:
         "mean_global_backward_seconds": mean_backward,
         "mean_residual_seconds": mean_residual,
         "prox_time_fraction": mean_prox / mean_epoch if mean_epoch > 0 else math.nan,
+        "mean_prox_pair_build_seconds": mean_field(rows, "prox_pair_build_seconds"),
+        "mean_prox_pair_build_wait_seconds": mean_field(rows, "prox_pair_build_wait_seconds"),
+        "mean_prox_h2d_seconds": mean_field(rows, "prox_h2d_seconds"),
+        "mean_prox_encode_seconds": mean_field(rows, "prox_encode_seconds"),
+        "mean_prox_loss_forward_seconds": mean_field(rows, "prox_loss_forward_seconds"),
+        "mean_prox_backward_seconds": mean_field(rows, "prox_backward_seconds"),
+        "mean_prox_optimizer_step_seconds": mean_field(rows, "prox_optimizer_step_seconds"),
+        "mean_prox_pair_count": mean_field(rows, "prox_pair_count"),
+        "mean_prox_optimizer_steps": mean_field(rows, "prox_optimizer_steps"),
         "measured_global_loss_time_fraction": (
             (mean_forward + mean_backward) / mean_epoch if mean_epoch > 0 else math.nan
         ),
@@ -416,19 +430,22 @@ def write_analysis(path: Path, rows: list[dict]) -> None:
         "",
         "## Runtime",
         "",
-        "The structural columns measure only the timed Ncut/OrthQA/ESG forward and global backward regions. "
-        "Residual time includes the full-Q forward, evaluation, optimizer work, diagnostics, and bookkeeping.",
+        "The proximity substage columns use CUDA events without synchronizing every batch. "
+        "Pair-build work is prefetched; pair wait is the portion exposed on the training critical path.",
         "",
-        "| Config | Epoch s | Prox s | Structural forward s | Global backward s | Residual s | Prox share |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Config | Epoch s | Prox s | Pair wait s | H2D s | Encode s | Loss forward s | Prox backward s | Adam step s | Prox share |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in ranked[:10]:
         lines.append(
             f"| {row['config']} | {number(row['mean_epoch_seconds']):.3f} | "
             f"{number(row['mean_prox_seconds']):.3f} | "
-            f"{number(row['mean_global_forward_seconds']):.3f} | "
-            f"{number(row['mean_global_backward_seconds']):.3f} | "
-            f"{number(row['mean_residual_seconds']):.3f} | "
+            f"{number(row['mean_prox_pair_build_wait_seconds']):.3f} | "
+            f"{number(row['mean_prox_h2d_seconds']):.3f} | "
+            f"{number(row['mean_prox_encode_seconds']):.3f} | "
+            f"{number(row['mean_prox_loss_forward_seconds']):.3f} | "
+            f"{number(row['mean_prox_backward_seconds']):.3f} | "
+            f"{number(row['mean_prox_optimizer_step_seconds']):.3f} | "
             f"{100.0 * number(row['prox_time_fraction']):.1f}% |"
         )
     lines += [""]
