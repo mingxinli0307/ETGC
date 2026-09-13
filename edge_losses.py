@@ -440,14 +440,12 @@ def edge_orthqa_penalty_global(Q_all: torch.Tensor, degree, eps: float = 1e-12) 
     return orthqa_loss
 
 
-def edge_ppr_proximity_loss(
+def edge_ppr_proximity_loss_preindexed(
     r_union: torch.Tensor,
-    local_index: dict,
-    batch_ids: np.ndarray,
-    Pi_E: sp.csr_matrix,
-    num_events: int,
-    rng: np.random.RandomState,
-    device: torch.device,
+    anchors: torch.Tensor,
+    positives: torch.Tensor,
+    negatives: torch.Tensor,
+    weights: torch.Tensor,
     similarity_mode: str = "cosine",
     node_emb: torch.Tensor = None,
     src_union: torch.Tensor = None,
@@ -461,24 +459,18 @@ def edge_ppr_proximity_loss(
     prox_temperature: float = 0.2,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    anchors, positives, weights = [], [], []
-    for eid in batch_ids.tolist():
-        start, end = Pi_E.indptr[eid], Pi_E.indptr[eid + 1]
-        for nbr, weight in zip(Pi_E.indices[start:end], Pi_E.data[start:end]):
-            if int(nbr) == int(eid) or int(nbr) not in local_index:
-                continue
-            anchors.append(local_index[int(eid)])
-            positives.append(local_index[int(nbr)])
-            weights.append(float(weight))
-    if not anchors:
+    """Evaluate the existing proximity objective from prepared local pairs."""
+    if anchors.numel() == 0:
         return r_union.sum() * 0.0
 
-    a = torch.as_tensor(anchors, dtype=torch.long, device=device)
-    p = torch.as_tensor(positives, dtype=torch.long, device=device)
-    w = torch.as_tensor(weights, dtype=torch.float32, device=device)
-    neg_global = rng.randint(0, num_events, size=len(anchors))
-    neg = torch.as_tensor([local_index.get(int(e), int(rng.randint(0, len(local_index)))) for e in neg_global],
-                          dtype=torch.long, device=device)
+    a = anchors.long()
+    p = positives.long()
+    neg = negatives.long()
+    w = weights.to(dtype=torch.float32)
+    if not (a.device == p.device == neg.device == w.device == r_union.device):
+        raise ValueError("Pre-indexed proximity tensors must be on the same device as r_union")
+    if not (a.numel() == p.numel() == neg.numel() == w.numel()):
+        raise ValueError("Pre-indexed proximity pair tensors must have equal lengths")
 
     mode = str(similarity_mode).lower()
     if mode == "event_dot":
@@ -526,6 +518,70 @@ def edge_ppr_proximity_loss(
     else:
         raise ValueError(f"Unsupported prox_similarity_mode: {similarity_mode}")
     return (w * F.softplus(-pos_score)).mean() + F.softplus(neg_score).mean()
+
+
+def edge_ppr_proximity_loss(
+    r_union: torch.Tensor,
+    local_index: dict,
+    batch_ids: np.ndarray,
+    Pi_E: sp.csr_matrix,
+    num_events: int,
+    rng: np.random.RandomState,
+    device: torch.device,
+    similarity_mode: str = "cosine",
+    node_emb: torch.Tensor = None,
+    src_union: torch.Tensor = None,
+    dst_union: torch.Tensor = None,
+    time_feat_union: torch.Tensor = None,
+    prox_role_ss_weight: float = 0.25,
+    prox_role_dd_weight: float = 0.25,
+    prox_role_ds_weight: float = 1.0,
+    prox_role_sd_weight: float = 0.0,
+    prox_role_time_weight: float = 0.25,
+    prox_temperature: float = 0.2,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Compatibility wrapper retaining the historical Python pair builder."""
+    anchors, positives, weights = [], [], []
+    for eid in batch_ids.tolist():
+        start, end = Pi_E.indptr[eid], Pi_E.indptr[eid + 1]
+        for nbr, weight in zip(Pi_E.indices[start:end], Pi_E.data[start:end]):
+            if int(nbr) == int(eid) or int(nbr) not in local_index:
+                continue
+            anchors.append(local_index[int(eid)])
+            positives.append(local_index[int(nbr)])
+            weights.append(float(weight))
+    if not anchors:
+        return r_union.sum() * 0.0
+
+    a = torch.as_tensor(anchors, dtype=torch.long, device=device)
+    p = torch.as_tensor(positives, dtype=torch.long, device=device)
+    w = torch.as_tensor(weights, dtype=torch.float32, device=device)
+    neg_global = rng.randint(0, num_events, size=len(anchors))
+    neg = torch.as_tensor(
+        [local_index.get(int(e), int(rng.randint(0, len(local_index)))) for e in neg_global],
+        dtype=torch.long,
+        device=device,
+    )
+    return edge_ppr_proximity_loss_preindexed(
+        r_union,
+        a,
+        p,
+        neg,
+        w,
+        similarity_mode=similarity_mode,
+        node_emb=node_emb,
+        src_union=src_union,
+        dst_union=dst_union,
+        time_feat_union=time_feat_union,
+        prox_role_ss_weight=prox_role_ss_weight,
+        prox_role_dd_weight=prox_role_dd_weight,
+        prox_role_ds_weight=prox_role_ds_weight,
+        prox_role_sd_weight=prox_role_sd_weight,
+        prox_role_time_weight=prox_role_time_weight,
+        prox_temperature=prox_temperature,
+        eps=eps,
+    )
 
 
 def _cosine_pair(x: torch.Tensor, y: torch.Tensor, eps: float) -> torch.Tensor:

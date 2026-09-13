@@ -1,6 +1,7 @@
 import csv
 import os
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -12,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from edge_losses import edge_ppr_proximity_loss
+from edge_losses import edge_ppr_proximity_loss, edge_ppr_proximity_loss_preindexed
 from edge_main import build_parser
 from edge_model import EdgeHiNoSModel
 from edge_train import EdgeHiNoSTrainer
@@ -127,10 +128,110 @@ def test_cosine_proximity_matches_repeated_norm_reference_and_backward():
     assert torch.allclose(r_actual.grad, r_reference.grad, atol=1e-7, rtol=1e-6)
 
 
+def _trainer_with_proximity_csr(pi_e: sp.csr_matrix) -> EdgeHiNoSTrainer:
+    trainer = object.__new__(EdgeHiNoSTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.Pi_E = pi_e.tocsr(copy=True)
+    trainer.Pi_E.sort_indices()
+    trainer.data = SimpleNamespace(num_events=trainer.Pi_E.shape[0])
+    trainer._prox_indptr_np = np.asarray(trainer.Pi_E.indptr, dtype=np.int64)
+    trainer._prox_indices_np = np.asarray(trainer.Pi_E.indices, dtype=np.int64)
+    trainer._prox_data_np = np.asarray(trainer.Pi_E.data, dtype=np.float32)
+    trainer._prox_global_to_local_np = np.full(trainer.data.num_events, -1, dtype=np.int64)
+    return trainer
+
+
+def _random_states_equal(left, right) -> bool:
+    return (
+        left[0] == right[0]
+        and np.array_equal(left[1], right[1])
+        and left[2:] == right[2:]
+    )
+
+
+def test_vectorized_proximity_batch_matches_historical_pairs_rng_loss_and_gradient():
+    rows = np.array([0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4])
+    cols = np.array([0, 1, 4, 0, 3, 2, 4, 0, 2, 4, 1, 3])
+    values = np.linspace(0.1, 1.2, rows.size, dtype=np.float32)
+    pi_e = sp.csr_matrix((values, (rows, cols)), shape=(5, 5))
+    trainer = _trainer_with_proximity_csr(pi_e)
+    batch_ids = np.array([3, 0, 2], dtype=np.int64)
+    union_ids = trainer._batch_union_ids(batch_ids)
+    local_index = {int(event_id): index for index, event_id in enumerate(union_ids.tolist())}
+
+    anchors, positives, weights = [], [], []
+    for event_id in batch_ids.tolist():
+        start, end = pi_e.indptr[event_id], pi_e.indptr[event_id + 1]
+        for neighbor, weight in zip(pi_e.indices[start:end], pi_e.data[start:end]):
+            if int(neighbor) == int(event_id) or int(neighbor) not in local_index:
+                continue
+            anchors.append(local_index[event_id])
+            positives.append(local_index[int(neighbor)])
+            weights.append(float(weight))
+    reference_rng = np.random.RandomState(29)
+    negative_global = reference_rng.randint(0, pi_e.shape[0], size=len(anchors))
+    negatives = np.asarray(
+        [
+            local_index.get(int(event_id), int(reference_rng.randint(0, len(local_index))))
+            for event_id in negative_global
+        ],
+        dtype=np.int64,
+    )
+
+    vectorized_rng = np.random.RandomState(29)
+    prepared = trainer._prepare_proximity_batch(batch_ids, vectorized_rng)
+
+    assert np.array_equal(prepared["union_ids"].numpy(), union_ids)
+    assert np.array_equal(prepared["anchors"].numpy(), np.asarray(anchors))
+    assert np.array_equal(prepared["positives"].numpy(), np.asarray(positives))
+    assert np.array_equal(prepared["negatives"].numpy(), negatives)
+    assert np.array_equal(prepared["weights"].numpy(), np.asarray(weights, dtype=np.float32))
+    assert prepared["pair_count"] == len(anchors)
+    assert _random_states_equal(reference_rng.get_state(), vectorized_rng.get_state())
+    assert np.all(trainer._prox_global_to_local_np == -1)
+
+    generator = torch.Generator().manual_seed(7)
+    r_fast = torch.randn(len(union_ids), 6, generator=generator, requires_grad=True)
+    r_reference = r_fast.detach().clone().requires_grad_(True)
+    loss_fast = edge_ppr_proximity_loss_preindexed(
+        r_fast,
+        prepared["anchors"],
+        prepared["positives"],
+        prepared["negatives"],
+        prepared["weights"],
+        similarity_mode="cosine",
+    )
+    loss_reference = edge_ppr_proximity_loss(
+        r_reference,
+        local_index,
+        batch_ids,
+        pi_e,
+        pi_e.shape[0],
+        np.random.RandomState(29),
+        torch.device("cpu"),
+        similarity_mode="cosine",
+    )
+    assert torch.equal(loss_fast, loss_reference)
+    loss_fast.backward()
+    loss_reference.backward()
+    assert torch.equal(r_fast.grad, r_reference.grad)
+
+
 def test_proximity_runtime_fields_are_part_of_epoch_metrics():
     fieldnames = EdgeHiNoSTrainer._metrics_fieldnames()
-    assert "prox_forward_backward_seconds" in fieldnames
-    assert "prox_optimizer_steps" in fieldnames
+    expected = {
+        "prox_forward_backward_seconds",
+        "prox_pair_build_seconds",
+        "prox_pair_build_wait_seconds",
+        "prox_h2d_seconds",
+        "prox_encode_seconds",
+        "prox_loss_forward_seconds",
+        "prox_backward_seconds",
+        "prox_optimizer_step_seconds",
+        "prox_pair_count",
+        "prox_optimizer_steps",
+    }
+    assert expected.issubset(fieldnames)
 
 
 def test_one_epoch_global_cosine_proximity_smoke(tmp_path):
@@ -177,6 +278,13 @@ def test_one_epoch_global_cosine_proximity_smoke(tmp_path):
         rows = list(csv.DictReader(reader))
     assert len(rows) == 1
     assert int(rows[0]["prox_optimizer_steps"]) > 0
+    assert int(rows[0]["prox_pair_count"]) > 0
+    assert float(rows[0]["prox_pair_build_seconds"]) >= 0.0
+    assert float(rows[0]["prox_pair_build_wait_seconds"]) >= 0.0
+    assert float(rows[0]["prox_encode_seconds"]) >= 0.0
+    assert float(rows[0]["prox_loss_forward_seconds"]) >= 0.0
+    assert float(rows[0]["prox_backward_seconds"]) >= 0.0
+    assert float(rows[0]["prox_optimizer_step_seconds"]) >= 0.0
     assert float(rows[0]["prox_forward_backward_seconds"]) >= 0.0
     assert np.isfinite(float(rows[0]["prox_loss"]))
 
