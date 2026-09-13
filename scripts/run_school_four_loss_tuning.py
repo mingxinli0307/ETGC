@@ -584,12 +584,17 @@ def refresh(output_dir: Path, tasks: list[Task], assignments: dict[Task, str]) -
 
 
 def main() -> int:
+    global EPOCHS
     parser = argparse.ArgumentParser()
     parser.add_argument("--root-dir", required=True, type=Path)
     parser.add_argument("--asset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--python-bin", required=True)
     parser.add_argument("--physical-gpus", required=True)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--dependency-complete-file", type=Path)
+    parser.add_argument("--dependency-pid", type=int, default=0)
+    parser.add_argument("--dependency-poll-seconds", type=float, default=60.0)
     parser.add_argument("--wait-for-free-gpus", action="store_true")
     parser.add_argument("--gpu-poll-seconds", type=float, default=60.0)
     parser.add_argument("--gpu-stable-checks", type=int, default=3)
@@ -598,11 +603,25 @@ def main() -> int:
     args.root_dir = args.root_dir.resolve()
     args.asset_root = args.asset_root.resolve()
     args.output_dir = args.output_dir.resolve()
+    EPOCHS = int(args.epochs)
+    if EPOCHS <= 0:
+        raise ValueError("epochs must be positive")
+    FIXED["epoch"] = EPOCHS
+    diagnostic_epochs = [1, 5, 10, 20, 30, 50, 75, 100]
+    if EPOCHS >= 150:
+        diagnostic_epochs.append(150)
+    if EPOCHS >= 200:
+        diagnostic_epochs.append(200)
+    FIXED["diagnostic_epochs"] = ",".join(
+        str(epoch) for epoch in diagnostic_epochs if epoch <= EPOCHS
+    )
     devices = [item.strip() for item in args.physical_gpus.split(",") if item.strip()]
     if not devices:
         raise ValueError("At least one physical GPU is required")
     if args.gpu_poll_seconds <= 0 or args.gpu_stable_checks <= 0:
         raise ValueError("GPU polling interval and stable-check count must be positive")
+    if args.dependency_poll_seconds <= 0:
+        raise ValueError("dependency polling interval must be positive")
     if not (args.asset_root / "dataset" / "school" / "school.txt").exists():
         raise FileNotFoundError("School dataset is missing from asset root")
 
@@ -664,6 +683,25 @@ def main() -> int:
             print(assignments[task], " ".join(command))
         print(f"task_count={len(tasks)}")
         return 0
+
+    if args.dependency_complete_file is not None:
+        dependency_path = args.dependency_complete_file.resolve()
+        while not dependency_path.exists():
+            if args.dependency_pid > 0 and not Path(f"/proc/{args.dependency_pid}").exists():
+                raise RuntimeError(
+                    f"Dependency process {args.dependency_pid} ended without {dependency_path}"
+                )
+            print(
+                f"dependency_wait file={dependency_path} pid={args.dependency_pid}",
+                flush=True,
+            )
+            time.sleep(args.dependency_poll_seconds)
+        dependency = read_json(dependency_path)
+        if dependency.get("status") != "success":
+            raise RuntimeError(
+                f"Dependency run did not succeed: file={dependency_path} status={dependency.get('status')}"
+            )
+        print(f"dependency_success file={dependency_path}", flush=True)
 
     lock = threading.Lock()
     pending = sorted(tasks, key=lambda item: item.estimated_cost, reverse=True)
