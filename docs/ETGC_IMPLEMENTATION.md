@@ -254,51 +254,10 @@ Q=\operatorname{softmax}(Z),\qquad Q\in\mathbb R^{M\times K}.
 
 ## 8. Cluster initialization
 
-实现支持以下初始化语义：
-
-| 模式 | 实际操作 |
-|---|---|
-| `random` | 保留 PyTorch 随机初始化 |
-| `random_orthogonal` | 用 QR 构造归一化 cluster weight |
-| `random_event` | 随机选择 K 个 event hidden vector |
-| `kmeans_plus_plus` | KMeans++ 选择中心，不做 Lloyd refinement |
-| `prototype` | KMeans++ 后继续执行配置数量的 Lloyd iterations |
-
-实际初始化的始终是最终 `cluster_output.weight`：
-
-- legacy MLP：初始化最后一层 `Linear(cluster_hidden_dim, K)` 的 weight；
-- cosine head：初始化 \(K\times d\) prototype weight。
-
-初始化 feature 来源：
-
-- legacy MLP：ReLU 后的 `cluster_hidden`；
-- cosine head：归一化后的 edge representation \(\hat R\)。
-
-### 8.1 两套参数的选择规则
-
-- `cosine_prototype` 读取 `prototype_init_mode`；
-- `legacy_mlp` 读取 `cluster_init_mode`。
-
-当前 cosine head 默认：
-
-```text
-prototype_init_mode=kmeans_plus_plus
-prototype_sample_size=20000
-```
-
-代码中 `kmeans_plus_plus` 分支调用 `lloyd_iters=0`。只有 `prototype` 语义会使用 `prototype_lloyd_iters`。
-
-### 8.2 warmup 后延迟初始化
-
-当同时满足：
-
-```text
-cluster_head_type=cosine_prototype
-prototype_init_mode=kmeans_plus_plus
-prox_warmup_epochs>0
-```
-
-prototype 初始化会延迟到第一次 global cluster update 前。这样 KMeans++ 使用的是经过 proximity warmup 后的 representation，而不是模型刚创建时的 representation。
+The hierarchical branch uses only module-level random initialization. The
+cosine head weight uses `normal_(mean=0, std=0.02)` and remains a trainable
+parameter. The legacy MLP keeps PyTorch `Linear` defaults. Training contains no
+data-dependent cluster-head seeding and no warmup-time parameter overwrite.
 
 ## 9. Temporal edge PPR
 
@@ -770,7 +729,7 @@ diagnostic.json      # 启用相关 diagnostic 时
 | edge representation | `direct_node_time` |
 | cluster head | `cosine_prototype` |
 | prototype temperature | `0.2` |
-| prototype init | `kmeans_plus_plus` |
+| cluster-head initialization | module random defaults |
 | node embedding | `small_lr`, `node_emb_lr=1e-5` |
 | PPR | `temporal_state_forest` |
 | alpha / beta | `0.2 / 5.0` |
@@ -780,11 +739,11 @@ diagnostic.json      # 启用相关 diagnostic 时
 | affinity sparsify | `symmetric_union_knn` |
 | Ncut scope | `global` |
 | cut | `matrix_ncut` |
-| penalty | `orthqa` |
+| penalty | ordinary two-level orth |
 | proximity weight | `1.0` |
 | cluster weight | `lambda_edge_ncut=0.5` |
 | OrthQA weight | `lambda_orth=1.0` |
-| projection / anchor | `0 / 0` |
+| projection | `lambda_proj=0` |
 | proximity/global warmup | 实际由 `prox_warmup_epochs=5` 控制 |
 
 ## 22. 默认代码、验证配置与 legacy 配置的区别
@@ -797,7 +756,7 @@ diagnostic.json      # 启用相关 diagnostic 时
 direct_node_time
 cosine_prototype
 matrix_ncut
-orthqa
+ordinary two-level orth
 symmetric_union_knn
 ```
 
@@ -811,7 +770,7 @@ symmetric_union_knn
 legacy_mlp
 zero output bias
 LayerNorm
-prototype initialization
+module random initialization
 ```
 
 它用于验证 bias、LayerNorm、prototype 对 rank-1 collapse 的作用，不能与当前 cosine head 默认混为一谈。
@@ -834,7 +793,7 @@ orth
 2. **`Pi_cut` 必须对称**：主线应使用 full symmetrization 或 `symmetric_union_knn`；`row_topk` 仅为兼容选项。
 3. **degree 与 affinity 必须同源**：当前 matrix path 使用 `D_Pi_degree_np = Pi_cut.sum(axis=1)`。
 4. **cosine head 没有 bias/LayerNorm**：设置这两个 legacy 参数不会改变 cosine head。
-5. **两套初始化参数不要混用**：cosine 读取 `prototype_init_mode`，legacy MLP 读取 `cluster_init_mode`。
+5. **Cluster head initialization**: cosine weights use `normal_(0, 0.02)`; legacy MLP uses PyTorch `Linear` defaults.
 6. **global warmup 参数存在命名偏差**：实际由 `prox_warmup_epochs` 控制。
 7. **current/history 的 Fourier 组织方式不同**：current 是“原始时间 + 单时间 Fourier + zero padding”，history 是四个时间量共同编码后压到 `time_dim`；主线默认使用 `current`。
 8. **direct representation 保留端点顺序**：`directed=0` 不会自动令 `[h_u,h_v]` 交换不变。

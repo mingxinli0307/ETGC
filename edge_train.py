@@ -1,5 +1,4 @@
 import csv
-import hashlib
 import json
 import os
 import time
@@ -18,11 +17,7 @@ from edge_losses import (
     scipy_csr_to_torch_sparse_coo,
 )
 from edge_metrics import evaluate_node_clustering
-from edge_model import (
-    EdgeHiNoSModel, initialize_cluster_output_from_prototypes,
-    initialize_cluster_output_random_event, initialize_cluster_output_random_orthogonal,
-    load_pretrained_node_features, tensor_checksum,
-)
+from edge_model import EdgeHiNoSModel, load_pretrained_node_features
 from edge_proximity import compute_edge_ppr_cached
 from edge_time import build_edge_time_features
 from utils import choose_device, ensure_dir
@@ -127,7 +122,6 @@ class EdgeHiNoSTrainer:
         self.args = args
         self.device = choose_device(args.device)
         self.model_seed = int(getattr(args, "model_seed", args.seed))
-        self.prototype_seed = int(getattr(args, "prototype_seed", self.model_seed))
         self.forest_seed = int(getattr(args, "forest_seed", args.seed))
         self.rng = np.random.RandomState(self.model_seed)
         self.ncut_scope = "global"
@@ -254,152 +248,14 @@ class EdgeHiNoSTrainer:
         self.epoch_records = []
         self.model_init_info = self._current_cluster_output_stats()
         self.model_init_info.update(self._model_parameter_info())
+        self.model_init_info["cluster_parameter_initialization"] = (
+            "normal_mean_0_std_0.02"
+            if self.cluster_head_type == "cosine_prototype"
+            else "pytorch_linear_default"
+        )
         self._apply_node_embedding_requires_grad_state()
-        self.prototype_initialization_pending = False
-        if args.initialization_state_in:
-            self._load_initialization_state(args.initialization_state_in)
-            if args.apply_cluster_initialization_after_state_load:
-                self._apply_cluster_initialization()
-        elif self._should_defer_prototype_initialization():
-            self.prototype_initialization_pending = True
-        else:
-            self._apply_cluster_initialization()
-        if args.initialization_state_out:
-            self._save_initialization_state(args.initialization_state_out)
         self.optimizer, self.node_emb_optimizer_info = build_optimizer_for_node_emb_mode(
             self.model, args.learning_rate, args.node_emb_mode, args.node_emb_lr)
-
-    def _model_state_checksum(self) -> str:
-        digest = hashlib.sha256()
-        for name, value in sorted(self.model.state_dict().items()):
-            tensor = value.detach().cpu().contiguous()
-            digest.update(name.encode("utf-8"))
-            digest.update(str(tensor.dtype).encode("ascii"))
-            digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
-            digest.update(tensor.numpy().tobytes())
-        return digest.hexdigest()
-
-
-    def _pi_cut_checksum(self) -> str:
-        matrix = self.Pi_cut.tocsr()
-        digest = hashlib.sha256()
-        digest.update(np.asarray(matrix.shape, dtype=np.int64).tobytes())
-        digest.update(np.asarray(matrix.indptr, dtype=np.int64).tobytes())
-        digest.update(np.asarray(matrix.indices, dtype=np.int64).tobytes())
-        digest.update(np.asarray(matrix.data, dtype=np.float64).tobytes())
-        return digest.hexdigest()
-
-
-    def _initialization_metadata(self) -> dict:
-        return {
-            "dataset": str(self.args.dataset),
-            "M": int(self.data.num_events),
-            "N": int(self.data.num_nodes),
-            "K": int(self.K),
-            "H": int(self.H),
-            "sharpen_gamma": self.model.sharpen_gamma,
-            "cluster_head_type": self.cluster_head_type,
-            "edge_encoder_mode": self.edge_encoder_mode,
-            "model_seed": int(self.model_seed),
-            "prototype_seed": int(self.prototype_seed),
-            "forest_seed": int(self.forest_seed),
-            "model_state_checksum": self._model_state_checksum(),
-            "Pi_cut_checksum": self._pi_cut_checksum(),
-        }
-
-
-    def _save_initialization_state(self, path: str) -> None:
-        path = os.path.abspath(path)
-        ensure_dir(os.path.dirname(path))
-        metadata = self._initialization_metadata()
-        self.model_init_info.update(
-            {
-                "initialization_state_source": "generated",
-                "initialization_state_path": path,
-                **metadata,
-            }
-        )
-        payload = {
-            "format": "etgc_hierarchical_initialization_state_v1",
-            "metadata": metadata,
-            "model_state_dict": {
-                name: value.detach().cpu() for name, value in self.model.state_dict().items()
-            },
-            "numpy_rng_state": self.rng.get_state(),
-            "torch_rng_state": torch.get_rng_state(),
-            "cuda_rng_state": (
-                torch.cuda.get_rng_state(self.device).cpu()
-                if self.device.type == "cuda"
-                else None
-            ),
-            "model_init_info": self.model_init_info,
-        }
-        torch.save(payload, path)
-        print(
-            "initialization_state_saved="
-            f"{path} model_checksum={metadata['model_state_checksum']} "
-            f"Pi_cut_checksum={metadata['Pi_cut_checksum']}"
-        )
-
-
-    def _load_initialization_state(self, path: str) -> None:
-        path = os.path.abspath(path)
-        try:
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(path, map_location="cpu")
-        if payload.get("format") != "etgc_hierarchical_initialization_state_v1":
-            raise ValueError(f"Unsupported ETGC initialization snapshot: {path}")
-        metadata = payload.get("metadata", {})
-        expected = {
-            "dataset": str(self.args.dataset),
-            "M": int(self.data.num_events),
-            "N": int(self.data.num_nodes),
-            "K": int(self.K),
-            "H": int(self.H),
-            "sharpen_gamma": self.model.sharpen_gamma,
-            "cluster_head_type": self.cluster_head_type,
-            "edge_encoder_mode": self.edge_encoder_mode,
-        }
-        mismatches = {
-            key: (metadata.get(key), value)
-            for key, value in expected.items()
-            if metadata.get(key) != value
-        }
-        if mismatches:
-            raise ValueError(f"Initialization snapshot metadata mismatch: {mismatches}")
-        affinity_checksum = self._pi_cut_checksum()
-        if metadata.get("Pi_cut_checksum") != affinity_checksum:
-            raise ValueError(
-                "Initialization snapshot Pi_cut mismatch: "
-                f"snapshot={metadata.get('Pi_cut_checksum')} current={affinity_checksum}"
-            )
-        self.model.load_state_dict(payload["model_state_dict"], strict=True)
-        self.rng.set_state(payload["numpy_rng_state"])
-        torch.set_rng_state(payload["torch_rng_state"])
-        cuda_rng_state = payload.get("cuda_rng_state")
-        if cuda_rng_state is not None and self.device.type == "cuda":
-            torch.cuda.set_rng_state(cuda_rng_state, self.device)
-        loaded_checksum = self._model_state_checksum()
-        if metadata.get("model_state_checksum") != loaded_checksum:
-            raise ValueError(
-                "Initialization snapshot model mismatch after load: "
-                f"snapshot={metadata.get('model_state_checksum')} loaded={loaded_checksum}"
-            )
-        source_info = dict(payload.get("model_init_info") or {})
-        self.model_init_info.update(source_info)
-        self.model_init_info.update(
-            {
-                "initialization_state_source": "loaded",
-                "initialization_state_path": path,
-                "model_state_checksum": loaded_checksum,
-                "Pi_cut_checksum": affinity_checksum,
-            }
-        )
-        print(
-            "initialization_state_loaded="
-            f"{path} model_checksum={loaded_checksum} Pi_cut_checksum={affinity_checksum}"
-        )
 
 
     def _resolve_feature_path(self) -> str:
@@ -622,128 +478,12 @@ class EdgeHiNoSTrainer:
         )
 
 
-    @torch.no_grad()
-    def _forward_all_cluster_hidden_no_grad(self, chunk_size: int) -> torch.Tensor:
-        self.model.eval()
-        hidden_chunks = []
-        chunk_size = max(1, int(chunk_size))
-        for start in range(0, self.data.num_events, chunk_size):
-            _, _, cluster_hidden = self._forward_event_tensors(
-                self.src_t[start : start + chunk_size],
-                self.dst_t[start : start + chunk_size],
-                self.time_feat_t[start : start + chunk_size],
-                return_cluster_hidden=True,
-            )
-            hidden_chunks.append(cluster_hidden.detach())
-        return torch.cat(hidden_chunks, dim=0)
-
-
-    @torch.no_grad()
-    def _forward_all_edge_repr_no_grad(self, chunk_size: int) -> torch.Tensor:
-        self.model.eval()
-        repr_chunks = []
-        chunk_size = max(1, int(chunk_size))
-        for start in range(0, self.data.num_events, chunk_size):
-            r, _ = self._forward_range(start, min(self.data.num_events, start + chunk_size))
-            repr_chunks.append(r.detach())
-        return torch.cat(repr_chunks, dim=0)
-
-
     def _current_cluster_output_stats(self) -> dict:
         bias = self.model.cluster_output.bias
         return {
             "output_bias_l2": 0.0 if bias is None else float(torch.linalg.norm(bias.detach()).cpu()),
             "cluster_output_weight_l2": float(torch.linalg.norm(self.model.cluster_output.weight.detach()).cpu()),
         }
-
-
-    def _should_defer_prototype_initialization(self) -> bool:
-        if str(getattr(self.args, "cluster_head_type", "legacy_mlp")).lower() != "cosine_prototype":
-            return False
-        if str(getattr(self.args, "prototype_init_mode", "kmeans_plus_plus")).lower() != "kmeans_plus_plus":
-            return False
-        return int(getattr(self.args, "prox_warmup_epochs", 0)) > 0
-
-
-    def _apply_cluster_initialization(self) -> None:
-        if self.cluster_head_type == "cosine_prototype":
-            mode = str(getattr(self.args, "prototype_init_mode", "kmeans_plus_plus")).lower()
-        else:
-            mode = str(getattr(self.args, "cluster_init_mode", "random")).lower()
-        if mode == "random":
-            self.model_init_info["cluster_init_mode_effective"] = "random"
-            self.model_init_info["initial_cluster_weight_checksum"] = tensor_checksum(
-                self.model.cluster_output.weight.detach()
-            )
-            return
-        if mode == "random_orthogonal":
-            self.model_init_info.update(
-                initialize_cluster_output_random_orthogonal(self.model, self.H, seed=self.prototype_seed)
-            )
-            return
-        hidden = self._prototype_initialization_features()
-        self.model_init_info["prototype_feature_checksum"] = tensor_checksum(hidden)
-        self.model_init_info["prototype_feature_source"] = (
-            "normalized_edge_repr_R" if self.cluster_head_type == "cosine_prototype" else "legacy_cluster_hidden"
-        )
-        if mode == "random_event":
-            self.model_init_info.update(
-                initialize_cluster_output_random_event(
-                    self.model,
-                    hidden,
-                    K=self.H,
-                    seed=self.prototype_seed,
-                )
-            )
-            return
-        if mode == "kmeans_plus_plus":
-            self.model_init_info.update(
-                initialize_cluster_output_from_prototypes(
-                    self.model,
-                    hidden,
-                    K=self.H,
-                    seed=self.prototype_seed,
-                    sample_size=int(getattr(self.args, "prototype_sample_size", 20000)),
-                    lloyd_iters=0,
-                )
-            )
-            self.model_init_info["prototype_init_executed"] = True
-            self.model_init_info["cluster_init_mode_effective"] = "kmeans_plus_plus"
-            self.prototype_initialization_pending = False
-            return
-        if mode == "prototype":
-            self.model_init_info.update(self._initialize_cluster_output_prototypes(hidden=hidden))
-            self.model_init_info["prototype_init_executed"] = True
-            self.prototype_initialization_pending = False
-            return
-        raise ValueError(f"Unsupported cluster_init_mode: {getattr(self.args, 'cluster_init_mode', None)}")
-
-
-    def _initialize_cluster_output_prototypes(self, hidden=None) -> dict:
-        if hidden is None:
-            hidden = self._prototype_initialization_features()
-        stats = initialize_cluster_output_from_prototypes(
-            self.model,
-            hidden,
-            K=self.H,
-            seed=self.prototype_seed,
-            sample_size=int(getattr(self.args, "prototype_sample_size", 20000)),
-            lloyd_iters=int(getattr(self.args, "prototype_lloyd_iters", 10)),
-        )
-        return stats
-
-
-    def _prototype_initialization_features(self) -> torch.Tensor:
-        if self.cluster_head_type == "cosine_prototype":
-            edge_repr = self._forward_all_edge_repr_no_grad(int(self.args.global_q_chunk_size))
-            return edge_repr / torch.linalg.norm(edge_repr, dim=1, keepdim=True).clamp_min(1e-12)
-        return self._forward_all_cluster_hidden_no_grad(int(self.args.global_q_chunk_size))
-
-
-    def _ensure_prototypes_initialized_after_warmup(self) -> None:
-        if not getattr(self, "prototype_initialization_pending", False):
-            return
-        self._apply_cluster_initialization()
 
 
     @staticmethod
@@ -1011,7 +751,6 @@ class EdgeHiNoSTrainer:
             started = time.time()
             record = dict(epoch=epoch, **self._train_proximity_epoch(epoch))
             if epoch > self.args.prox_warmup_epochs:
-                self._ensure_prototypes_initialized_after_warmup()
                 self.model.train()
                 self.optimizer.zero_grad(set_to_none=True)
                 hierarchical = self.forward_hierarchical()

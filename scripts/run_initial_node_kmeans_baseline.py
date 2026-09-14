@@ -21,9 +21,7 @@ if str(ROOT) not in sys.path:
 from edge_data import load_edge_event_data  # noqa: E402
 from edge_metrics import evaluate_node_clustering  # noqa: E402
 from edge_model import (  # noqa: E402
-    assign_all_to_centers,
     feature_common_variation_statistics,
-    fit_kmeans_centers,
     load_pretrained_node_features,
     tensor_checksum,
 )
@@ -35,6 +33,103 @@ from scripts.node_embedding_inventory import (  # noqa: E402
     write_csv,
     write_json,
 )
+
+
+def fit_kmeans_centers(
+    features: torch.Tensor,
+    K: int,
+    seed: int,
+    sample_size: int = 20000,
+    max_iters: int = 10,
+    eps: float = 1e-12,
+) -> tuple:
+    if features.dim() != 2:
+        raise ValueError(f"features must be 2D, got shape={tuple(features.shape)}")
+    n = int(features.size(0))
+    d = int(features.size(1))
+    K = int(K)
+    if K <= 0:
+        raise ValueError(f"K must be positive, got {K}")
+    if n < K:
+        raise ValueError(f"Need at least K samples for prototype initialization, got n={n}, K={K}")
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    sample_size = min(max(K, int(sample_size)), n)
+    if sample_size < n:
+        sample_idx = torch.randperm(n, generator=gen)[:sample_size].to(device=features.device)
+        X = features.index_select(0, sample_idx).detach()
+    else:
+        X = features.detach()
+    n_sample = int(X.size(0))
+    first = int(torch.randint(n_sample, (1,), generator=gen).item())
+    selected = [first]
+    centers = [X[first].clone()]
+    min_dist = torch.cdist(X, centers[0].view(1, d)).square().squeeze(1)
+    for _ in range(1, K):
+        masked = min_dist.clone()
+        masked[torch.as_tensor(selected, device=features.device)] = -1.0
+        total = float(torch.clamp(masked, min=0.0).sum().cpu())
+        if total <= eps:
+            next_idx = int(torch.argmax(masked).item())
+        else:
+            probs = torch.clamp(masked, min=0.0)
+            probs = (probs / probs.sum()).cpu()
+            next_idx = int(torch.multinomial(probs, 1, generator=gen).item())
+            while next_idx in selected:
+                masked[next_idx] = -1.0
+                if float(torch.clamp(masked, min=0.0).sum().cpu()) <= eps:
+                    next_idx = int(torch.argmax(masked).item())
+                    break
+                probs = torch.clamp(masked, min=0.0)
+                probs = (probs / probs.sum()).cpu()
+                next_idx = int(torch.multinomial(probs, 1, generator=gen).item())
+        selected.append(next_idx)
+        centers.append(X[next_idx].clone())
+        dist = torch.cdist(X, centers[-1].view(1, d)).square().squeeze(1)
+        min_dist = torch.minimum(min_dist, dist)
+    C = torch.stack(centers, dim=0)
+    max_iters = max(0, int(max_iters))
+    lloyd_iters_run = 0
+    for _ in range(max_iters):
+        dist = torch.cdist(X, C).square()
+        assign = torch.argmin(dist, dim=1)
+        new_centers = []
+        min_current = dist.gather(1, assign.view(-1, 1)).squeeze(1)
+        for k in range(K):
+            mask = assign == k
+            if bool(mask.any()):
+                new_centers.append(X[mask].mean(dim=0))
+            else:
+                farthest = int(torch.argmax(min_current).item())
+                new_centers.append(X[farthest].clone())
+                min_current[farthest] = -1.0
+        new_C = torch.stack(new_centers, dim=0)
+        lloyd_iters_run += 1
+        if torch.allclose(new_C, C, atol=1e-6, rtol=1e-5):
+            C = new_C
+            break
+        C = new_C
+    if not torch.isfinite(C).all():
+        raise FloatingPointError("KMeans centers contain NaN or Inf values")
+    stats = {
+        "kmeans_sample_size": int(n_sample),
+        "kmeans_lloyd_iters_requested": int(max_iters),
+        "kmeans_lloyd_iters_run": int(lloyd_iters_run),
+        "kmeans_center_checksum": tensor_checksum(C),
+    }
+    return C, stats
+
+
+@torch.no_grad()
+def assign_all_to_centers(features: torch.Tensor, centers: torch.Tensor, chunk_size: int = 8192) -> torch.Tensor:
+    if features.dim() != 2 or centers.dim() != 2:
+        raise ValueError("features and centers must be 2D tensors")
+    labels = []
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, int(features.size(0)), chunk_size):
+        dist = torch.cdist(features[start : start + chunk_size], centers).square()
+        labels.append(torch.argmin(dist, dim=1).detach())
+    return torch.cat(labels, dim=0)
 
 
 DEFAULT_SEEDS = [42, 43, 44]

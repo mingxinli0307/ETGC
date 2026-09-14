@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from edge_losses import (cform_ncut_loss, hierarchical_ncut_terms,
                          trace_mincut_orthogonality_loss, projection_loss_global,
                          project_edge_assignments_to_nodes_global,
-                         edge_expected_structural_score_gain_loss_global)
+                         edge_expected_structural_score_gain_loss_global,
+                         edge_ppr_proximity_loss_preindexed)
 from edge_model import EdgeHiNoSModel, power_sharpen
 from edge_main import build_parser, main
 from edge_train import EdgeHiNoSTrainer
@@ -143,10 +144,54 @@ def test_model_global_backward_and_routing(head):
                 + 0.4 * terms['esg_loss'] + 0.3 * terms['projection_loss'])
     torch.testing.assert_close(loss, expected)
     loss.backward()
-    for param in (model.cluster_output.weight, model.coarse_assignment_logits):
+    for param in (model.node_emb, model.cluster_output.weight, model.coarse_assignment_logits):
         assert param.grad is not None and torch.isfinite(param.grad).all() and param.grad.norm() > 0
     print(f'{head}_global_loss={float(loss.detach()):.10g} head_grad={float(model.cluster_output.weight.grad.norm()):.10g} '
           f'coarse_logits_grad={float(model.coarse_assignment_logits.grad.norm()):.10g}')
+
+
+@pytest.mark.parametrize('encoder', ['direct_node_time', 'mlp'])
+def test_proximity_step_updates_hierarchical_shared_representation_only(encoder):
+    torch.manual_seed(91)
+    model = EdgeHiNoSModel(
+        np.random.RandomState(4).normal(size=(8, 5)).astype('float32'),
+        time_dim=2, edge_dim=7, edge_hidden_dim=9, cluster_hidden_dim=6,
+        K=3, directed=False, hier_ncut_h=6, edge_encoder_mode=encoder,
+        cluster_head_type='cosine_prototype',
+    )
+    src = torch.tensor([0, 1, 2, 3, 4, 5])
+    dst = torch.tensor([1, 2, 3, 4, 5, 6])
+    time_feat = torch.randn(6, 2)
+    before_repr = model.forward_hierarchical(src, dst, time_feat)['edge_repr_all'].detach().clone()
+    before_first_head = model.cluster_output.weight.detach().clone()
+    before_second_level = model.coarse_assignment_logits.detach().clone()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    r_all = model.encode_edge_events(src, dst, time_feat)
+    proximity_loss = edge_ppr_proximity_loss_preindexed(
+        r_all,
+        anchors=torch.tensor([0, 1, 2]),
+        positives=torch.tensor([1, 2, 3]),
+        negatives=torch.tensor([5, 4, 5]),
+        weights=torch.ones(3),
+        similarity_mode='event_dot',
+    )
+    assert torch.isfinite(proximity_loss)
+    optimizer.zero_grad(set_to_none=True)
+    proximity_loss.backward()
+    assert model.node_emb.grad is not None and model.node_emb.grad.norm() > 0
+    if encoder == 'mlp':
+        edge_mlp_grads = [p.grad for p in model.edge_mlp.parameters()]
+        assert all(g is not None and torch.isfinite(g).all() for g in edge_mlp_grads)
+        assert sum(float(g.norm()) for g in edge_mlp_grads) > 0
+    assert model.cluster_output.weight.grad is None
+    assert model.coarse_assignment_logits.grad is None
+    optimizer.step()
+
+    after_repr = model.forward_hierarchical(src, dst, time_feat)['edge_repr_all'].detach()
+    assert not torch.allclose(before_repr, after_repr)
+    torch.testing.assert_close(model.cluster_output.weight, before_first_head)
+    torch.testing.assert_close(model.coarse_assignment_logits, before_second_level)
 
 
 def test_cli_validation_and_default_dimensions():
@@ -162,8 +207,10 @@ def test_cli_validation_and_default_dimensions():
         with pytest.raises(ValueError):
             EdgeHiNoSModel(**kwargs, sharpen_gamma=gamma)
     names = vars(args)
-    assert not any(any(token in name for token in ('node_prior', 'node_sbm', 'anchor', 'lambda_bal',
-        'orth_type', 'global_cut_scale', 'global_orth_scale')) for name in names)
+    removed = ('node_prior', 'node_sbm', 'anchor', 'lambda_bal', 'orth_type',
+               'global_cut_scale', 'global_orth_scale', 'prototype_init',
+               'prototype_seed', 'cluster_init_mode', 'initialization_state')
+    assert not any(any(token in name for token in removed) for name in names)
 
 
 def test_repeated_events_project_independently():
@@ -174,9 +221,9 @@ def test_repeated_events_project_independently():
     torch.testing.assert_close(S, expected)
 
 
-@pytest.mark.parametrize('head,init,warmup', [('legacy_mlp', 'random', 0),
-    ('cosine_prototype', 'random', 0), ('cosine_prototype', 'kmeans_plus_plus', 1)])
-def test_dataset_free_training_smoke(tmp_path, head, init, warmup):
+@pytest.mark.parametrize('head,warmup', [('legacy_mlp', 0),
+    ('cosine_prototype', 0), ('cosine_prototype', 1)])
+def test_dataset_free_training_smoke(tmp_path, head, warmup):
     data = tmp_path / 'dataset' / 'toy'
     data.mkdir(parents=True)
     # Includes repeated endpoints: all six events must survive loading.
@@ -187,7 +234,7 @@ def test_dataset_free_training_smoke(tmp_path, head, init, warmup):
         '--cache_dir', str(tmp_path / 'cache'), '--output_dir', str(output), '--epoch', str(warmup + 1),
         '--batch_size', '2', '--edge_ppr_method', 'truncated', '--edge_ppr_topk', '-1',
         '--edge_dim', '8', '--time_dim', '3', '--edge_hidden_dim', '10', '--cluster_hidden_dim', '6',
-        '--cluster_head_type', head, '--prototype_init_mode', init, '--node_emb_mode', 'full',
+        '--cluster_head_type', head, '--node_emb_mode', 'full',
         '--lambda_proj', '0.1', '--prox_warmup_epochs', str(warmup), '--global_q_chunk_size', '2', '--quiet', '1'])
     main(args)
     result = json.loads((output / 'result.json').read_text())
@@ -211,26 +258,3 @@ def test_near_uniform_and_isolated_affinity_are_finite():
         fine, coarse, _, _, _ = hierarchical_ncut_terms(first, power_sharpen(first), second.softmax(1), W, W.sum(1))
         (fine + coarse).backward()
         assert torch.isfinite(first.grad).all() and torch.isfinite(second.grad).all()
-
-
-def test_hierarchical_snapshot_restores_both_levels_and_rejects_wrong_h(tmp_path):
-    data = tmp_path / 'dataset' / 'toy'
-    data.mkdir(parents=True)
-    (data / 'toy.txt').write_text('0 1 0\n0 1 1\n1 2 2\n2 3 3\n3 0 4\n1 3 5\n')
-    (data / 'node2label.txt').write_text('0 0\n1 0\n2 1\n3 1\n')
-    args = build_parser().parse_args(['--dataset', 'toy', '--device', 'cpu',
-        '--data_root', str(data.parent), '--cache_dir', str(tmp_path / 'cache'),
-        '--edge_ppr_method', 'truncated', '--prototype_init_mode', 'random',
-        '--prox_warmup_epochs', '0', '--edge_dim', '8', '--quiet', '1'])
-    args.model_seed = args.prototype_seed = args.forest_seed = args.seed
-    trainer = EdgeHiNoSTrainer(args)
-    expected = trainer.infer_Q()
-    checkpoint = tmp_path / 'initial.pt'
-    trainer._save_initialization_state(str(checkpoint))
-    restored = EdgeHiNoSTrainer(args)
-    restored._load_initialization_state(str(checkpoint))
-    np.testing.assert_array_equal(expected, restored.infer_Q())
-    torch.testing.assert_close(trainer.model.coarse_assignment_logits, restored.model.coarse_assignment_logits)
-    restored.H += 1
-    with pytest.raises(ValueError, match='metadata mismatch'):
-        restored._load_initialization_state(str(checkpoint))

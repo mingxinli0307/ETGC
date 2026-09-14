@@ -16,7 +16,6 @@ def build_parser():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_seed", type=int, default=None)
-    parser.add_argument("--prototype_seed", type=int, default=None)
     parser.add_argument("--forest_seed", type=int, default=None)
     parser.add_argument("--data_root", default=os.path.join(cur_dir, "dataset"))
     parser.add_argument("--emb_root", default=os.path.join(cur_dir, "emb"))
@@ -83,31 +82,6 @@ def build_parser():
     parser.add_argument("--prox_temperature", type=float, default=0.2)
     parser.add_argument("--cluster_output_bias_mode", choices=["default", "zero", "none"], default="default")
     parser.add_argument("--cluster_input_norm", choices=["none", "layernorm"], default="none")
-    parser.add_argument(
-        "--cluster_init_mode",
-        choices=["random", "random_orthogonal", "random_event", "kmeans_plus_plus", "prototype"],
-        default="random",
-    )
-    parser.add_argument("--prototype_init_mode", choices=["random", "random_orthogonal", "kmeans_plus_plus"], default="kmeans_plus_plus")
-    parser.add_argument("--prototype_sample_size", type=int, default=20000)
-    parser.add_argument("--prototype_lloyd_iters", type=int, default=10)
-    parser.add_argument(
-        "--initialization_state_in",
-        default="",
-        help="Load a validation-only ETGC initialization snapshot after hierarchical model construction.",
-    )
-    parser.add_argument(
-        "--initialization_state_out",
-        default="",
-        help="Write a validation-only ETGC initialization snapshot before any optimizer step.",
-    )
-    parser.add_argument(
-        "--apply_cluster_initialization_after_state_load",
-        type=int,
-        choices=[0, 1],
-        default=0,
-        help="Validation-only: refit the configured cluster head after loading a shared pre-init snapshot.",
-    )
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--eval_every", type=int, default=1)
     parser.add_argument("--save_embeddings", type=int, default=0)
@@ -128,17 +102,13 @@ def main(args):
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     if args.model_seed is None:
         args.model_seed = args.seed
-    if args.prototype_seed is None:
-        args.prototype_seed = args.model_seed
     if args.forest_seed is None:
         args.forest_seed = args.seed
     args.seed = args.model_seed
     for name in ("data_root", "emb_root", "pretrain_emb_dir", "feature_path", "cache_dir",
-                 "output_dir", "initialization_state_in", "initialization_state_out"):
+                 "output_dir"):
         if getattr(args, name):
             setattr(args, name, resolve_path(cur_dir, getattr(args, name)))
-    if args.initialization_state_in and args.initialization_state_out:
-        raise ValueError("initialization_state_in and initialization_state_out are mutually exclusive")
     # Never overwrite a previous experiment's output.
     if args.output_dir and os.path.isdir(args.output_dir) and os.listdir(args.output_dir):
         raise FileExistsError(f"output_dir must be new or empty: {args.output_dir}")
@@ -148,6 +118,8 @@ def main(args):
     print(f"ETGC hierarchical C-form: M={trainer.data.num_events} -> H={trainer.H} -> K={trainer.K}")
     print(f"gamma={args.sharpen_gamma}; projection=RowNorm(incidence_NxM @ Q_final)")
     print(f"device={trainer.device}; F1=Hungarian-matched Macro_F1", flush=True)
+    if args.cluster_head_type == "cosine_prototype":
+        print("Cosine prototypes are trainable parameters initialized randomly; no KMeans seeding is used.", flush=True)
     best_epoch, best_metrics = trainer.train()
     trainer.write_result_json(best_epoch, best_metrics, trainer.final_metrics, time.time() - started)
     print(f"best_epoch={best_epoch} final_metrics={trainer.final_metrics} status=success", flush=True)

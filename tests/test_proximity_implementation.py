@@ -256,7 +256,6 @@ def test_one_epoch_global_cosine_proximity_smoke(tmp_path):
             "--time_dim", "3",
             "--edge_encoder_mode", "direct_node_time",
             "--cluster_head_type", "cosine_prototype",
-            "--prototype_init_mode", "random",
             "--cluster_loss_type", "matrix_ncut",
             "--ncut_scope", "global",
             "--node_emb_mode", "full",
@@ -268,7 +267,6 @@ def test_one_epoch_global_cosine_proximity_smoke(tmp_path):
         ]
     )
     args.model_seed = args.seed
-    args.prototype_seed = args.seed
     args.forest_seed = args.seed
     trainer = EdgeHiNoSTrainer(args)
     trainer.train()
@@ -310,7 +308,6 @@ def test_zero_orth_during_proximity_warmup_logs_uncomputed_global_losses(tmp_pat
             "--time_dim", "3",
             "--edge_encoder_mode", "direct_node_time",
             "--cluster_head_type", "cosine_prototype",
-            "--prototype_init_mode", "random",
             "--cluster_loss_type", "matrix_ncut",
             "--ncut_scope", "global",
             "--node_emb_mode", "full",
@@ -323,7 +320,6 @@ def test_zero_orth_during_proximity_warmup_logs_uncomputed_global_losses(tmp_pat
         ]
     )
     args.model_seed = args.seed
-    args.prototype_seed = args.seed
     args.forest_seed = args.seed
 
     EdgeHiNoSTrainer(args).train()

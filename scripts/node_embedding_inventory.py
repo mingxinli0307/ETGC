@@ -8,7 +8,7 @@ from edge_time import build_edge_time_features
 from utils import hash_cfg
 
 FOREST_SEED = 20260725
-COMMON_CONFIG = {'directed': 0, 'batch_size': 512, 'epoch': 30, 'learning_rate': 0.0001, 'edge_dim': 128, 'time_dim': 32, 'edge_hidden_dim': 128, 'cluster_hidden_dim': 64, 'alpha': 0.2, 'T': 4, 'beta': 5.0, 'edge_neighbor_k': -1, 'edge_ppr_topk': -1, 'edge_ppr_method': 'temporal_state_forest', 'forest_samples': 50, 'global_q_chunk_size': 8192, 'global_ncut_row_block_size': 65536, 'lambda_edge_ncut': 0.5, 'lambda_proj': 0.0, 'node_emb_lr': 1e-05, 'cluster_output_bias_mode': 'none', 'cluster_input_norm': 'layernorm', 'cluster_init_mode': 'random_orthogonal', 'prototype_sample_size': 20000, 'prototype_lloyd_iters': 0, 'require_pretrained_node2vec': 1}
+COMMON_CONFIG = {'directed': 0, 'batch_size': 512, 'epoch': 30, 'learning_rate': 0.0001, 'edge_dim': 128, 'time_dim': 32, 'edge_hidden_dim': 128, 'cluster_hidden_dim': 64, 'alpha': 0.2, 'T': 4, 'beta': 5.0, 'edge_neighbor_k': -1, 'edge_ppr_topk': -1, 'edge_ppr_method': 'temporal_state_forest', 'forest_samples': 50, 'global_q_chunk_size': 8192, 'global_ncut_row_block_size': 65536, 'lambda_edge_ncut': 0.5, 'lambda_proj': 0.0, 'node_emb_lr': 1e-05, 'cluster_output_bias_mode': 'none', 'cluster_input_norm': 'layernorm', 'require_pretrained_node2vec': 1}
 
 def resolve_node2vec_path(root: Path, dataset: str, feature_path: str = "") -> str:
     if feature_path:

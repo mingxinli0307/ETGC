@@ -14,7 +14,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from edge_main import build_parser
-from edge_model import EdgeHiNoSModel, initialize_cluster_output_from_prototypes
+from edge_model import EdgeHiNoSModel
 from edge_proximity import build_edge_ncut_affinity, compute_edge_ppr_cached, sparse_symmetric_union_knn
 from edge_time import build_edge_time_features
 from edge_train import EdgeHiNoSTrainer
@@ -86,20 +86,22 @@ def test_cosine_prototype_logits_temperature_and_softmax():
     assert torch.allclose(q.sum(dim=1), torch.ones(1), atol=1e-6)
 
 
-def test_prototype_initialization_uses_normalized_event_repr_directly_and_seed():
-    H = np.random.RandomState(0).normal(size=(5, 3)).astype(np.float32)
-    model1 = EdgeHiNoSModel(H, 2, 4, 4, 4, 3, False, edge_encoder_mode="direct_node_time", cluster_head_type="cosine_prototype")
-    model2 = EdgeHiNoSModel(H, 2, 4, 4, 4, 3, False, edge_encoder_mode="direct_node_time", cluster_head_type="cosine_prototype")
-    src = torch.tensor([0, 1, 2, 3, 4, 0])
-    dst = torch.tensor([1, 2, 3, 4, 0, 2])
-    time_feat = torch.linspace(0.0, 1.0, steps=12).view(6, 2)
-    R = model1.build_direct_node_time_event_repr(src, dst, time_feat)
-    R_norm = R / torch.linalg.norm(R, dim=1, keepdim=True).clamp_min(1e-12)
-    stats1 = initialize_cluster_output_from_prototypes(model1, R_norm, model1.H, seed=11, sample_size=6, lloyd_iters=0)
-    stats2 = initialize_cluster_output_from_prototypes(model2, R_norm, model2.H, seed=11, sample_size=6, lloyd_iters=0)
-    assert stats1["kmeans_center_checksum"] == stats2["kmeans_center_checksum"]
-    assert torch.allclose(model1.cluster_output.weight, model2.cluster_output.weight)
-    assert torch.allclose(torch.linalg.norm(model1.cluster_output.weight, dim=1), torch.ones(model1.H), atol=1e-6)
+def test_cosine_prototypes_use_module_random_initialization():
+    features = np.random.RandomState(0).normal(size=(5, 3)).astype(np.float32)
+    torch.manual_seed(11)
+    model1 = EdgeHiNoSModel(
+        features, 2, 4, 4, 4, 3, False,
+        edge_encoder_mode="direct_node_time", cluster_head_type="cosine_prototype",
+    )
+    torch.manual_seed(11)
+    model2 = EdgeHiNoSModel(
+        features, 2, 4, 4, 4, 3, False,
+        edge_encoder_mode="direct_node_time", cluster_head_type="cosine_prototype",
+    )
+    torch.testing.assert_close(model1.cluster_output.weight, model2.cluster_output.weight)
+    assert model1.cluster_output.weight.shape == (model1.H, model1.cluster_input_dim)
+    assert torch.isfinite(model1.cluster_output.weight).all()
+    assert float(model1.cluster_output.weight.std(unbiased=False)) > 0.0
 
 
 

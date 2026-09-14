@@ -34,8 +34,9 @@ The code uses a clamped denominator for power sharpening. There is no frequency
 correction or detached assignment. Coarse diagonal entries are retained, and no
 coarse sparsification or normalization is performed. Final assignments are not
 passed through another softmax. `coarse_assignment_logits` is initialized once
-with `normal_(mean=0, std=0.02)`. Existing optional first-head initialization
-uses `H`; no new clustering initializer is introduced.
+with `normal_(mean=0, std=0.02)`. The cosine head parameters use
+`normal_(mean=0, std=0.02)`; the legacy MLP uses PyTorch `Linear` defaults.
+Neither head has a data-dependent initialization or an epoch-time reset.
 
 Define the pure C-form:
 
@@ -108,7 +109,6 @@ There is no full training or multi-dataset performance claim.
 - Finite-difference gradcheck and both cluster-head global backward checks pass.
 - Dense, sparse COO, sparse CSR, and scipy block affinity checks pass.
 - Existing proximity pair/RNG/loss/gradient regression checks pass.
-- Snapshot roundtrip restores both levels and validates H/gamma metadata.
 
 School smoke uses all `188508` events, `H=18`, `K=9`, default forest50 affinity
 copied from the existing cache, one epoch, zero proximity warmup, and
@@ -129,3 +129,14 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m pytest tests -q
 For a future smoke run, explicitly set `--epoch 1 --prox_warmup_epochs 0`, valid
 data/embedding/cache paths, and a new `--output_dir`. The default warmup is still
 five epochs, so a default one-epoch command would test only proximity.
+
+## Random cluster-head initialization refinement
+
+The first cluster head now starts only from its module-level random parameters.
+All KMeans/KMeans++, event-seeded, orthogonal overwrite, deferred warmup reset,
+and related CLI/config/checkpoint fields were removed. Proximity still runs at
+its existing cadence before the hierarchical global step in every training
+epoch. It updates `node_emb` in direct-node-time mode and both `node_emb` and
+`edge_mlp` in MLP mode; these are the exact parameters used to construct the
+subsequent `edge_repr -> Z1 -> Q1 -> P1` path. Proximity remains outside
+`global_loss`.
