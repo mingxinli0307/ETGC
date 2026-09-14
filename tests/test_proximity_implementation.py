@@ -258,7 +258,6 @@ def test_one_epoch_global_cosine_proximity_smoke(tmp_path):
             "--cluster_head_type", "cosine_prototype",
             "--prototype_init_mode", "random",
             "--cluster_loss_type", "matrix_ncut",
-            "--orth_type", "orthqa",
             "--ncut_scope", "global",
             "--node_emb_mode", "full",
             "--lambda_prox", "1",
@@ -313,7 +312,6 @@ def test_zero_orth_during_proximity_warmup_logs_uncomputed_global_losses(tmp_pat
             "--cluster_head_type", "cosine_prototype",
             "--prototype_init_mode", "random",
             "--cluster_loss_type", "matrix_ncut",
-            "--orth_type", "orthqa",
             "--ncut_scope", "global",
             "--node_emb_mode", "full",
             "--lambda_prox", "1",
@@ -321,8 +319,6 @@ def test_zero_orth_during_proximity_warmup_logs_uncomputed_global_losses(tmp_pat
             "--lambda_esg", "0.1",
             "--prox_similarity_mode", "cosine",
             "--prox_warmup_epochs", "5",
-            "--global_warmup_epochs", "0",
-            "--loss_formulation_diagnostic", "1",
             "--quiet", "1",
         ]
     )
@@ -335,6 +331,6 @@ def test_zero_orth_during_proximity_warmup_logs_uncomputed_global_losses(tmp_pat
     with (output_dir / "metrics.csv").open("r", encoding="utf-8", newline="") as reader:
         rows = list(csv.DictReader(reader))
     assert len(rows) == 1
-    assert np.isnan(float(rows[0]["weighted_cut_loss"]))
-    assert np.isnan(float(rows[0]["weighted_orth_loss"]))
+    assert rows[0]["hierarchical_cut_loss"] == ""
+    assert rows[0]["orth_loss"] == ""
     assert int(rows[0]["prox_optimizer_steps"]) > 0

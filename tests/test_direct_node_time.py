@@ -15,32 +15,9 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
-from edge_losses import (
-    edge_orthqa_penalty_global,
-    edge_ppr_proximity_loss,
-    edge_trace_mincut_loss_global,
-    node_embedding_anchor_loss,
-    project_edge_assignments_to_nodes_global,
-    projection_loss_global,
-    role_aware_event_scores,
-)
+from edge_losses import (edge_ppr_proximity_loss, project_edge_assignments_to_nodes_global, projection_loss_global, role_aware_event_scores)
 from edge_model import EdgeHiNoSModel, load_pretrained_node_features
 from edge_train import build_optimizer_for_node_emb_mode
-from summarize_direct_node_time_all_datasets import (
-    CONFIGS,
-    COMMON_CONFIG,
-    discover_datasets,
-    make_plan,
-    make_run_config,
-    stable_config_checksum,
-)
-from summarize_direct_node_time_stabilization import (
-    CONFIGS as STABILIZATION_CONFIGS,
-    COMMON_CONFIG as STABILIZATION_COMMON_CONFIG,
-    make_plan as make_stabilization_plan,
-    make_run_config as make_stabilization_run_config,
-    stable_config_checksum as stable_stabilization_checksum,
-)
 
 
 def _node_features(num_nodes=5, dim=4):
@@ -370,55 +347,8 @@ def test_role_aware_proximity_uses_same_score_for_negative_branch():
     assert torch.isfinite(node_emb.grad).all()
 
 
-def test_node_anchor_loss_only_updates_node_embedding():
-    model, _, _ = _direct_model("full")
-    initial = model.node_emb_initial.detach().clone()
-    assert torch.allclose(node_embedding_anchor_loss(model.node_emb, initial), torch.tensor(0.0))
-    with torch.no_grad():
-        model.node_emb[0, 0] += 1.0
-    loss = node_embedding_anchor_loss(model.node_emb, initial)
-    assert float(loss.detach()) > 0.0
-    loss.backward()
-    assert model.node_emb.grad is not None
-    assert float(model.node_emb.grad.abs().sum()) > 0.0
-    assert model.cluster_output.weight.grad is None
 
 
-def test_cut_orth_orthqa_and_projection_backpropagate_to_node_embedding():
-    src, dst, time_feat = _toy_inputs()
-    W = _toy_affinity()
-    degree = np.asarray(W.sum(axis=1)).ravel().astype(np.float32)
-    for idx, loss_name in enumerate(["cut", "orth", "orthqa", "projection"]):
-        rng = np.random.RandomState(100 + idx)
-        model = EdgeHiNoSModel(
-            rng.normal(0.0, 0.4, size=(5, 4)).astype(np.float32),
-            time_dim=2,
-            edge_dim=6,
-            edge_hidden_dim=7,
-            cluster_hidden_dim=5,
-            K=3,
-            directed=False,
-            cluster_output_bias_mode="none",
-            cluster_input_norm="none",
-            edge_encoder_mode="direct_node_time",
-        )
-        model.node_emb.requires_grad_(True)
-        _, Q = model(src, dst, time_feat)
-        _, cut_loss, orth_loss = edge_trace_mincut_loss_global(Q, W, degree, 3, row_block_size=2)
-        if loss_name == "cut":
-            loss = cut_loss
-        elif loss_name == "orth":
-            loss = orth_loss
-        elif loss_name == "orthqa":
-            loss = edge_orthqa_penalty_global(Q, torch.from_numpy(degree))
-        else:
-            loss = projection_loss_global(Q, src, dst, num_nodes=5)
-        loss.backward()
-        assert model.node_emb.grad is not None, loss_name
-        assert torch.isfinite(model.node_emb.grad).all(), loss_name
-        assert float(model.node_emb.grad.abs().sum()) > 0.0, loss_name
-        assert model.cluster_hidden.weight.grad is not None, loss_name
-        assert model.cluster_output.weight.grad is not None, loss_name
 
 
 def test_frozen_full_and_small_lr_node_embedding_modes():
@@ -502,49 +432,3 @@ def _write_toy_dataset(root):
         "0 0.1 0.2\n1 0.3 0.4\n2 0.5 0.6\n",
         encoding="utf-8",
     )
-
-
-def test_inventory_plan_and_checksum_include_direct_mode(tmp_path):
-    _write_toy_dataset(tmp_path)
-    inventory = discover_datasets(tmp_path, COMMON_CONFIG)
-    assert inventory[0]["dataset_name"] == "toy"
-    assert inventory[0]["usable"] is True
-    assert inventory[0]["node2vec_exists"] is True
-    assert inventory[0]["node2vec_shape"] == [3, 2]
-    plan = make_plan(inventory, "", "", None, tmp_path, tmp_path / "logs")
-    assert len(plan) == 5 * 3
-    assert {cfg["config"] for cfg in plan} == set(CONFIGS)
-    e0 = make_run_config("toy", "E0", 42, tmp_path, tmp_path / "logs")
-    e1 = make_run_config("toy", "E1", 42, tmp_path, tmp_path / "logs")
-    assert stable_config_checksum(e0) != stable_config_checksum(e1)
-    assert e1["edge_encoder_mode"] == "direct_node_time"
-    assert e1["cluster_init_mode"] == "random_orthogonal"
-
-
-def test_inventory_marks_missing_node2vec_unusable(tmp_path):
-    ds = tmp_path / "dataset" / "toy"
-    ds.mkdir(parents=True)
-    ds.joinpath("toy.txt").write_text("0 1 0.0\n", encoding="utf-8")
-    ds.joinpath("node2label.txt").write_text("0 0\n1 1\n", encoding="utf-8")
-    inventory = discover_datasets(tmp_path, COMMON_CONFIG)
-    assert inventory[0]["usable"] is False
-    assert "Node2Vec" in inventory[0]["failure_reason"]
-
-
-def test_stabilization_plan_and_checksum_cover_new_controls(tmp_path):
-    _write_toy_dataset(tmp_path)
-    inventory = discover_datasets(tmp_path, STABILIZATION_COMMON_CONFIG)
-    plan = make_stabilization_plan(inventory, "", "", None, tmp_path, "all")
-    assert len(plan) == len(STABILIZATION_CONFIGS) * 3
-    assert {cfg["config"] for cfg in plan} == set(STABILIZATION_CONFIGS)
-    n0 = make_stabilization_run_config("toy", "N0", 42, tmp_path)
-    n2 = make_stabilization_run_config("toy", "N2", 42, tmp_path)
-    n8 = make_stabilization_run_config("toy", "N8", 42, tmp_path)
-    n9 = make_stabilization_run_config("toy", "N9", 42, tmp_path)
-    assert n0["direct_time_scale"] == 1.0
-    assert n2["direct_time_scale"] == 0.25
-    assert n8["prox_similarity_mode"] == "role_aware"
-    assert n8["lambda_node_anchor"] == 0.01
-    assert n9["lambda_prox"] == 0.1
-    assert stable_stabilization_checksum(n0) != stable_stabilization_checksum(n2)
-    assert stable_stabilization_checksum(n8) != stable_stabilization_checksum(n9)

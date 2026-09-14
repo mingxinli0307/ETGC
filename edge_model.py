@@ -60,6 +60,14 @@ def load_pretrained_node_features(
     return features
 
 
+def power_sharpen(q1: torch.Tensor, gamma: float = 2.0, eps: float = 1e-12) -> torch.Tensor:
+    """Differentiable row-wise power sharpening, without frequency correction."""
+    if not np.isfinite(gamma) or gamma < 1.0:
+        raise ValueError("sharpen_gamma must be finite and >= 1.0")
+    q_power = q1.pow(gamma)
+    return q_power / q_power.sum(dim=1, keepdim=True).clamp_min(eps)
+
+
 class EdgeHiNoSModel(nn.Module):
     def __init__(
         self,
@@ -76,11 +84,21 @@ class EdgeHiNoSModel(nn.Module):
         direct_time_scale: float = 1.0,
         cluster_head_type: str = "legacy_mlp",
         prototype_temperature: float = 0.2,
+        hier_ncut_h: int = -1,
+        sharpen_gamma: float = 2.0,
     ):
         super().__init__()
+        self.K = int(K)
+        self.H = 2 * self.K if int(hier_ncut_h) <= 0 else int(hier_ncut_h)
+        if self.K <= 0 or self.H < self.K:
+            raise ValueError(f"Require H >= K > 0, got H={self.H}, K={self.K}")
+        self.sharpen_gamma = float(sharpen_gamma)
+        if not np.isfinite(self.sharpen_gamma) or self.sharpen_gamma < 1.0:
+            raise ValueError("sharpen_gamma must be finite and >= 1.0")
+        self.coarse_assignment_logits = nn.Parameter(torch.empty(self.H, self.K))
+        nn.init.normal_(self.coarse_assignment_logits, mean=0.0, std=0.02)
         initial_node_features = initial_node_features.astype(np.float32, copy=True)
         self.node_emb = nn.Parameter(torch.from_numpy(initial_node_features))
-        self.register_buffer("node_emb_initial", torch.from_numpy(initial_node_features.copy()))
         self.directed = bool(directed)
         self.edge_encoder_mode = str(edge_encoder_mode).lower()
         self.direct_time_scale = float(direct_time_scale)
@@ -125,7 +143,7 @@ class EdgeHiNoSModel(nn.Module):
             self.cluster_activation = nn.ReLU()
             self.cluster_output = nn.Linear(
                 cluster_hidden_dim,
-                K,
+                self.H,
                 bias=self.cluster_output_bias_mode != "none",
             )
             if self.cluster_output_bias_mode == "zero" and self.cluster_output.bias is not None:
@@ -140,7 +158,7 @@ class EdgeHiNoSModel(nn.Module):
             self.cluster_hidden = None
             self.cluster_activation = None
             self.cluster_output = CosinePrototypeOutput(
-                K=K,
+                K=self.H,
                 dim=self.cluster_input_dim,
                 temperature=self.prototype_temperature,
             )
@@ -194,6 +212,17 @@ class EdgeHiNoSModel(nn.Module):
     def cluster_logits_from_hidden(self, cluster_hidden: torch.Tensor) -> torch.Tensor:
         return self.cluster_output(cluster_hidden)
 
+    def forward_hierarchical(self, src, dst, time_feat):
+        edge_repr_all = self.encode_edge_events(src, dst, time_feat)
+        _, cluster_hidden = self.cluster_hidden_from_edge_repr(edge_repr_all)
+        z1_all = self.cluster_logits_from_hidden(cluster_hidden)
+        q1_all = F.softmax(z1_all, dim=1)
+        p1_all = power_sharpen(q1_all, self.sharpen_gamma)
+        q2 = F.softmax(self.coarse_assignment_logits, dim=1)
+        q_final_all = p1_all @ q2
+        return dict(edge_repr_all=edge_repr_all, z1_all=z1_all, q1_all=q1_all,
+                    p1_all=p1_all, q2=q2, q_final_all=q_final_all)
+
     def forward(
         self,
         src: torch.Tensor,
@@ -206,7 +235,10 @@ class EdgeHiNoSModel(nn.Module):
         r_e = self.encode_edge_events(src, dst, time_feat)
         _cluster_input, cluster_hidden = self.cluster_hidden_from_edge_repr(r_e)
         logits = self.cluster_logits_from_hidden(cluster_hidden)
-        q_e = F.softmax(logits, dim=-1)
+        q1 = F.softmax(logits, dim=1)
+        p1 = power_sharpen(q1, self.sharpen_gamma)
+        q2 = F.softmax(self.coarse_assignment_logits, dim=1)
+        q_e = p1 @ q2
         if return_logits and return_cluster_hidden:
             return r_e, q_e, logits, cluster_hidden
         if return_logits:

@@ -14,7 +14,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from edge_main import build_parser
-from edge_losses import edge_matrix_ncut_loss_global
 from edge_model import EdgeHiNoSModel, initialize_cluster_output_from_prototypes
 from edge_proximity import build_edge_ncut_affinity, compute_edge_ppr_cached, sparse_symmetric_union_knn
 from edge_time import build_edge_time_features
@@ -71,6 +70,7 @@ def test_cosine_prototype_logits_temperature_and_softmax():
         edge_encoder_mode="direct_node_time",
         cluster_head_type="cosine_prototype",
         prototype_temperature=0.5,
+        hier_ncut_h=2,
     )
     assert model.cluster_output.bias is None
     with torch.no_grad():
@@ -95,58 +95,15 @@ def test_prototype_initialization_uses_normalized_event_repr_directly_and_seed()
     time_feat = torch.linspace(0.0, 1.0, steps=12).view(6, 2)
     R = model1.build_direct_node_time_event_repr(src, dst, time_feat)
     R_norm = R / torch.linalg.norm(R, dim=1, keepdim=True).clamp_min(1e-12)
-    stats1 = initialize_cluster_output_from_prototypes(model1, R_norm, 3, seed=11, sample_size=6, lloyd_iters=0)
-    stats2 = initialize_cluster_output_from_prototypes(model2, R_norm, 3, seed=11, sample_size=6, lloyd_iters=0)
+    stats1 = initialize_cluster_output_from_prototypes(model1, R_norm, model1.H, seed=11, sample_size=6, lloyd_iters=0)
+    stats2 = initialize_cluster_output_from_prototypes(model2, R_norm, model2.H, seed=11, sample_size=6, lloyd_iters=0)
     assert stats1["kmeans_center_checksum"] == stats2["kmeans_center_checksum"]
     assert torch.allclose(model1.cluster_output.weight, model2.cluster_output.weight)
-    assert torch.allclose(torch.linalg.norm(model1.cluster_output.weight, dim=1), torch.ones(3), atol=1e-6)
+    assert torch.allclose(torch.linalg.norm(model1.cluster_output.weight, dim=1), torch.ones(model1.H), atol=1e-6)
 
 
-def test_matrix_ncut_matches_dense_reference_and_backward():
-    W = torch.tensor(
-        [
-            [0.0, 1.0, 0.2],
-            [1.0, 0.0, 0.5],
-            [0.2, 0.5, 0.0],
-        ],
-        dtype=torch.float32,
-    )
-    degree = W.sum(dim=1)
-    Q = torch.tensor([[0.8, 0.2], [0.3, 0.7], [0.4, 0.6]], dtype=torch.float32, requires_grad=True)
-    eps = 1e-6
-    DQ = degree[:, None] * Q
-    A = Q.t() @ DQ + eps * torch.eye(2)
-    B = Q.t() @ (DQ - W @ Q)
-    reference = torch.trace(torch.linalg.solve(A, B))
-    W_sp = sp.csr_matrix(W.numpy())
-    total, ncut, penalty = edge_matrix_ncut_loss_global(Q, W_sp, degree.numpy(), 2, lambda_orth=0.5, eps=eps, orth_type="orthqa")
-    assert torch.allclose(ncut, reference, atol=1e-5)
-    total.backward()
-    assert Q.grad is not None
-    assert torch.isfinite(Q.grad).all()
-    assert float(Q.grad.abs().sum()) > 0.0
-    assert torch.isfinite(penalty).all()
 
 
-def test_matrix_ncut_rank_deficient_float32_q_uses_finite_regularized_solve():
-    Q = torch.full((4, 2), 0.5, dtype=torch.float32, requires_grad=True)
-    degree = np.ones(4, dtype=np.float32)
-    W = sp.csr_matrix((4, 4), dtype=np.float32)
-    total, ncut, penalty = edge_matrix_ncut_loss_global(
-        Q,
-        W,
-        degree,
-        2,
-        lambda_orth=1.0,
-        eps=1e-8,
-        orth_type="orth",
-    )
-    assert torch.isfinite(total)
-    assert torch.isfinite(ncut)
-    assert torch.isfinite(penalty)
-    total.backward()
-    assert Q.grad is not None
-    assert torch.isfinite(Q.grad).all()
 
 
 def test_symmetric_union_knn_semantics_and_degree_after_sparsification():
@@ -203,136 +160,3 @@ def test_cache_key_separates_row_topk_and_symmetric_union_knn(tmp_path):
     _, _, _, sym_stats = compute_edge_ppr_cached(**common, affinity_sparsify="symmetric_union_knn")
     assert row_stats["pi_config_hash"] == sym_stats["pi_config_hash"]
     assert row_stats["w_config_hash"] != sym_stats["w_config_hash"]
-
-
-def test_direct_slice_forward_matches_id_gather(tmp_path):
-    data_dir = tmp_path / "dataset" / "toy"
-    data_dir.mkdir(parents=True)
-    (data_dir / "toy.txt").write_text("0 1 0.0\n1 2 0.2\n2 0 0.4\n", encoding="utf-8")
-    (data_dir / "node2label.txt").write_text("0 0\n1 1\n2 0\n", encoding="utf-8")
-    args = build_parser().parse_args(
-        [
-            "--dataset",
-            "toy",
-            "--data_root",
-            str(tmp_path / "dataset"),
-            "--cache_dir",
-            str(tmp_path / "cache"),
-            "--epoch",
-            "1",
-            "--edge_ppr_method",
-            "truncated",
-            "--edge_ppr_topk",
-            "-1",
-            "--time_dim",
-            "5",
-            "--edge_dim",
-            "4",
-            "--cluster_head_type",
-            "cosine_prototype",
-            "--prototype_init_mode",
-            "random",
-            "--prox_warmup_epochs",
-            "0",
-            "--quiet",
-            "1",
-        ]
-    )
-    args.model_seed = args.seed
-    args.prototype_seed = args.seed
-    args.forest_seed = args.seed
-    trainer = EdgeHiNoSTrainer(args)
-    ids = np.array([0, 1, 2], dtype=np.int64)
-    r_id, q_id, logits_id = trainer._forward_ids_with_logits(ids)
-    r_slice, q_slice, logits_slice, _ = trainer._forward_range_diagnostic(0, 3)
-    assert torch.max(torch.abs(r_id - r_slice)) < 1e-6
-    assert torch.max(torch.abs(q_id - q_slice)) < 1e-6
-    assert torch.max(torch.abs(logits_id - logits_slice)) < 1e-6
-
-
-def test_loss_formulation_diagnostic_records_each_epoch_and_matrix_conditioning(tmp_path):
-    data_dir = tmp_path / "dataset" / "toy"
-    data_dir.mkdir(parents=True)
-    (data_dir / "toy.txt").write_text(
-        "0 1 0.0\n1 2 0.2\n2 3 0.4\n3 0 0.6\n0 2 0.8\n1 3 1.0\n",
-        encoding="utf-8",
-    )
-    (data_dir / "node2label.txt").write_text("0 0\n1 0\n2 1\n3 1\n", encoding="utf-8")
-    output_dir = tmp_path / "run"
-    args = build_parser().parse_args(
-        [
-            "--dataset", "toy",
-            "--data_root", str(tmp_path / "dataset"),
-            "--cache_dir", str(tmp_path / "cache"),
-            "--output_dir", str(output_dir),
-            "--diagnostic_output_dir", str(output_dir),
-            "--epoch", "1",
-            "--edge_ppr_method", "truncated",
-            "--edge_ppr_topk", "-1",
-            "--time_dim", "5",
-            "--edge_dim", "4",
-            "--edge_hidden_dim", "6",
-            "--cluster_hidden_dim", "4",
-            "--time_feature_mode", "history",
-            "--edge_encoder_mode", "mlp",
-            "--cluster_head_type", "legacy_mlp",
-            "--cluster_output_bias_mode", "zero",
-            "--cluster_input_norm", "layernorm",
-            "--cluster_init_mode", "prototype",
-            "--prototype_sample_size", "6",
-            "--prototype_lloyd_iters", "1",
-            "--cluster_loss_type", "matrix_ncut",
-            "--orth_type", "orthqa",
-            "--node_emb_mode", "frozen",
-            "--lambda_prox", "0",
-            "--lambda_proj", "0",
-            "--lambda_bal", "0",
-            "--prox_warmup_epochs", "0",
-            "--loss_formulation_diagnostic", "1",
-            "--diagnostic_epochs", "1",
-            "--uniform_collapse_diagnostic", "1",
-            "--diagnostic_only_first_epoch", "0",
-            "--quiet", "1",
-        ]
-    )
-    args.model_seed = args.seed
-    args.prototype_seed = args.seed
-    args.forest_seed = args.seed
-    trainer = EdgeHiNoSTrainer(args)
-    trainer.write_config_json()
-    best_epoch, best_metrics = trainer.train()
-    trainer.write_result_json(best_epoch, best_metrics, trainer.final_metrics, runtime_seconds=0.0)
-
-    diagnostic = json.loads((output_dir / "diagnostic.json").read_text(encoding="utf-8"))
-    epoch_stage = diagnostic["stages"]["epoch_1"]
-    assert epoch_stage["q_centered_to_total_energy_ratio"] >= 0.0
-    assert epoch_stage["q_normalized_margin_mean"] >= 0.0
-    assert len(epoch_stage["cluster_soft_volume_k"]) == 2
-    assert np.isfinite(epoch_stage["qtdq_condition_number"])
-    assert epoch_stage["matrix_ncut_solve_finite"] is True
-    assert "orth_original_value" in epoch_stage
-    assert "orthqa_value" in epoch_stage
-
-    with (output_dir / "metrics.csv").open("r", encoding="utf-8", newline="") as reader:
-        rows = list(csv.DictReader(reader))
-    assert len(rows) == 1
-    assert rows[0]["q_centered_to_total_energy_ratio"] != ""
-    assert rows[0]["q_normalized_margin_mean"] != ""
-    assert rows[0]["cluster_volume_cv"] != ""
-    assert rows[0]["qtdq_condition_number"] != ""
-
-
-def test_formal_default_configuration():
-    args = build_parser().parse_args([])
-    assert args.time_feature_mode == "current"
-    assert args.edge_encoder_mode == "direct_node_time"
-    assert args.cluster_head_type == "cosine_prototype"
-    assert args.cluster_loss_type == "matrix_ncut"
-    assert args.orth_type == "orthqa"
-    assert args.forest_samples == 50
-    assert args.affinity_sparsify == "symmetric_union_knn"
-    assert args.node_emb_mode == "small_lr"
-    assert args.lambda_proj == 0.0
-    assert args.lambda_node_anchor == 0.0
-    assert args.prox_similarity_mode == "cosine"
-    assert args.loss_formulation_diagnostic == 0

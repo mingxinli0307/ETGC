@@ -27,7 +27,7 @@ from edge_model import (  # noqa: E402
     load_pretrained_node_features,
     tensor_checksum,
 )
-from scripts.summarize_direct_node_time_all_datasets import (  # noqa: E402
+from scripts.node_embedding_inventory import (  # noqa: E402
     COMMON_CONFIG as INVENTORY_COMMON_CONFIG,
     discover_datasets,
     inspect_node2vec_file,

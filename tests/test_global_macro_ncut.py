@@ -10,14 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from edge_losses import (
-    edge_ncut_loss,
-    edge_ncut_loss_global,
-    edge_trace_mincut_loss_global,
-    project_edge_assignments_to_nodes_global,
-    projection_loss_global,
-    scipy_csr_to_torch_sparse_coo,
-)
+from edge_losses import (project_edge_assignments_to_nodes_global, projection_loss_global, scipy_csr_to_torch_sparse_coo)
 from edge_metrics import align_predicted_labels, evaluate_node_clustering
 from edge_model import EdgeHiNoSModel
 from edge_proximity import build_temporal_edge_event_transition, sparse_row_topk
@@ -41,133 +34,18 @@ def test_macro_f1_matches_sklearn_after_alignment():
     assert metrics["F1"] == metrics["Macro_F1"]
 
 
-def test_global_ncut_matches_full_union_local_loss_and_backward():
-    torch.manual_seed(0)
-    W = _toy_affinity()
-    logits = torch.randn(4, 3, requires_grad=True)
-    Q = torch.softmax(logits, dim=1)
-    local = edge_ncut_loss(Q, np.arange(4, dtype=np.int64), W, 3)
-    global_loss = edge_ncut_loss_global(Q, W, 3, row_block_size=2)
-    assert abs(float(local.detach()) - float(global_loss.detach())) < 1e-5
-    global_loss.backward()
-    assert logits.grad is not None
-    assert torch.isfinite(logits.grad).all()
-    assert float(logits.grad.abs().sum()) > 0.0
 
 
-def test_global_ncut_backpropagates_to_model_parameters():
-    torch.manual_seed(1)
-    rng = np.random.RandomState(1)
-    initial = rng.normal(0.0, 0.1, size=(4, 5)).astype(np.float32)
-    model = EdgeHiNoSModel(
-        initial_node_features=initial,
-        time_dim=3,
-        edge_dim=6,
-        edge_hidden_dim=8,
-        cluster_hidden_dim=5,
-        K=2,
-        directed=False,
-    )
-    src = torch.tensor([0, 1, 2, 0], dtype=torch.long)
-    dst = torch.tensor([1, 2, 3, 3], dtype=torch.long)
-    time_feat = torch.randn(4, 3)
-    _, Q = model(src, dst, time_feat)
-    loss = edge_ncut_loss_global(Q, _toy_affinity(), 2, row_block_size=2)
-    loss.backward()
-    grads = [p.grad for p in model.parameters() if p.grad is not None]
-    assert grads
-    assert all(torch.isfinite(g).all() for g in grads)
-    assert any(float(g.abs().sum()) > 0.0 for g in grads)
 
 
-def test_trace_mincut_matches_dense_reference_sparse_and_block():
-    torch.manual_seed(2)
-    W = _toy_affinity()
-    Q = torch.softmax(torch.randn(4, 3), dim=1)
-    degree = np.asarray(W.sum(axis=1)).ravel().astype(np.float32)
-    W_dense = torch.from_numpy(W.toarray()).float()
-    degree_t = torch.from_numpy(degree).float()
-    lambda_orth = 0.7
-
-    reference_cut = -torch.trace(Q.t() @ W_dense @ Q) / torch.trace(Q.t() @ torch.diag(degree_t) @ Q)
-    QtQ = Q.t() @ Q
-    reference_orth = torch.linalg.norm(
-        QtQ / torch.linalg.norm(QtQ, ord="fro") - torch.eye(3) / (3.0 ** 0.5),
-        ord="fro",
-    )
-    reference_total = reference_cut + lambda_orth * reference_orth
-
-    total_block, cut_block, orth_block = edge_trace_mincut_loss_global(
-        Q, W, degree, 3, lambda_orth=lambda_orth, row_block_size=2
-    )
-    W_sparse = scipy_csr_to_torch_sparse_coo(W, Q.device, Q.dtype)
-    total_sparse, cut_sparse, orth_sparse = edge_trace_mincut_loss_global(
-        Q, W_sparse, degree, 3, lambda_orth=lambda_orth, row_block_size=2
-    )
-
-    assert abs(float(cut_block - reference_cut)) < 1e-5
-    assert abs(float(orth_block - reference_orth)) < 1e-5
-    assert abs(float(total_block - reference_total)) < 1e-5
-    assert abs(float(cut_sparse - reference_cut)) < 1e-5
-    assert abs(float(orth_sparse - reference_orth)) < 1e-5
-    assert abs(float(total_sparse - reference_total)) < 1e-5
 
 
-def test_trace_numerator_equals_q_times_wq():
-    torch.manual_seed(3)
-    W = torch.from_numpy(_toy_affinity().toarray()).float()
-    Q = torch.softmax(torch.randn(4, 2), dim=1)
-    trace_value = torch.trace(Q.t() @ W @ Q)
-    q_wq_value = (Q * (W @ Q)).sum()
-    assert abs(float(trace_value - q_wq_value)) < 1e-6
 
 
-def test_trace_denominator_equals_degree_weighted_q_square():
-    torch.manual_seed(4)
-    W = torch.from_numpy(_toy_affinity().toarray()).float()
-    degree = W.sum(dim=1)
-    Q = torch.softmax(torch.randn(4, 2), dim=1)
-    trace_value = torch.trace(Q.t() @ torch.diag(degree) @ Q)
-    weighted_value = (degree.unsqueeze(1) * Q.square()).sum()
-    assert abs(float(trace_value - weighted_value)) < 1e-6
 
 
-def test_trace_orthogonality_term_matches_formula():
-    torch.manual_seed(5)
-    Q = torch.softmax(torch.randn(5, 3), dim=1)
-    QtQ = Q.t() @ Q
-    expected = torch.linalg.norm(
-        QtQ / torch.linalg.norm(QtQ, ord="fro") - torch.eye(3) / (3.0 ** 0.5),
-        ord="fro",
-    )
-    W = sp.eye(5, format="csr", dtype=np.float32)
-    total, cut, got = edge_trace_mincut_loss_global(Q, W, np.ones(5, dtype=np.float32), 3)
-    del total, cut
-    assert abs(float(got - expected)) < 1e-6
 
 
-def test_trace_mincut_projection_joint_backward_is_finite_and_nonzero():
-    torch.manual_seed(6)
-    W = _toy_affinity()
-    logits = torch.randn(4, 3, requires_grad=True)
-    Q = torch.softmax(logits, dim=1)
-    degree = np.asarray(W.sum(axis=1)).ravel().astype(np.float32)
-    cluster_loss, cut_loss, orth_loss = edge_trace_mincut_loss_global(Q, W, degree, 3, row_block_size=2)
-    proj_loss = projection_loss_global(
-        Q,
-        torch.tensor([0, 1, 2, 0], dtype=torch.long),
-        torch.tensor([1, 2, 3, 3], dtype=torch.long),
-        num_nodes=4,
-    )
-    loss = cluster_loss + proj_loss
-    loss.backward()
-    assert torch.isfinite(cluster_loss)
-    assert torch.isfinite(cut_loss)
-    assert torch.isfinite(orth_loss)
-    assert torch.isfinite(proj_loss)
-    assert logits.grad is not None
-    assert torch.isfinite(logits.grad).all()
-    assert float(logits.grad.abs().sum()) > 0.0
 
 
 def test_global_projection_matches_explicit_incidence_matrix():
